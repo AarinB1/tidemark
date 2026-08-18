@@ -1,0 +1,270 @@
+// Package graph describes a job as vertices and the edges between them. It
+// holds no running state: the runtime turns a validated graph into subtasks.
+package graph
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/AarinB1/tidemark/pkg/core"
+)
+
+// VertexKind is the role a vertex plays in the pipeline.
+type VertexKind uint8
+
+const (
+	VertexSource VertexKind = iota
+	VertexOperator
+	VertexSink
+)
+
+// String renders the kind for error messages.
+func (k VertexKind) String() string {
+	switch k {
+	case VertexSource:
+		return "source"
+	case VertexOperator:
+		return "operator"
+	case VertexSink:
+		return "sink"
+	default:
+		return "unknown"
+	}
+}
+
+// Vertex is one logical stage of a job.
+//
+// The three factory fields hold constructors rather than instances because a
+// vertex with parallelism N becomes N subtasks, each of which must own its
+// operator. Sharing one instance across subtasks is a data race that no test at
+// parallelism 1 can catch, so the shape that makes it impossible is chosen
+// before parallelism exists. Exactly the field matching Kind is set.
+type Vertex struct {
+	ID          string
+	Kind        VertexKind
+	Parallelism int
+	NewSource   func() core.Source
+	NewOperator func() core.Operator
+	NewSink     func() core.Sink
+}
+
+// Validation failures. Each condition has its own error so that callers and
+// tests can tell them apart with errors.Is.
+var (
+	errEmptyID                = errors.New("vertex ID is empty")
+	errDuplicateID            = errors.New("duplicate vertex ID")
+	errUnknownVertex          = errors.New("unknown vertex")
+	errDuplicateEdge          = errors.New("duplicate edge")
+	errUnknownKind            = errors.New("unknown vertex kind")
+	errMissingFactory         = errors.New("factory for kind is nil")
+	errExtraFactory           = errors.New("factory set that does not match kind")
+	errParallelismTooLow      = errors.New("parallelism < 1")
+	errParallelismUnsupported = errors.New("parallelism > 1 arrives in Phase 1")
+	errSourceHasInbound       = errors.New("source has inbound edges")
+	errSinkHasOutbound        = errors.New("sink has outbound edges")
+	errOperatorNoInput        = errors.New("operator has no inputs")
+	errOperatorNoOutput       = errors.New("operator has no outputs")
+	errDisconnected           = errors.New("vertex has no edges")
+	errNoSource               = errors.New("graph has no source")
+	errNoSink                 = errors.New("graph has no sink")
+	errCycle                  = errors.New("graph has a cycle")
+)
+
+// Graph is a job under construction. The zero value is not usable; call New.
+type Graph struct {
+	byID map[string]Vertex
+	out  map[string][]string
+	in   map[string][]string
+}
+
+// New returns an empty graph.
+func New() *Graph {
+	return &Graph{
+		byID: make(map[string]Vertex),
+		out:  make(map[string][]string),
+		in:   make(map[string][]string),
+	}
+}
+
+// AddVertex adds v. IDs must be unique; the duplicate is rejected here rather
+// than in Validate because the second vertex would otherwise be dropped
+// silently.
+func (g *Graph) AddVertex(v Vertex) error {
+	if v.ID == "" {
+		return errEmptyID
+	}
+	if _, ok := g.byID[v.ID]; ok {
+		return fmt.Errorf("vertex %q: %w", v.ID, errDuplicateID)
+	}
+	g.byID[v.ID] = v
+	return nil
+}
+
+// Connect adds an edge from fromID to toID. Both vertices must already exist,
+// and an edge may not be added twice: a repeated edge would give the pair two
+// channels, and a record partitioned to "one" downstream channel would arrive
+// at that vertex twice.
+func (g *Graph) Connect(fromID, toID string) error {
+	if _, ok := g.byID[fromID]; !ok {
+		return fmt.Errorf("edge %q -> %q: from %q: %w", fromID, toID, fromID, errUnknownVertex)
+	}
+	if _, ok := g.byID[toID]; !ok {
+		return fmt.Errorf("edge %q -> %q: to %q: %w", fromID, toID, toID, errUnknownVertex)
+	}
+	if slices.Contains(g.out[fromID], toID) {
+		return fmt.Errorf("edge %q -> %q: %w", fromID, toID, errDuplicateEdge)
+	}
+	g.out[fromID] = append(g.out[fromID], toID)
+	g.in[toID] = append(g.in[toID], fromID)
+	return nil
+}
+
+// Downstream returns the IDs the edges out of id point at, in lexicographic
+// order. The runtime wires one channel per entry, and the order is fixed so
+// that a given downstream vertex keeps the same channel index across runs.
+func (g *Graph) Downstream(id string) []string {
+	ids := slices.Clone(g.out[id])
+	slices.Sort(ids)
+	return ids
+}
+
+// Validate reports the first structural problem with the graph. Vertices are
+// examined in lexicographic ID order so that a graph with several problems
+// always reports the same one.
+func (g *Graph) Validate() error {
+	sources, sinks := 0, 0
+	for _, id := range g.sortedIDs() {
+		v := g.byID[id]
+		if v.Parallelism < 1 {
+			return fmt.Errorf("vertex %q: parallelism %d: %w", id, v.Parallelism, errParallelismTooLow)
+		}
+		if v.Parallelism > 1 {
+			return fmt.Errorf("vertex %q: parallelism %d: %w", id, v.Parallelism, errParallelismUnsupported)
+		}
+		if err := checkFactories(v); err != nil {
+			return fmt.Errorf("vertex %q: %w", id, err)
+		}
+		switch v.Kind {
+		case VertexSource:
+			sources++
+			if len(g.in[id]) > 0 {
+				return fmt.Errorf("vertex %q: %w", id, errSourceHasInbound)
+			}
+		case VertexSink:
+			sinks++
+			if len(g.out[id]) > 0 {
+				return fmt.Errorf("vertex %q: %w", id, errSinkHasOutbound)
+			}
+		case VertexOperator:
+			if len(g.in[id]) == 0 {
+				return fmt.Errorf("vertex %q: %w", id, errOperatorNoInput)
+			}
+			if len(g.out[id]) == 0 {
+				return fmt.Errorf("vertex %q: %w", id, errOperatorNoOutput)
+			}
+		}
+		if len(g.in[id]) == 0 && len(g.out[id]) == 0 {
+			return fmt.Errorf("vertex %q: %w", id, errDisconnected)
+		}
+	}
+	if sources == 0 {
+		return errNoSource
+	}
+	if sinks == 0 {
+		return errNoSink
+	}
+	_, err := g.kahn()
+	return err
+}
+
+// TopoOrder returns the vertices in topological order. It validates first, so
+// a caller that gets an order back has a graph the runtime can execute.
+func (g *Graph) TopoOrder() ([]Vertex, error) {
+	if err := g.Validate(); err != nil {
+		return nil, err
+	}
+	return g.kahn()
+}
+
+// kahn runs Kahn's algorithm. When several vertices have in-degree zero it
+// takes the lexicographically smallest, which makes the order a function of the
+// graph alone. A topological order that varied between runs would make every
+// downstream test flaky in a way that looks like a concurrency bug.
+func (g *Graph) kahn() ([]Vertex, error) {
+	indeg := make(map[string]int, len(g.byID))
+	var ready []string
+	for _, id := range g.sortedIDs() {
+		indeg[id] = len(g.in[id])
+		if indeg[id] == 0 {
+			ready = append(ready, id)
+		}
+	}
+	order := make([]Vertex, 0, len(g.byID))
+	for len(ready) > 0 {
+		slices.Sort(ready)
+		id := ready[0]
+		ready = ready[1:]
+		order = append(order, g.byID[id])
+		for _, to := range g.Downstream(id) {
+			indeg[to]--
+			if indeg[to] == 0 {
+				ready = append(ready, to)
+			}
+		}
+	}
+	if len(order) != len(g.byID) {
+		var left []string
+		for id, d := range indeg {
+			if d > 0 {
+				left = append(left, id)
+			}
+		}
+		slices.Sort(left)
+		return nil, fmt.Errorf("%w: %v remain", errCycle, left)
+	}
+	return order, nil
+}
+
+// sortedIDs returns every vertex ID in lexicographic order. Map iteration order
+// is randomized, so nothing that affects a result may iterate g.byID directly.
+func (g *Graph) sortedIDs() []string {
+	ids := make([]string, 0, len(g.byID))
+	for id := range g.byID {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// checkFactories requires exactly the factory matching v.Kind to be set.
+func checkFactories(v Vertex) error {
+	var matching bool
+	switch v.Kind {
+	case VertexSource:
+		matching = v.NewSource != nil
+	case VertexOperator:
+		matching = v.NewOperator != nil
+	case VertexSink:
+		matching = v.NewSink != nil
+	default:
+		return fmt.Errorf("kind %d: %w", uint8(v.Kind), errUnknownKind)
+	}
+	if !matching {
+		return fmt.Errorf("%s: %w", v.Kind, errMissingFactory)
+	}
+	set := 0
+	if v.NewSource != nil {
+		set++
+	}
+	if v.NewOperator != nil {
+		set++
+	}
+	if v.NewSink != nil {
+		set++
+	}
+	if set != 1 {
+		return fmt.Errorf("%s: %w", v.Kind, errExtraFactory)
+	}
+	return nil
+}
