@@ -1,4 +1,4 @@
-.PHONY: build test vet lint check wordcount
+.PHONY: build test vet lint check demo
 
 build:
 	go build ./...
@@ -6,8 +6,12 @@ build:
 test:
 	go test ./... -race -count=1
 
+# stdmethods is off because it insists any method named Seek match io.Seeker.
+# core.Source.Seek takes a logical element offset, has no whence argument, and
+# returns no position; it is deliberately not an io.Seeker. Every other
+# analyzer stays on.
 vet:
-	go vet ./...
+	go vet -stdmethods=false ./...
 
 lint: vet
 	@unformatted=$$(gofmt -l .); \
@@ -19,5 +23,5 @@ lint: vet
 
 check: vet lint test
 
-wordcount:
-	go run ./cmd/worker --job wordcount --records 1000000
+demo:
+	go run ./cmd/worker --job identity --records 100000
