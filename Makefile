@@ -1,4 +1,4 @@
-.PHONY: build test vet lint check wordcount
+.PHONY: build test vet lint check demo
 
 build:
 	go build ./...
@@ -19,5 +19,5 @@ lint: vet
 
 check: vet lint test
 
-wordcount:
-	go run ./cmd/worker --job wordcount --records 1000000
+demo:
+	go run ./cmd/worker --job identity --records 100000
