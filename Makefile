@@ -6,8 +6,12 @@ build:
 test:
 	go test ./... -race -count=1
 
+# stdmethods is off because it insists any method named Seek match io.Seeker.
+# core.Source.Seek takes a logical element offset, has no whence argument, and
+# returns no position; it is deliberately not an io.Seeker. Every other
+# analyzer stays on.
 vet:
-	go vet ./...
+	go vet -stdmethods=false ./...
 
 lint: vet
 	@unformatted=$$(gofmt -l .); \
