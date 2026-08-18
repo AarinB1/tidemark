@@ -10,7 +10,10 @@ Violating any of these produces a silent failure. Never "simplify" past one.
 
 1. InputGate output watermark is `min(perChannelWatermark)`, never `max`. Taking the max fires windows early on incomplete data and nothing crashes.
 2. Records partition to exactly ONE downstream channel. Watermarks, barriers, and end-of-stream broadcast to ALL downstream channels.
-3. Sources inject barriers on schedule regardless of data volume. A quiet channel that stops forwarding barriers deadlocks alignment downstream.
+3. Sources inject barriers at a fixed element interval, not on a wall clock, and
+   inject them regardless of data volume. Logical-position injection is what
+   makes a recovered run reproducible from a seed. A quiet channel that stops
+   forwarding barriers deadlocks alignment downstream.
 4. Sinks commit only on `NotifyCheckpointComplete`, never during snapshot. Committing at snapshot time can commit data belonging to a checkpoint that never completes, which yields duplicates on recovery.
 5. Watermarks and barriers travel in-band as `StreamElement`, never on a side channel. In-band is what guarantees they stay ordered relative to records.
 6. Fault injection is keyed to logical position (elements processed, barriers seen), never wall-clock time. Go's scheduler is not deterministic; the fault schedule must be.
@@ -29,7 +32,10 @@ Not being built, at any point, in any phase: a DSL or fluent builder API, a plug
 
 If a change adds an abstraction layer, it is out of scope. If you are about to write a registry or a builder, stop and say so instead.
 
-The public API surface stays under 10 exported types.
+The API a user of the engine touches stays under 10 exported types. That means
+`pkg/core` and `pkg/graph`. Internals (`pkg/runtime`, `pkg/transport`,
+`pkg/state`) are uncounted, but every other rule in this section applies to them
+identically.
 
 Dependencies require explicit approval. Permitted when their phase arrives: `cockroachdb/pebble`, `google.golang.org/grpc`, `google.golang.org/protobuf`. Nothing else, and everything must be cgo-free and ARM64-native. Do not add `golang.org/x/...` helpers; the stdlib equivalent is fine.
 
@@ -48,8 +54,18 @@ If a task seems to require one of these, the task is out of phase. Say so rather
 
 ## Working agreement
 
-- One file plus its test per session. Do not modify files outside the stated slice.
-- When a test fails, state the root cause before proposing a fix. Do not iterate toward green by special-casing.
-- Table-driven tests. From Phase 2 onward, every windowed computation asserts equality against the batch oracle in `test/oracle`.
-- `make check` (vet, gofmt, `go test -race`) must pass before a commit.
-- End each session by explaining the three subtlest decisions made and why.
+- Work proceeds in numbered steps. One step is one file plus its test. Complete
+  a step, run `make check`, and commit before beginning the next.
+- Do not modify files outside the current step's stated slice, including files
+  belonging to a later step in the same task.
+- If a step's stated slice turns out to be wrong, stop and report rather than
+  widening it.
+- If a file the task assumes exists is missing, stop and report. Do not infer
+  its contents and create it.
+- When a test fails, state the root cause before proposing a fix. Do not iterate
+  toward green by special-casing.
+- Table-driven tests. From Phase 2 onward, every windowed computation asserts
+  equality against the batch oracle in `test/oracle`.
+- `make check` (vet, gofmt, `go test -race`) must pass before every commit.
+- One commit per step. Do not squash.
+- End each task by explaining the three subtlest decisions made and why.
