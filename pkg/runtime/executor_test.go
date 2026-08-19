@@ -28,15 +28,26 @@ func testGeneratorConfig(count int64) sources.GeneratorConfig {
 	}
 }
 
+// identity is the operator every chain below uses when the test is about the
+// runtime rather than about the operator.
+func identity() core.Operator {
+	return operators.NewMap(func(r *core.Record) (*core.Record, error) { return r, nil })
+}
+
 // chain builds source "src" -> map "id" -> sink "out".
 func chain(t *testing.T, newSource func() core.Source, newSink func() core.Sink) *graph.Graph {
+	t.Helper()
+	return chainWith(t, newSource, identity, newSink)
+}
+
+// chainWith is chain with the middle vertex supplied, for tests that need to
+// observe the operator itself.
+func chainWith(t *testing.T, newSource func() core.Source, newOperator func() core.Operator, newSink func() core.Sink) *graph.Graph {
 	t.Helper()
 	g := graph.New()
 	vertices := []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: 1, NewSource: newSource},
-		{ID: "id", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: func() core.Operator {
-			return operators.NewMap(func(r *core.Record) (*core.Record, error) { return r, nil })
-		}},
+		{ID: "id", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: newOperator},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: 1, NewSink: newSink},
 	}
 	for _, v := range vertices {
@@ -199,27 +210,38 @@ func (s *blockingSink) Write(*core.Record) error {
 
 func (s *blockingSink) Close() error { return nil }
 
-// closeRecording wraps a source or operator so the test can observe exactly
-// when the runtime finished with it. Close runs on every exit path, so the flag
-// flipping means that goroutine has unwound.
+// closeRecording wraps a source, operator or sink so the test can observe
+// exactly when the runtime finished with it. Close runs on every exit path, so
+// a non-zero count means that goroutine has unwound. The count, rather than a
+// flag, is what lets a test distinguish "closed" from "closed twice".
 type closeRecordingSource struct {
 	core.Source
-	closed *atomic.Bool
+	closes *atomic.Int64
 }
 
 func (s *closeRecordingSource) Close() error {
-	s.closed.Store(true)
+	s.closes.Add(1)
 	return s.Source.Close()
 }
 
 type closeRecordingOperator struct {
 	core.Operator
-	closed *atomic.Bool
+	closes *atomic.Int64
 }
 
 func (o *closeRecordingOperator) Close() error {
-	o.closed.Store(true)
+	o.closes.Add(1)
 	return o.Operator.Close()
+}
+
+type closeRecordingSink struct {
+	core.Sink
+	closes *atomic.Int64
+}
+
+func (s *closeRecordingSink) Close() error {
+	s.closes.Add(1)
+	return s.Sink.Close()
 }
 
 // TestRunCancelledMidRun asserts that cancelling the context unwinds goroutines
@@ -238,7 +260,7 @@ func TestRunCancelledMidRun(t *testing.T) {
 			release: make(chan struct{}),
 			entered: make(chan struct{}),
 		}
-		var srcClosed, opClosed atomic.Bool
+		var srcCloses, opCloses atomic.Int64
 
 		// More records than the two channels can buffer, so the source and the
 		// operator are genuinely blocked in Send rather than finished.
@@ -249,13 +271,13 @@ func TestRunCancelledMidRun(t *testing.T) {
 			{ID: "src", Kind: graph.VertexSource, Parallelism: 1, NewSource: func() core.Source {
 				return &closeRecordingSource{
 					Source: sources.NewGenerator(testGeneratorConfig(count)),
-					closed: &srcClosed,
+					closes: &srcCloses,
 				}
 			}},
 			{ID: "id", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: func() core.Operator {
 				return &closeRecordingOperator{
-					Operator: operators.NewMap(func(r *core.Record) (*core.Record, error) { return r, nil }),
-					closed:   &opClosed,
+					Operator: identity(),
+					closes:   &opCloses,
 				}
 			}},
 			{ID: "out", Kind: graph.VertexSink, Parallelism: 1, NewSink: func() core.Sink { return sink }},
@@ -284,9 +306,9 @@ func TestRunCancelledMidRun(t *testing.T) {
 			t.Fatalf("Run returned %v before cancellation", err)
 		default:
 		}
-		if srcClosed.Load() || opClosed.Load() {
-			t.Fatalf("a vertex exited before cancellation: source %v, operator %v",
-				srcClosed.Load(), opClosed.Load())
+		if srcCloses.Load() != 0 || opCloses.Load() != 0 {
+			t.Fatalf("a vertex exited before cancellation: source closed %d times, operator %d times",
+				srcCloses.Load(), opCloses.Load())
 		}
 
 		cancel()
@@ -295,10 +317,10 @@ func TestRunCancelledMidRun(t *testing.T) {
 		// The sink is still parked in user code, so the pipeline has not
 		// drained. Both upstream vertices must nevertheless be gone: they can
 		// only have got there by Send returning ctx.Err().
-		if !srcClosed.Load() {
+		if srcCloses.Load() == 0 {
 			t.Error("the source is still blocked in Send after cancellation")
 		}
-		if !opClosed.Load() {
+		if opCloses.Load() == 0 {
 			t.Error("the operator is still blocked in Send after cancellation")
 		}
 
@@ -381,6 +403,119 @@ func TestOpContextInitialWatermark(t *testing.T) {
 	oc := newOpContext(context.Background(), nil)
 	if got := oc.CurrentWatermark(); got != math.MinInt64 {
 		t.Errorf("CurrentWatermark = %d, want math.MinInt64", got)
+	}
+}
+
+// TestRunClosesDownstreamOnUpstreamFailure covers the quiet exit path. When an
+// upstream vertex fails, the runtime closes its output channel, so a downstream
+// Recv returns ok=false with no end-of-stream element. That vertex reports
+// nothing, because the failed one is the one that reports; core.Operator
+// nevertheless documents Close as running exactly once whether or not the
+// subtask completed, and Phase 3 attaches state to that guarantee.
+//
+// Failing before the first record is the case that pins the quiet exit itself:
+// the operator emits nothing, so Recv returning ok=false is the only way it can
+// leave its loop. Failing mid-stream races the operator's own Emit against the
+// cancellation and may leave by either path, which is exactly why Close has to
+// run on both.
+func TestRunClosesDownstreamOnUpstreamFailure(t *testing.T) {
+	tests := []struct {
+		name   string
+		failAt int64
+	}{
+		{name: "before any record", failAt: 0},
+		{name: "mid stream", failAt: 5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var opCloses, sinkCloses atomic.Int64
+
+			g := chainWith(t,
+				func() core.Source { return &failingSource{failAt: tt.failAt} },
+				func() core.Operator {
+					return &closeRecordingOperator{Operator: identity(), closes: &opCloses}
+				},
+				func() core.Sink {
+					return &closeRecordingSink{Sink: sinks.NewCollect(), closes: &sinkCloses}
+				},
+			)
+
+			// Run returns only after every vertex goroutine has unwound, so the
+			// counts below are final rather than sampled.
+			if err := Run(context.Background(), g); !errors.Is(err, errSourceFailed) {
+				t.Fatalf("Run = %v, want %v", err, errSourceFailed)
+			}
+			if got := opCloses.Load(); got != 1 {
+				t.Errorf("operator Close ran %d times, want exactly 1", got)
+			}
+			if got := sinkCloses.Load(); got != 1 {
+				t.Errorf("sink Close ran %d times, want exactly 1", got)
+			}
+		})
+	}
+}
+
+// TestOpContextEmitStopsAfterFirstFailure pins the bound on an operator that
+// emits in a loop. The runtime only collects the stash between operator calls,
+// so once a Send has failed every remaining Emit in that call must be a no-op:
+// otherwise the operator grinds through a Send per record that cannot succeed,
+// and a later Send that did succeed would clear the error that explains why the
+// job is stopping.
+func TestOpContextEmitStopsAfterFirstFailure(t *testing.T) {
+	const capacity = 4
+	ch := transport.NewChannel(capacity)
+	ctx, cancel := context.WithCancel(context.Background())
+	oc := newOpContext(ctx, []*transport.Channel{ch})
+
+	// Fill the buffer first, so the Emit after cancellation has nowhere to put
+	// its record and fails on the cancelled context rather than racing it.
+	for range capacity {
+		oc.Emit(&core.Record{Key: []byte("before")})
+	}
+	if err := oc.takeErr(); err != nil {
+		t.Fatalf("filling the buffer: %v", err)
+	}
+
+	cancel()
+	oc.Emit(&core.Record{Key: []byte("fails")})
+	if !errors.Is(oc.err, context.Canceled) {
+		t.Fatalf("Emit into a cancelled context held %v, want context.Canceled", oc.err)
+	}
+
+	// Drain the buffer and put a live context back, which removes the only
+	// source of nondeterminism here: Send selects between delivering and
+	// observing cancellation, and with both ready the choice is random. Against
+	// a live context and an empty buffer, an Emit that still reached Send
+	// delivers its record and overwrites the stash with nil, every time.
+	for range capacity {
+		if _, ok := ch.Recv(); !ok {
+			t.Fatal("Recv reported closure on a channel holding records")
+		}
+	}
+	oc.ctx = context.Background()
+	// The loop is the case that matters: this is an operator emitting per input
+	// record, with room for every one of them.
+	for range capacity {
+		oc.Emit(&core.Record{Key: []byte("after")})
+	}
+
+	if !errors.Is(oc.err, context.Canceled) {
+		t.Errorf("a later Emit replaced the first error with %v", oc.err)
+	}
+	ch.Close()
+	for {
+		e, ok := ch.Recv()
+		if !ok {
+			break
+		}
+		t.Errorf("an Emit after a failed Send reached the channel with key %q", e.Record.Key)
+	}
+	if err := oc.takeErr(); !errors.Is(err, context.Canceled) {
+		t.Errorf("takeErr = %v, want the first error", err)
+	}
+	if err := oc.takeErr(); err != nil {
+		t.Errorf("takeErr did not clear the error: %v", err)
 	}
 }
 
