@@ -16,7 +16,7 @@ type nopSource struct{}
 
 func (nopSource) Open(core.Context) error           { return nil }
 func (nopSource) Next() (*core.Record, bool, error) { return nil, false, nil }
-func (nopSource) Seek(int64) error                  { return nil }
+func (nopSource) SeekTo(int64) error                { return nil }
 func (nopSource) Position() int64                   { return 0 }
 func (nopSource) Close() error                      { return nil }
 

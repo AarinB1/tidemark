@@ -14,7 +14,7 @@ type nopSource struct {
 
 func (s *nopSource) Open(ctx Context) error       { return nil }
 func (s *nopSource) Next() (*Record, bool, error) { return nil, false, io.EOF }
-func (s *nopSource) Seek(offset int64) error      { s.pos = offset; return nil }
+func (s *nopSource) SeekTo(offset int64) error    { s.pos = offset; return nil }
 func (s *nopSource) Position() int64              { return s.pos }
 func (s *nopSource) Close() error                 { return nil }
 

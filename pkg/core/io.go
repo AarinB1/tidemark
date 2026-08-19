@@ -2,7 +2,7 @@ package core
 
 // Source produces the records at the head of a pipeline.
 //
-// Seek and Position are part of the contract from the start, even though
+// SeekTo and Position are part of the contract from the start, even though
 // nothing calls them in Phase 0. Recovery restarts a source from the offset
 // recorded in a checkpoint, and a source written as a stateful loop cannot be
 // retrofitted with that behaviour cheaply. Requiring it now forces every
@@ -17,10 +17,10 @@ type Source interface {
 	// Next returns the record at the current position and advances it. ok is
 	// false when the input is exhausted, in which case the record is nil.
 	Next() (rec *Record, ok bool, err error)
-	// Seek positions the source so that the next Next returns the element at
+	// SeekTo positions the source so that the next Next returns the element at
 	// offset. Seeking to n and reading must produce the same sequence as
 	// reading from 0 and discarding the first n elements.
-	Seek(offset int64) error
+	SeekTo(offset int64) error
 	// Position returns the offset of the element the next Next will return.
 	Position() int64
 	// Close releases resources. It is called exactly once.

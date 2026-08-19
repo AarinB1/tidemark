@@ -54,10 +54,10 @@ func equalRecords(a, b *core.Record) bool {
 		a.EventTime == b.EventTime
 }
 
-// TestSeekMatchesSequentialRead is invariant 7: Seek(n) then read is identical
+// TestSeekToMatchesSequentialRead is invariant 7: SeekTo(n) then read is identical
 // to reading from 0 and discarding n. A generator that advanced a held random
 // source would fail here, and only here.
-func TestSeekMatchesSequentialRead(t *testing.T) {
+func TestSeekToMatchesSequentialRead(t *testing.T) {
 	const (
 		skip = 500
 		take = 100
@@ -67,11 +67,11 @@ func TestSeekMatchesSequentialRead(t *testing.T) {
 			cfg := testConfig(seed)
 
 			seeked := open(t, cfg)
-			if err := seeked.Seek(skip); err != nil {
-				t.Fatalf("Seek: %v", err)
+			if err := seeked.SeekTo(skip); err != nil {
+				t.Fatalf("SeekTo: %v", err)
 			}
 			if got := seeked.Position(); got != skip {
-				t.Fatalf("Position after Seek(%d) = %d", skip, got)
+				t.Fatalf("Position after SeekTo(%d) = %d", skip, got)
 			}
 			got := readN(t, seeked, take)
 
@@ -125,48 +125,70 @@ func TestDifferentSeedsDiffer(t *testing.T) {
 	}
 }
 
-// TestEventTimeWithinLagBound is the property Phase 2's watermark generator is
-// tested against: out-of-orderness is bounded by exactly MaxLag.
-func TestEventTimeWithinLagBound(t *testing.T) {
-	lags := []int64{0, 1, 250, 5000}
+// TestEventTimeLagCoverage pins that the generator spreads event times across
+// the whole lag range rather than clustering in part of it. MaxLag is small
+// enough that a fixed number of draws covers every residue in [0, MaxLag]
+// outright: a generator that always returned zero lag, or that reached only
+// some of the range, leaves a residue unseen.
+func TestEventTimeLagCoverage(t *testing.T) {
+	const maxLag = 7
+	const draws = 1000
 	for _, seed := range seeds {
-		for _, maxLag := range lags {
-			t.Run(name(seed), func(t *testing.T) {
-				cfg := testConfig(seed)
-				cfg.MaxLag = maxLag
-				// Enough draws that every lag in [0, MaxLag] is hit many times
-				// over, so the endpoint assertions below test the generator
-				// rather than a coupon-collector coincidence.
-				cfg.Count = max(cfg.Count, 40*(maxLag+1))
-				g := open(t, cfg)
+		t.Run(name(seed), func(t *testing.T) {
+			cfg := testConfig(seed)
+			cfg.MaxLag = maxLag
+			cfg.Count = draws
+			g := open(t, cfg)
 
-				var sawMin, sawMax bool
-				for n := range int64(cfg.Count) {
-					rec, ok, err := g.Next()
-					if err != nil || !ok {
-						t.Fatalf("Next at %d: ok=%v err=%v", n, ok, err)
-					}
-					inOrder := cfg.BaseEventTime + n*cfg.EventTimeStep
-					if rec.EventTime > inOrder {
-						t.Fatalf("offset %d: event time %d is later than %d", n, rec.EventTime, inOrder)
-					}
-					if rec.EventTime < inOrder-maxLag {
-						t.Fatalf("offset %d: event time %d is earlier than %d", n, rec.EventTime, inOrder-maxLag)
-					}
-					if rec.EventTime == inOrder {
-						sawMax = true
-					}
-					if rec.EventTime == inOrder-maxLag {
-						sawMin = true
-					}
+			var seen [maxLag + 1]bool
+			for n := range int64(draws) {
+				rec, ok, err := g.Next()
+				if err != nil || !ok {
+					t.Fatalf("Next at %d: ok=%v err=%v", n, ok, err)
 				}
-				// Both ends of the range must actually occur, or a generator
-				// that always returned zero lag would pass the bounds check.
-				if !sawMin || !sawMax {
-					t.Errorf("lag %d: reached lower bound %v, reached upper bound %v", maxLag, sawMin, sawMax)
+				lag := cfg.BaseEventTime + n*cfg.EventTimeStep - rec.EventTime
+				if lag < 0 || lag > maxLag {
+					t.Fatalf("offset %d: lag %d is outside [0, %d]", n, lag, maxLag)
 				}
-			})
-		}
+				seen[lag] = true
+			}
+			for lag, hit := range seen {
+				if !hit {
+					t.Errorf("lag %d never occurred in %d draws", lag, draws)
+				}
+			}
+		})
+	}
+}
+
+// TestEventTimeWithinLagBound is the property Phase 2's watermark generator is
+// tested against: out-of-orderness is bounded by exactly MaxLag. Only the bound
+// is asserted here, at a lag wide enough that its endpoints need not occur;
+// TestEventTimeLagCoverage is what pins the spread.
+func TestEventTimeWithinLagBound(t *testing.T) {
+	const maxLag = 5000
+	const draws = 10000
+	for _, seed := range seeds {
+		t.Run(name(seed), func(t *testing.T) {
+			cfg := testConfig(seed)
+			cfg.MaxLag = maxLag
+			cfg.Count = draws
+			g := open(t, cfg)
+
+			for n := range int64(draws) {
+				rec, ok, err := g.Next()
+				if err != nil || !ok {
+					t.Fatalf("Next at %d: ok=%v err=%v", n, ok, err)
+				}
+				inOrder := cfg.BaseEventTime + n*cfg.EventTimeStep
+				if rec.EventTime > inOrder {
+					t.Fatalf("offset %d: event time %d is later than %d", n, rec.EventTime, inOrder)
+				}
+				if rec.EventTime < inOrder-maxLag {
+					t.Fatalf("offset %d: event time %d is earlier than %d", n, rec.EventTime, inOrder-maxLag)
+				}
+			}
+		})
 	}
 }
 
@@ -266,13 +288,13 @@ func TestOpenRejectsBadConfig(t *testing.T) {
 	}
 }
 
-func TestSeekRejectsNegativeOffset(t *testing.T) {
+func TestSeekToRejectsNegativeOffset(t *testing.T) {
 	g := open(t, testConfig(seeds[0]))
-	if err := g.Seek(-1); err == nil {
-		t.Fatal("Seek accepted a negative offset")
+	if err := g.SeekTo(-1); err == nil {
+		t.Fatal("SeekTo accepted a negative offset")
 	}
 	if got := g.Position(); got != 0 {
-		t.Errorf("a rejected Seek moved the position to %d", got)
+		t.Errorf("a rejected SeekTo moved the position to %d", got)
 	}
 }
 
