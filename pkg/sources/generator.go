@@ -23,7 +23,7 @@ type GeneratorConfig struct {
 // Salts separating the three derived streams. Independent streams come from
 // salting the seed rather than from advancing a counter, because advancing a
 // counter makes element n depend on how many elements were drawn before it,
-// which is exactly what Seek must not have to reconstruct.
+// which is exactly what SeekTo must not have to reconstruct.
 const (
 	keySalt   = 0x1
 	valueSalt = 0x2
@@ -33,7 +33,7 @@ const (
 // Generator is a seekable, deterministic source.
 //
 // Element n is a pure function of (Seed, n). It holds no generator state, only
-// a position, so Seek is an assignment and recovery from a checkpointed offset
+// a position, so SeekTo is an assignment and recovery from a checkpointed offset
 // replays exactly the records the failed run would have produced. A source
 // built around a held *rand.Rand cannot offer that: its output depends on how
 // many values have been drawn, not on which element is being asked for.
@@ -50,7 +50,7 @@ func NewGenerator(cfg GeneratorConfig) *Generator {
 	return &Generator{cfg: cfg}
 }
 
-// Open validates the config. It does not touch the position, so a Seek before
+// Open validates the config. It does not touch the position, so a SeekTo before
 // Open survives.
 func (g *Generator) Open(ctx core.Context) error {
 	switch {
@@ -80,9 +80,9 @@ func (g *Generator) Next() (*core.Record, bool, error) {
 	}, true, nil
 }
 
-// Seek positions the generator at offset. There is no accumulated state to
+// SeekTo positions the generator at offset. There is no accumulated state to
 // discard: the offset is the whole of the source's state.
-func (g *Generator) Seek(offset int64) error {
+func (g *Generator) SeekTo(offset int64) error {
 	if offset < 0 {
 		return fmt.Errorf("generator: seek to negative offset %d", offset)
 	}

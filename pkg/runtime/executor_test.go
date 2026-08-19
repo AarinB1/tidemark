@@ -131,9 +131,9 @@ func (s *failingSource) Next() (*core.Record, bool, error) {
 	return &core.Record{Key: []byte("k"), Value: []byte("v"), EventTime: s.pos}, true, nil
 }
 
-func (s *failingSource) Seek(offset int64) error { s.pos = offset; return nil }
-func (s *failingSource) Position() int64         { return s.pos }
-func (s *failingSource) Close() error            { return nil }
+func (s *failingSource) SeekTo(offset int64) error { s.pos = offset; return nil }
+func (s *failingSource) Position() int64           { return s.pos }
+func (s *failingSource) Close() error              { return nil }
 
 func TestRunPropagatesSourceError(t *testing.T) {
 	collect := sinks.NewCollect()

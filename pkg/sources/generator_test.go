@@ -54,10 +54,10 @@ func equalRecords(a, b *core.Record) bool {
 		a.EventTime == b.EventTime
 }
 
-// TestSeekMatchesSequentialRead is invariant 7: Seek(n) then read is identical
+// TestSeekToMatchesSequentialRead is invariant 7: SeekTo(n) then read is identical
 // to reading from 0 and discarding n. A generator that advanced a held random
 // source would fail here, and only here.
-func TestSeekMatchesSequentialRead(t *testing.T) {
+func TestSeekToMatchesSequentialRead(t *testing.T) {
 	const (
 		skip = 500
 		take = 100
@@ -67,11 +67,11 @@ func TestSeekMatchesSequentialRead(t *testing.T) {
 			cfg := testConfig(seed)
 
 			seeked := open(t, cfg)
-			if err := seeked.Seek(skip); err != nil {
-				t.Fatalf("Seek: %v", err)
+			if err := seeked.SeekTo(skip); err != nil {
+				t.Fatalf("SeekTo: %v", err)
 			}
 			if got := seeked.Position(); got != skip {
-				t.Fatalf("Position after Seek(%d) = %d", skip, got)
+				t.Fatalf("Position after SeekTo(%d) = %d", skip, got)
 			}
 			got := readN(t, seeked, take)
 
@@ -266,13 +266,13 @@ func TestOpenRejectsBadConfig(t *testing.T) {
 	}
 }
 
-func TestSeekRejectsNegativeOffset(t *testing.T) {
+func TestSeekToRejectsNegativeOffset(t *testing.T) {
 	g := open(t, testConfig(seeds[0]))
-	if err := g.Seek(-1); err == nil {
-		t.Fatal("Seek accepted a negative offset")
+	if err := g.SeekTo(-1); err == nil {
+		t.Fatal("SeekTo accepted a negative offset")
 	}
 	if got := g.Position(); got != 0 {
-		t.Errorf("a rejected Seek moved the position to %d", got)
+		t.Errorf("a rejected SeekTo moved the position to %d", got)
 	}
 }
 
