@@ -98,8 +98,8 @@ func TestValidate(t *testing.T) {
 	zeroParallelism := source("s")
 	zeroParallelism.Parallelism = 0
 
-	twoParallelism := source("s")
-	twoParallelism.Parallelism = 2
+	overTheCap := source("s")
+	overTheCap.Parallelism = maxParallelism + 1
 
 	tests := []struct {
 		name     string
@@ -170,10 +170,12 @@ func TestValidate(t *testing.T) {
 			wantErr:  errParallelismTooLow,
 		},
 		{
-			name:     "parallelism above one",
-			vertices: []Vertex{twoParallelism, sink("k")},
+			// Parallelism above one is no longer a failure: it is what Phase 1
+			// executes. Only the typo guard remains.
+			name:     "parallelism above the cap",
+			vertices: []Vertex{overTheCap, sink("k")},
 			edges:    []edge{{"s", "k"}},
-			wantErr:  errParallelismUnsupported,
+			wantErr:  errParallelismTooHigh,
 		},
 		{
 			name:     "source with inbound edge",
@@ -254,14 +256,32 @@ func TestValidateCycleReportsLeftoverVertices(t *testing.T) {
 	}
 }
 
-func TestValidateParallelismMessage(t *testing.T) {
+// TestValidateAcceptsParallelism covers the range the runtime executes. The
+// rejection this replaces was the Phase 0 boundary; Phase 1 removes it.
+func TestValidateAcceptsParallelism(t *testing.T) {
+	for _, p := range []int{1, 2, 4, 8, 64, maxParallelism} {
+		vs, es := chain()
+		for i := range vs {
+			vs[i].Parallelism = p
+		}
+		if _, err := build(vs, es); err != nil {
+			t.Errorf("parallelism %d: %v", p, err)
+		}
+	}
+}
+
+// TestValidateParallelismCapMessage checks the cap names its number. The cap
+// exists so a mistyped parallelism fails at validation rather than spawning
+// tens of thousands of goroutines, and an error that did not say the limit
+// would leave the reader guessing what to change it to.
+func TestValidateParallelismCapMessage(t *testing.T) {
 	v := source("s")
-	v.Parallelism = 2
+	v.Parallelism = maxParallelism + 1
 	_, err := build([]Vertex{v, sink("k")}, []edge{{"s", "k"}})
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if want := "parallelism > 1 arrives in Phase 1"; !strings.Contains(err.Error(), want) {
+	if want := "parallelism > 256"; !strings.Contains(err.Error(), want) {
 		t.Errorf("error %q does not contain %q", err, want)
 	}
 }
