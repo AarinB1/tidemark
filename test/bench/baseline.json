@@ -1,0 +1,39 @@
+{
+  "go_version": "go1.25.0",
+  "gomaxprocs": 4,
+  "num_cpu": 4,
+  "results": [
+    {
+      "parallelism": 1,
+      "records": 2000000,
+      "seed": 1,
+      "keys": 10000,
+      "elapsed_millis": 2869,
+      "records_per_sec": 696937.6797054895
+    },
+    {
+      "parallelism": 2,
+      "records": 2000000,
+      "seed": 1,
+      "keys": 10000,
+      "elapsed_millis": 2520,
+      "records_per_sec": 793488.2689904792
+    },
+    {
+      "parallelism": 4,
+      "records": 2000000,
+      "seed": 1,
+      "keys": 10000,
+      "elapsed_millis": 2318,
+      "records_per_sec": 862591.9951990752
+    },
+    {
+      "parallelism": 8,
+      "records": 2000000,
+      "seed": 1,
+      "keys": 10000,
+      "elapsed_millis": 2176,
+      "records_per_sec": 918783.8675735202
+    }
+  ]
+}

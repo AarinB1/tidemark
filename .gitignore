@@ -30,3 +30,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Benchmark reports. The committed baseline lives at test/bench/baseline.json;
+# a local run writes here and is not a repo artifact.
+bench.json
