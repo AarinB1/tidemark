@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -330,8 +332,14 @@ func TestWireCreatesOneChannelPerSubtaskPair(t *testing.T) {
 			}
 			inputs, outputs := wire(g, order)
 
+			// Each of these vertices has one downstream vertex, so one
+			// group, holding that edge's channel to every subtask on the far
+			// end.
 			for i := range tt.sourceP {
-				if got := len(outputs[subtaskID{"src", i}]); got != tt.operatorP {
+				if got := len(outputs[subtaskID{"src", i}]); got != 1 {
+					t.Fatalf("src[%d] has %d output groups, want 1", i, got)
+				}
+				if got := len(outputs[subtaskID{"src", i}][0]); got != tt.operatorP {
 					t.Errorf("src[%d] has %d outputs, want %d", i, got, tt.operatorP)
 				}
 			}
@@ -339,7 +347,10 @@ func TestWireCreatesOneChannelPerSubtaskPair(t *testing.T) {
 				if got := len(inputs[subtaskID{"id", j}]); got != tt.sourceP {
 					t.Errorf("id[%d] has %d inputs, want %d", j, got, tt.sourceP)
 				}
-				if got := len(outputs[subtaskID{"id", j}]); got != tt.sinkP {
+				if got := len(outputs[subtaskID{"id", j}]); got != 1 {
+					t.Fatalf("id[%d] has %d output groups, want 1", j, got)
+				}
+				if got := len(outputs[subtaskID{"id", j}][0]); got != tt.sinkP {
 					t.Errorf("id[%d] has %d outputs, want %d", j, got, tt.sinkP)
 				}
 			}
@@ -348,16 +359,18 @@ func TestWireCreatesOneChannelPerSubtaskPair(t *testing.T) {
 					t.Errorf("out[%d] has %d inputs, want %d", k, got, tt.operatorP)
 				}
 				if got := len(outputs[subtaskID{"out", k}]); got != 0 {
-					t.Errorf("out[%d] has %d outputs, want none", k, got)
+					t.Errorf("out[%d] has %d output groups, want none", k, got)
 				}
 			}
 
 			// Every channel appears once as somebody's output and once as
 			// somebody's input: one producer and one consumer each.
 			producers := make(map[any]int)
-			for _, outs := range outputs {
-				for _, o := range outs {
-					producers[o]++
+			for _, groups := range outputs {
+				for _, group := range groups {
+					for _, o := range group {
+						producers[o]++
+					}
 				}
 			}
 			consumers := make(map[any]int)
@@ -384,12 +397,17 @@ func TestWireCreatesOneChannelPerSubtaskPair(t *testing.T) {
 // fanOutGraph is one source feeding two parallel operators, both feeding one
 // sink, every vertex at p.
 //
-// A source subtask's outputs are the union of its channels to both operators,
-// and EmitRecord picks one of them. A record therefore goes to one operator or
-// the other, not to both: fan-out splits the stream rather than copying it,
-// which is invariant 2 applied to a vertex with two downstream vertices. Only
-// watermarks, barriers, and end-of-stream reach both. The sink consequently
-// holds each source record exactly once, the same contents the chain produces.
+// A source subtask's outputs are grouped by downstream vertex, one group for
+// left and one for right, and EmitRecord sends to exactly one output in each
+// group. A record therefore reaches both operators: partitioning happens WITHIN
+// an edge, choosing which subtask of left and which subtask of right handles
+// the key, and never between edges. left and right are different computations
+// over the same stream, so each must see all of it.
+//
+// The sink consequently holds each source record twice, once by way of each
+// branch, which is why this topology's oracle is the generator's output
+// doubled rather than the chain's. That is not duplication in the delivery
+// sense: it is two branches each producing a full result into a shared sink.
 func fanOutGraph(t *testing.T, cfg sources.GeneratorConfig, p int, sink core.Sink) *graph.Graph {
 	t.Helper()
 	return buildGraph(t, []graph.Vertex{
@@ -454,7 +472,11 @@ func TestSinkContentsAreIdenticalAcrossParallelism(t *testing.T) {
 			build: func(t *testing.T, p int, sink core.Sink) *graph.Graph {
 				return fanOutGraph(t, chainCfg, p, sink)
 			},
-			oracle: func(t *testing.T) []*core.Record { return readSource(t, chainCfg, nil) },
+			// Both branches carry the whole stream into the one sink, so the
+			// expected contents are the generator's output twice over.
+			oracle: func(t *testing.T) []*core.Record {
+				return append(readSource(t, chainCfg, nil), readSource(t, chainCfg, nil)...)
+			},
 		},
 		{
 			name: "multi input",
@@ -535,21 +557,51 @@ func (o *flushCountingOperator) OnEndOfStream(ctx core.Context) error {
 	return o.Operator.OnEndOfStream(ctx)
 }
 
-// TestFanOutSplitsTheStreamAcrossBothBranches keeps the fan-out case above from
-// being vacuous. If every record took the same branch, the sink contents would
-// still be right and the equivalence assertion would still pass, while the
-// topology under test was really a chain.
-func TestFanOutSplitsTheStreamAcrossBothBranches(t *testing.T) {
+// branchRecorder collects every record one branch of a fan-out saw. All p
+// subtasks of that branch share one, so it locks.
+type branchRecorder struct {
+	mu      sync.Mutex
+	records []*core.Record
+}
+
+func (b *branchRecorder) see(r *core.Record) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.records = append(b.records, r)
+}
+
+func (b *branchRecorder) seen() []*core.Record {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.records)
+}
+
+// TestFanOutSendsTheCompleteStreamToEveryBranch is the regression test for
+// records being partitioned across edges instead of within them.
+//
+// The version this replaces asserted only that the two branches saw
+// count records between them and that neither saw zero. Both of those hold
+// under the broken routing — splitting 5000 records into roughly 2500 each
+// satisfies them exactly — which is how the bug survived Phase 1 with a test
+// named for the property it failed to check. Counting is not enough: the
+// assertion has to be that each branch received the complete stream, which is
+// false under any split and true only when records are copied across edges.
+//
+// Compared sorted. Two branches consuming one source concurrently see it in
+// whatever order the shuffle produces, and comparing emission order would be a
+// broken test.
+func TestFanOutSendsTheCompleteStreamToEveryBranch(t *testing.T) {
 	const (
 		p     = 4
 		count = 5000
 	)
-	var left, right atomic.Int64
+	cfg := testGeneratorConfig(count)
+	var left, right branchRecorder
 
-	counting := func(seen *atomic.Int64) func() core.Operator {
+	recording := func(into *branchRecorder) func() core.Operator {
 		return func() core.Operator {
 			return operators.NewMap(func(r *core.Record) (*core.Record, error) {
-				seen.Add(1)
+				into.see(r)
 				return r, nil
 			})
 		}
@@ -557,9 +609,9 @@ func TestFanOutSplitsTheStreamAcrossBothBranches(t *testing.T) {
 
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(count)) }},
-		{ID: "left", Kind: graph.VertexOperator, Parallelism: p, NewOperator: counting(&left)},
-		{ID: "right", Kind: graph.VertexOperator, Parallelism: p, NewOperator: counting(&right)},
+			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+		{ID: "left", Kind: graph.VertexOperator, Parallelism: p, NewOperator: recording(&left)},
+		{ID: "right", Kind: graph.VertexOperator, Parallelism: p, NewOperator: recording(&right)},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
 			NewSink: func() core.Sink { return sinks.NewDiscard() }},
 	}, [][2]string{{"src", "left"}, {"src", "right"}, {"left", "out"}, {"right", "out"}})
@@ -568,12 +620,80 @@ func TestFanOutSplitsTheStreamAcrossBothBranches(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	l, r := left.Load(), right.Load()
-	// Split, not copied: each record went down exactly one branch.
-	if l+r != count {
-		t.Errorf("the branches saw %d records in total, want %d", l+r, count)
+	want := readSource(t, cfg, nil)
+	assertSameRecords(t, left.seen(), want, "the left branch")
+	assertSameRecords(t, right.seen(), want, "the right branch")
+}
+
+// TestWireGroupsOutputsByDownstreamVertex checks the grouping the Writer
+// depends on: one group per outgoing edge, groups in lexicographic order of
+// downstream vertex, each group holding that edge's channel to every subtask on
+// the far end.
+//
+// Group order does not decide where a record goes, since every group receives
+// every record. It decides which send is attempted first, and so which failure
+// surfaces when a cancelled job comes apart. Pinning it keeps that from varying
+// between runs.
+func TestWireGroupsOutputsByDownstreamVertex(t *testing.T) {
+	const (
+		sourceP = 2
+		leftP   = 3
+		rightP  = 5
+	)
+	g := buildGraph(t, []graph.Vertex{
+		{ID: "src", Kind: graph.VertexSource, Parallelism: sourceP,
+			NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(1)) }},
+		// "left" sorts before "right", so the groups must come out in that
+		// order whatever order the edges were added in.
+		{ID: "right", Kind: graph.VertexOperator, Parallelism: rightP, NewOperator: identity},
+		{ID: "left", Kind: graph.VertexOperator, Parallelism: leftP, NewOperator: identity},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: 1,
+			NewSink: func() core.Sink { return sinks.NewDiscard() }},
+	}, [][2]string{{"src", "right"}, {"src", "left"}, {"left", "out"}, {"right", "out"}})
+
+	order, err := g.TopoOrder()
+	if err != nil {
+		t.Fatalf("TopoOrder: %v", err)
 	}
-	if l == 0 || r == 0 {
-		t.Errorf("one branch saw nothing: left %d, right %d", l, r)
+	inputs, outputs := wire(g, order)
+
+	for i := range sourceP {
+		groups := outputs[subtaskID{"src", i}]
+		if len(groups) != 2 {
+			t.Fatalf("src[%d] has %d output groups, want one per downstream vertex", i, len(groups))
+		}
+		// Group 0 is the edge to "left", group 1 the edge to "right".
+		if got := len(groups[0]); got != leftP {
+			t.Errorf("src[%d] group 0 holds %d outputs, want %d (the left edge)", i, got, leftP)
+		}
+		if got := len(groups[1]); got != rightP {
+			t.Errorf("src[%d] group 1 holds %d outputs, want %d (the right edge)", i, got, rightP)
+		}
+	}
+
+	// Confirm the groups really are the left and right edges rather than two
+	// slices of the right sizes: every channel in group 0 must be an input of a
+	// "left" subtask, and every channel in group 1 an input of a "right" one.
+	for _, tt := range []struct {
+		group  int
+		vertex string
+		p      int
+	}{
+		{group: 0, vertex: "left", p: leftP},
+		{group: 1, vertex: "right", p: rightP},
+	} {
+		consumers := make(map[any]bool)
+		for j := range tt.p {
+			for _, in := range inputs[subtaskID{tt.vertex, j}] {
+				consumers[in] = true
+			}
+		}
+		for i := range sourceP {
+			for _, out := range outputs[subtaskID{"src", i}][tt.group] {
+				if !consumers[out] {
+					t.Errorf("src[%d] group %d holds a channel no %s subtask reads", i, tt.group, tt.vertex)
+				}
+			}
+		}
 	}
 }

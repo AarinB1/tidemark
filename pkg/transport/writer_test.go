@@ -38,6 +38,27 @@ func newCollectOutputs(n int) ([]Output, []*collectOutput) {
 	return outs, collected
 }
 
+// oneGroup wraps outs as a single group: a vertex with exactly one downstream
+// vertex.
+//
+// Every test below that uses it is also the assertion that the single-group
+// case behaves exactly as it did before outputs were grouped. Their bodies are
+// unchanged from when NewWriter took a flat list, so if grouping altered
+// routing, distribution, error handling, or closing for a vertex with one
+// downstream vertex, they would say so.
+func oneGroup(outs []Output) [][]Output { return [][]Output{outs} }
+
+// newCollectGroups builds one group of collectors per entry in sizes, so a test
+// can give a Writer downstream vertices of differing parallelism.
+func newCollectGroups(sizes ...int) ([][]Output, [][]*collectOutput) {
+	groups := make([][]Output, len(sizes))
+	collected := make([][]*collectOutput, len(sizes))
+	for i, n := range sizes {
+		groups[i], collected[i] = newCollectOutputs(n)
+	}
+	return groups, collected
+}
+
 // key returns the fixed-width big-endian encoding the generator uses, so the
 // tests here route the same byte strings the engine does.
 func key(n uint64) []byte {
@@ -53,7 +74,7 @@ func TestEmitRecordIsStableForTheSameKey(t *testing.T) {
 	for _, n := range []int{1, 2, 3, 4, 8, 16} {
 		t.Run(itoa(n), func(t *testing.T) {
 			outs, collected := newCollectOutputs(n)
-			w := NewWriter(outs)
+			w := NewWriter(oneGroup(outs))
 
 			// Where the first copy of each key landed.
 			first := make(map[uint64]int)
@@ -87,7 +108,7 @@ func TestEmitRecordIsStableForTheSameKey(t *testing.T) {
 func TestEmitRecordRoutesToExactlyOneOutput(t *testing.T) {
 	const records = 1000
 	outs, collected := newCollectOutputs(4)
-	w := NewWriter(outs)
+	w := NewWriter(oneGroup(outs))
 
 	for k := range uint64(records) {
 		if err := w.EmitRecord(context.Background(), &core.Record{Key: key(k)}); err != nil {
@@ -119,7 +140,7 @@ func TestEmitRecordDistributesEvenly(t *testing.T) {
 		tolerance = 0.10
 	)
 	outs, collected := newCollectOutputs(outputs)
-	w := NewWriter(outs)
+	w := NewWriter(oneGroup(outs))
 
 	for k := range uint64(keys) {
 		if err := w.EmitRecord(context.Background(), &core.Record{Key: key(k)}); err != nil {
@@ -150,7 +171,7 @@ func TestEmitRecordRejectsAnEmptyKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			outs, collected := newCollectOutputs(4)
-			w := NewWriter(outs)
+			w := NewWriter(oneGroup(outs))
 
 			if err := w.EmitRecord(context.Background(), &core.Record{Key: tt.key}); !errors.Is(err, errEmptyKey) {
 				t.Fatalf("EmitRecord = %v, want errEmptyKey", err)
@@ -185,7 +206,7 @@ func TestBroadcastReachesEveryOutputExactlyOnce(t *testing.T) {
 	for _, e := range elements {
 		t.Run(e.Kind.String(), func(t *testing.T) {
 			outs, collected := newCollectOutputs(6)
-			w := NewWriter(outs)
+			w := NewWriter(oneGroup(outs))
 
 			if err := w.Broadcast(context.Background(), e); err != nil {
 				t.Fatalf("Broadcast: %v", err)
@@ -210,7 +231,7 @@ func TestBroadcastStopsOnTheFirstError(t *testing.T) {
 	errSend := errors.New("send failed")
 	outs, collected := newCollectOutputs(4)
 	collected[1].err = errSend
-	w := NewWriter(outs)
+	w := NewWriter(oneGroup(outs))
 
 	if err := w.Broadcast(context.Background(), core.NewEndOfStreamElement()); !errors.Is(err, errSend) {
 		t.Fatalf("Broadcast = %v, want %v", err, errSend)
@@ -222,7 +243,7 @@ func TestBroadcastStopsOnTheFirstError(t *testing.T) {
 
 func TestCloseAllClosesEveryOutputOnce(t *testing.T) {
 	outs, collected := newCollectOutputs(5)
-	w := NewWriter(outs)
+	w := NewWriter(oneGroup(outs))
 	w.CloseAll()
 
 	for i, out := range collected {
@@ -237,7 +258,7 @@ func TestCloseAllClosesEveryOutputOnce(t *testing.T) {
 func TestChannelSatisfiesTheSeam(t *testing.T) {
 	chans := []*Channel{NewChannel(4), NewChannel(4)}
 	outs := []Output{chans[0], chans[1]}
-	w := NewWriter(outs)
+	w := NewWriter(oneGroup(outs))
 
 	if err := w.EmitRecord(context.Background(), &core.Record{Key: key(1)}); err != nil {
 		t.Fatalf("EmitRecord: %v", err)
@@ -297,7 +318,9 @@ func TestEmitRecordDoesNotAllocate(t *testing.T) {
 	for i := range outs {
 		outs[i] = discardOutput{}
 	}
-	w := NewWriter(outs)
+	// Three groups of different sizes, so this covers the loop over groups and
+	// the reuse of one hash across them, not just the single-group path.
+	w := NewWriter([][]Output{outs[:3], outs[3:5], outs[5:]})
 	ctx := context.Background()
 	rec := &core.Record{Key: key(12345), Value: make([]byte, 16)}
 
@@ -322,7 +345,7 @@ func BenchmarkEmitRecord(b *testing.B) {
 	for i := range outs {
 		outs[i] = discardOutput{}
 	}
-	w := NewWriter(outs)
+	w := NewWriter([][]Output{outs[:3], outs[3:5], outs[5:]})
 	ctx := context.Background()
 	rec := &core.Record{Key: key(12345), Value: make([]byte, 16)}
 
@@ -331,6 +354,187 @@ func BenchmarkEmitRecord(b *testing.B) {
 		if err := w.EmitRecord(ctx, rec); err != nil {
 			b.Fatalf("EmitRecord: %v", err)
 		}
+	}
+}
+
+// TestEmitRecordReachesEveryGroup is the core of the fix: a record is
+// partitioned within each group and copied across them.
+//
+// The groups are deliberately of different sizes. Equal sizes would let a
+// single shared modulo pass, since every group would agree on an index by
+// coincidence; 2 and 3 share no factor, so agreement can only come from
+// computing the index per group.
+func TestEmitRecordReachesEveryGroup(t *testing.T) {
+	const records = 900
+	groups, collected := newCollectGroups(2, 3)
+	w := NewWriter(groups)
+
+	for k := range uint64(records) {
+		if err := w.EmitRecord(context.Background(), &core.Record{Key: key(k)}); err != nil {
+			t.Fatalf("EmitRecord: %v", err)
+		}
+	}
+
+	for gi, group := range collected {
+		total := 0
+		for _, out := range group {
+			for _, e := range out.elements {
+				if e.Kind != core.KindRecord {
+					t.Fatalf("EmitRecord sent a %s element", e.Kind)
+				}
+			}
+			total += len(out.elements)
+		}
+		// Exactly once within the group: every record arrived, and none of them
+		// arrived twice.
+		if total != records {
+			t.Errorf("group %d holds %d records, want %d", gi, total, records)
+		}
+	}
+}
+
+// TestEmitRecordPartitionsIndependentlyPerGroup proves the modulo is taken per
+// group rather than once for all of them.
+//
+// It finds a key that lands on index 0 of a group of 2 and on a nonzero index
+// of a group of 3. A Writer that computed one index and reused it across groups
+// would put that record at index 0 in both, so this is the case that
+// distinguishes reusing the hash, which is correct and what the code does, from
+// reusing the index, which is not.
+func TestEmitRecordPartitionsIndependentlyPerGroup(t *testing.T) {
+	const (
+		small = 2
+		large = 3
+	)
+
+	var (
+		k     uint64
+		found bool
+	)
+	for candidate := range uint64(1000) {
+		h := fnv1a(key(candidate))
+		if h%small == 0 && h%large != 0 {
+			k, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no key in the first 1000 lands on index 0 of one group and a nonzero index of the other")
+	}
+
+	groups, collected := newCollectGroups(small, large)
+	w := NewWriter(groups)
+	if err := w.EmitRecord(context.Background(), &core.Record{Key: key(k)}); err != nil {
+		t.Fatalf("EmitRecord: %v", err)
+	}
+
+	if len(collected[0][0].elements) != 1 {
+		t.Errorf("key %d did not land on index 0 of the group of %d", k, small)
+	}
+	if n := len(collected[1][0].elements); n != 0 {
+		t.Errorf("key %d landed on index 0 of the group of %d as well: the index was reused across groups", k, large)
+	}
+	// It still arrived somewhere in the second group.
+	total := 0
+	for _, out := range collected[1] {
+		total += len(out.elements)
+	}
+	if total != 1 {
+		t.Errorf("the group of %d received %d copies of the record, want exactly 1", large, total)
+	}
+}
+
+// TestEmitRecordStopsOnTheFirstFailingGroup pins the contract opContext relies
+// on: the first failed send returns, and no later group is attempted.
+func TestEmitRecordStopsOnTheFirstFailingGroup(t *testing.T) {
+	errSend := errors.New("send failed")
+	groups, collected := newCollectGroups(1, 1, 1)
+	collected[1][0].err = errSend
+	w := NewWriter(groups)
+
+	if err := w.EmitRecord(context.Background(), &core.Record{Key: key(7)}); !errors.Is(err, errSend) {
+		t.Fatalf("EmitRecord = %v, want %v", err, errSend)
+	}
+	if len(collected[2][0].elements) != 0 {
+		t.Error("EmitRecord kept sending after a group failed")
+	}
+}
+
+// TestBroadcastReachesEveryOutputInEveryGroup is invariant 2 for control
+// elements at a vertex with several downstream vertices. A barrier that reached
+// every subtask of one downstream vertex but none of another deadlocks
+// alignment on that second edge in Phase 3.
+func TestBroadcastReachesEveryOutputInEveryGroup(t *testing.T) {
+	elements := []core.StreamElement{
+		core.NewEndOfStreamElement(),
+		core.NewWatermarkElement(1700000000000),
+		core.NewBarrierElement(&core.Barrier{CheckpointID: 3}),
+	}
+
+	for _, e := range elements {
+		t.Run(e.Kind.String(), func(t *testing.T) {
+			groups, collected := newCollectGroups(1, 2, 3)
+			w := NewWriter(groups)
+
+			if err := w.Broadcast(context.Background(), e); err != nil {
+				t.Fatalf("Broadcast: %v", err)
+			}
+			for gi, group := range collected {
+				for i, out := range group {
+					if len(out.elements) != 1 {
+						t.Fatalf("group %d output %d received %d elements, want exactly 1",
+							gi, i, len(out.elements))
+					}
+					if out.elements[0].Kind != e.Kind {
+						t.Errorf("group %d output %d received a %s element, want %s",
+							gi, i, out.elements[0].Kind, e.Kind)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestCloseAllClosesEveryGroup checks no downstream vertex is left hanging.
+// Recv has no context to watch, so an unclosed group blocks every subtask of
+// that vertex forever.
+func TestCloseAllClosesEveryGroup(t *testing.T) {
+	groups, collected := newCollectGroups(1, 2, 3)
+	NewWriter(groups).CloseAll()
+
+	for gi, group := range collected {
+		for i, out := range group {
+			if out.closes != 1 {
+				t.Errorf("group %d output %d closed %d times, want exactly 1", gi, i, out.closes)
+			}
+		}
+	}
+}
+
+// TestNewWriterRejectsAnEmptyGroup covers the wiring bug this cannot otherwise
+// report. Graph validation guarantees parallelism >= 1, so an empty group means
+// the runtime built the group wrongly; accepting it would give a downstream
+// vertex that silently receives nothing.
+func TestNewWriterRejectsAnEmptyGroup(t *testing.T) {
+	outs, _ := newCollectOutputs(2)
+	tests := []struct {
+		name   string
+		groups [][]Output
+	}{
+		{name: "only group is empty", groups: [][]Output{{}}},
+		{name: "later group is empty", groups: [][]Output{outs, {}}},
+		{name: "nil group", groups: [][]Output{nil}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Error("NewWriter accepted a group with no outputs")
+				}
+			}()
+			NewWriter(tt.groups)
+		})
 	}
 }
 

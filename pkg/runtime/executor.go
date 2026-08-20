@@ -98,37 +98,53 @@ func Run(ctx context.Context, g *graph.Graph) error {
 // exactly one consumer, which is the contract *transport.Channel is built on
 // and the reason a subtask may close its own outputs and nothing else.
 //
-// Order matters and is fixed here. A subtask's outputs are ordered by
-// downstream vertex (lexicographic, from Downstream) and then by downstream
-// index, because the writer picks among them by hash modulo their count: a
-// different order would send the same key to a different subtask between runs
-// and quietly falsify the reproducibility claim. A subtask's inputs are ordered
-// by upstream vertex and then by upstream index for the same reason in
-// reverse — Phase 2 indexes per-input watermarks by position, and Phase 3
-// indexes barrier alignment the same way.
-func wire(g *graph.Graph, order []graph.Vertex) (map[subtaskID][]transport.Input, map[subtaskID][]transport.Output) {
+// A subtask's outputs are grouped by downstream vertex: one group per outgoing
+// edge, holding that edge's channel to each subtask on the far end. The Writer
+// partitions within a group and broadcasts across groups, so the grouping is
+// what makes a vertex with two downstream vertices send the whole stream to
+// each rather than splitting it between them. A flat list cannot express that
+// distinction, which is how the split survived Phase 1.
+//
+// Order matters and is fixed here. The groups are ordered by downstream vertex
+// (lexicographic, from Downstream) and each group's outputs by downstream
+// index. Within a group the order is load-bearing: the writer picks among a
+// group by hash modulo its length, so a different order would send the same key
+// to a different subtask between runs and quietly falsify the reproducibility
+// claim. Across groups it is not — every group receives every record — but it
+// still fixes which send is attempted first, and therefore which failure
+// surfaces when a cancelled job comes apart. That should not vary run to run
+// either. A subtask's inputs are ordered by upstream vertex and then by
+// upstream index for the same reason in reverse — Phase 2 indexes per-input
+// watermarks by position, and Phase 3 indexes barrier alignment the same way.
+func wire(g *graph.Graph, order []graph.Vertex) (map[subtaskID][]transport.Input, map[subtaskID][][]transport.Output) {
 	byID := make(map[string]graph.Vertex, len(order))
 	for _, v := range order {
 		byID[v.ID] = v
 	}
 
 	inputs := make(map[subtaskID][]transport.Input)
-	outputs := make(map[subtaskID][]transport.Output)
+	outputs := make(map[subtaskID][][]transport.Output)
 
 	// order is topological with a lexicographic tie-break and Downstream is
-	// sorted, so this traversal, and therefore the channel order, is a function
-	// of the graph alone.
+	// already sorted lexicographically, so this traversal, and therefore both
+	// the group order and the channel order within a group, is a function of
+	// the graph alone.
 	for _, from := range order {
 		for _, toID := range g.Downstream(from.ID) {
 			to := byID[toID]
 			for i := range from.Parallelism {
+				producer := subtaskID{vertexID: from.ID, index: i}
+				// One group per edge. to.Parallelism >= 1 is guaranteed by
+				// graph validation, so this group is never empty and NewWriter
+				// never rejects it.
+				group := make([]transport.Output, 0, to.Parallelism)
 				for j := range to.Parallelism {
 					ch := transport.NewChannel(transport.DefaultCapacity)
-					producer := subtaskID{vertexID: from.ID, index: i}
 					consumer := subtaskID{vertexID: toID, index: j}
-					outputs[producer] = append(outputs[producer], ch)
+					group = append(group, ch)
 					inputs[consumer] = append(inputs[consumer], ch)
 				}
+				outputs[producer] = append(outputs[producer], group)
 			}
 		}
 	}

@@ -413,7 +413,7 @@ func TestOpContextEmitStopsAfterFirstFailure(t *testing.T) {
 	const capacity = 4
 	ch := transport.NewChannel(capacity)
 	ctx, cancel := context.WithCancel(context.Background())
-	oc := newOpContext(ctx, transport.NewWriter([]transport.Output{ch}))
+	oc := newOpContext(ctx, transport.NewWriter([][]transport.Output{{ch}}))
 
 	// Fill the buffer first, so the Emit after cancellation has nowhere to put
 	// its record and fails on the cancelled context rather than racing it.
@@ -472,7 +472,7 @@ func TestOpContextEmitStopsAfterFirstFailure(t *testing.T) {
 func TestOpContextEmitHoldsSendError(t *testing.T) {
 	ch := transport.NewChannel(1)
 	ctx, cancel := context.WithCancel(context.Background())
-	oc := newOpContext(ctx, transport.NewWriter([]transport.Output{ch}))
+	oc := newOpContext(ctx, transport.NewWriter([][]transport.Output{{ch}}))
 
 	oc.Emit(&core.Record{Key: []byte("a")})
 	if err := oc.takeErr(); err != nil {
