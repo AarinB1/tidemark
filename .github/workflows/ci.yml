@@ -15,3 +15,17 @@ jobs:
           go-version: "1.25"
 
       - run: make check
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # 40 percent, not the 15 percent used locally. Shared runners are noisy,
+      # and a tight threshold here produces false alarms that train you to
+      # ignore the check. The 15 percent comparison stays local.
+      - run: make bench-check BENCH_THRESHOLD=40

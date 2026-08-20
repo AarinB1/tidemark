@@ -346,59 +346,6 @@ func TestRunRejectsInvalidGraph(t *testing.T) {
 	}
 }
 
-// TestRunRejectsMultiInputAndFanOut pins the Phase 0 boundary: merging inputs
-// needs the input gate and splitting outputs needs the partitioner, both of
-// which arrive in Phase 1. Approximating either produces wrong results rather
-// than a failure, so Run refuses.
-func TestRunRejectsMultiInputAndFanOut(t *testing.T) {
-	newSource := func() core.Source { return sources.NewGenerator(testGeneratorConfig(10)) }
-	newSink := func() core.Sink { return sinks.NewCollect() }
-
-	tests := []struct {
-		name     string
-		vertices []graph.Vertex
-		edges    [][2]string
-	}{
-		{
-			name: "two inputs",
-			vertices: []graph.Vertex{
-				{ID: "a", Kind: graph.VertexSource, Parallelism: 1, NewSource: newSource},
-				{ID: "b", Kind: graph.VertexSource, Parallelism: 1, NewSource: newSource},
-				{ID: "out", Kind: graph.VertexSink, Parallelism: 1, NewSink: newSink},
-			},
-			edges: [][2]string{{"a", "out"}, {"b", "out"}},
-		},
-		{
-			name: "two outputs",
-			vertices: []graph.Vertex{
-				{ID: "src", Kind: graph.VertexSource, Parallelism: 1, NewSource: newSource},
-				{ID: "x", Kind: graph.VertexSink, Parallelism: 1, NewSink: newSink},
-				{ID: "y", Kind: graph.VertexSink, Parallelism: 1, NewSink: newSink},
-			},
-			edges: [][2]string{{"src", "x"}, {"src", "y"}},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			g := graph.New()
-			for _, v := range tt.vertices {
-				if err := g.AddVertex(v); err != nil {
-					t.Fatalf("AddVertex: %v", err)
-				}
-			}
-			for _, e := range tt.edges {
-				if err := g.Connect(e[0], e[1]); err != nil {
-					t.Fatalf("Connect: %v", err)
-				}
-			}
-			if err := Run(context.Background(), g); err == nil {
-				t.Fatal("Run accepted a topology that needs Phase 1")
-			}
-		})
-	}
-}
-
 func TestOpContextInitialWatermark(t *testing.T) {
 	oc := newOpContext(context.Background(), nil)
 	if got := oc.CurrentWatermark(); got != math.MinInt64 {
@@ -466,7 +413,7 @@ func TestOpContextEmitStopsAfterFirstFailure(t *testing.T) {
 	const capacity = 4
 	ch := transport.NewChannel(capacity)
 	ctx, cancel := context.WithCancel(context.Background())
-	oc := newOpContext(ctx, []*transport.Channel{ch})
+	oc := newOpContext(ctx, transport.NewWriter([]transport.Output{ch}))
 
 	// Fill the buffer first, so the Emit after cancellation has nowhere to put
 	// its record and fails on the cancelled context rather than racing it.
@@ -525,7 +472,7 @@ func TestOpContextEmitStopsAfterFirstFailure(t *testing.T) {
 func TestOpContextEmitHoldsSendError(t *testing.T) {
 	ch := transport.NewChannel(1)
 	ctx, cancel := context.WithCancel(context.Background())
-	oc := newOpContext(ctx, []*transport.Channel{ch})
+	oc := newOpContext(ctx, transport.NewWriter([]transport.Output{ch}))
 
 	oc.Emit(&core.Record{Key: []byte("a")})
 	if err := oc.takeErr(); err != nil {

@@ -10,6 +10,15 @@ import (
 	"github.com/AarinB1/tidemark/pkg/core"
 )
 
+// maxParallelism bounds the subtasks one vertex may have.
+//
+// The runtime gives every subtask a goroutine and every edge P*Q channels, so a
+// mistyped parallelism is not a slow job but tens of thousands of goroutines and
+// a machine that stops responding. The cap is a typo guard rather than a claim
+// about what the engine can schedule; a job that genuinely wants more subtasks
+// than this wants more than one process, which is Phase 7.
+const maxParallelism = 256
+
 // VertexKind is the role a vertex plays in the pipeline.
 type VertexKind uint8
 
@@ -52,23 +61,23 @@ type Vertex struct {
 // Validation failures. Each condition has its own error so that callers and
 // tests can tell them apart with errors.Is.
 var (
-	errEmptyID                = errors.New("vertex ID is empty")
-	errDuplicateID            = errors.New("duplicate vertex ID")
-	errUnknownVertex          = errors.New("unknown vertex")
-	errDuplicateEdge          = errors.New("duplicate edge")
-	errUnknownKind            = errors.New("unknown vertex kind")
-	errMissingFactory         = errors.New("factory for kind is nil")
-	errExtraFactory           = errors.New("factory set that does not match kind")
-	errParallelismTooLow      = errors.New("parallelism < 1")
-	errParallelismUnsupported = errors.New("parallelism > 1 arrives in Phase 1")
-	errSourceHasInbound       = errors.New("source has inbound edges")
-	errSinkHasOutbound        = errors.New("sink has outbound edges")
-	errOperatorNoInput        = errors.New("operator has no inputs")
-	errOperatorNoOutput       = errors.New("operator has no outputs")
-	errDisconnected           = errors.New("vertex has no edges")
-	errNoSource               = errors.New("graph has no source")
-	errNoSink                 = errors.New("graph has no sink")
-	errCycle                  = errors.New("graph has a cycle")
+	errEmptyID            = errors.New("vertex ID is empty")
+	errDuplicateID        = errors.New("duplicate vertex ID")
+	errUnknownVertex      = errors.New("unknown vertex")
+	errDuplicateEdge      = errors.New("duplicate edge")
+	errUnknownKind        = errors.New("unknown vertex kind")
+	errMissingFactory     = errors.New("factory for kind is nil")
+	errExtraFactory       = errors.New("factory set that does not match kind")
+	errParallelismTooLow  = errors.New("parallelism < 1")
+	errParallelismTooHigh = errors.New("parallelism > 256")
+	errSourceHasInbound   = errors.New("source has inbound edges")
+	errSinkHasOutbound    = errors.New("sink has outbound edges")
+	errOperatorNoInput    = errors.New("operator has no inputs")
+	errOperatorNoOutput   = errors.New("operator has no outputs")
+	errDisconnected       = errors.New("vertex has no edges")
+	errNoSource           = errors.New("graph has no source")
+	errNoSink             = errors.New("graph has no sink")
+	errCycle              = errors.New("graph has a cycle")
 )
 
 // Graph is a job under construction. The zero value is not usable; call New.
@@ -139,8 +148,8 @@ func (g *Graph) Validate() error {
 		if v.Parallelism < 1 {
 			return fmt.Errorf("vertex %q: parallelism %d: %w", id, v.Parallelism, errParallelismTooLow)
 		}
-		if v.Parallelism > 1 {
-			return fmt.Errorf("vertex %q: parallelism %d: %w", id, v.Parallelism, errParallelismUnsupported)
+		if v.Parallelism > maxParallelism {
+			return fmt.Errorf("vertex %q: parallelism %d: %w", id, v.Parallelism, errParallelismTooHigh)
 		}
 		if err := checkFactories(v); err != nil {
 			return fmt.Errorf("vertex %q: %w", id, err)

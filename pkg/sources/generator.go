@@ -93,6 +93,11 @@ func (g *Generator) SeekTo(offset int64) error {
 // Position returns the offset of the element the next Next will return.
 func (g *Generator) Position() int64 { return g.pos }
 
+// Count returns the number of elements the generator produces from offset 0.
+// It is what lets a parallel source vertex divide the offset space into one
+// contiguous range per subtask.
+func (g *Generator) Count() int64 { return g.cfg.Count }
+
 // Close releases nothing; the generator holds no resources.
 func (g *Generator) Close() error { return nil }
 
