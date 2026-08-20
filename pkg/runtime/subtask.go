@@ -26,11 +26,12 @@ func (id subtaskID) String() string { return fmt.Sprintf("%s[%d]", id.vertexID, 
 // the only signal it has. A subtask closes its own outputs and nothing else,
 // which is what keeps one producer per channel true at P*Q channels.
 //
-// gate is nil for a source, which has no inputs, and outs is empty for a sink,
-// which has no outputs.
-func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, outs []transport.Output) error {
+// gate is nil for a source, which has no inputs, and groups is empty for a
+// sink, which has no outputs. groups holds one group of outputs per downstream
+// vertex; see transport.NewWriter for what the grouping buys.
+func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, groups [][]transport.Output) error {
 	id := subtaskID{vertexID: v.ID, index: index}
-	w := transport.NewWriter(outs)
+	w := transport.NewWriter(groups)
 	defer w.CloseAll()
 
 	switch v.Kind {
