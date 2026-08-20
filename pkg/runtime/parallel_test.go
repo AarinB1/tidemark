@@ -380,3 +380,200 @@ func TestWireCreatesOneChannelPerSubtaskPair(t *testing.T) {
 		})
 	}
 }
+
+// fanOutGraph is one source feeding two parallel operators, both feeding one
+// sink, every vertex at p.
+//
+// A source subtask's outputs are the union of its channels to both operators,
+// and EmitRecord picks one of them. A record therefore goes to one operator or
+// the other, not to both: fan-out splits the stream rather than copying it,
+// which is invariant 2 applied to a vertex with two downstream vertices. Only
+// watermarks, barriers, and end-of-stream reach both. The sink consequently
+// holds each source record exactly once, the same contents the chain produces.
+func fanOutGraph(t *testing.T, cfg sources.GeneratorConfig, p int, sink core.Sink) *graph.Graph {
+	t.Helper()
+	return buildGraph(t, []graph.Vertex{
+		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
+			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+		{ID: "left", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
+		{ID: "right", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
+			NewSink: func() core.Sink { return sink }},
+	}, [][2]string{{"src", "left"}, {"src", "right"}, {"left", "out"}, {"right", "out"}})
+}
+
+// multiInputGraph is two sources feeding one operator, every vertex at p. The
+// operator's gate merges 2*p inputs and must emit one end-of-stream after the
+// last of them, not one per input.
+func multiInputGraph(t *testing.T, a, b sources.GeneratorConfig, p int, sink core.Sink) *graph.Graph {
+	t.Helper()
+	return buildGraph(t, []graph.Vertex{
+		{ID: "srcA", Kind: graph.VertexSource, Parallelism: p,
+			NewSource: func() core.Source { return sources.NewGenerator(a) }},
+		{ID: "srcB", Kind: graph.VertexSource, Parallelism: p,
+			NewSource: func() core.Source { return sources.NewGenerator(b) }},
+		{ID: "merge", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
+			NewSink: func() core.Sink { return sink }},
+	}, [][2]string{{"srcA", "merge"}, {"srcB", "merge"}, {"merge", "out"}})
+}
+
+// TestSinkContentsAreIdenticalAcrossParallelism is the Phase 1 exit criterion.
+//
+// The same seed at parallelism 1, 2, 4 and 8 must put the same records in the
+// sink. Sorted contents, never emission order: order across parallelism differs
+// by design, since P source subtasks read disjoint ranges concurrently and the
+// shuffle interleaves them, and a test that compared order would be a broken
+// test.
+//
+// Each level is also compared against an oracle read straight from the
+// generator, so a systematic error that shifted all four levels the same way
+// cannot pass. 10k records, because this runs under -race and parallelism 8
+// under -race is slow.
+func TestSinkContentsAreIdenticalAcrossParallelism(t *testing.T) {
+	const count = 10000
+	chainCfg := testGeneratorConfig(count)
+	leftCfg, rightCfg := testGeneratorConfig(count), testGeneratorConfig(count)
+	rightCfg.Seed = chainCfg.Seed + 1
+
+	tests := []struct {
+		name  string
+		build func(t *testing.T, p int, sink core.Sink) *graph.Graph
+		// oracle is the expected sink contents, computed without the runtime.
+		oracle func(t *testing.T) []*core.Record
+	}{
+		{
+			name: "chain",
+			build: func(t *testing.T, p int, sink core.Sink) *graph.Graph {
+				return parallelChain(t, chainCfg, p, sink)
+			},
+			oracle: func(t *testing.T) []*core.Record { return readSource(t, chainCfg, nil) },
+		},
+		{
+			name: "fan out",
+			build: func(t *testing.T, p int, sink core.Sink) *graph.Graph {
+				return fanOutGraph(t, chainCfg, p, sink)
+			},
+			oracle: func(t *testing.T) []*core.Record { return readSource(t, chainCfg, nil) },
+		},
+		{
+			name: "multi input",
+			build: func(t *testing.T, p int, sink core.Sink) *graph.Graph {
+				return multiInputGraph(t, leftCfg, rightCfg, p, sink)
+			},
+			oracle: func(t *testing.T) []*core.Record {
+				return append(readSource(t, leftCfg, nil), readSource(t, rightCfg, nil)...)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := tt.oracle(t)
+
+			var atOne []*core.Record
+			for _, p := range parallelismLevels {
+				collect := sinks.NewCollect()
+				if err := Run(context.Background(), tt.build(t, p, collect)); err != nil {
+					t.Fatalf("parallelism %d: Run: %v", p, err)
+				}
+				got := collect.Records()
+
+				assertSameRecords(t, got, want, "parallelism %d against the generator", p)
+				if p == parallelismLevels[0] {
+					atOne = got
+					continue
+				}
+				assertSameRecords(t, got, atOne, "parallelism %d against parallelism %d", p, parallelismLevels[0])
+			}
+		})
+	}
+}
+
+// TestMultiInputEmitsOneEndOfStream checks the gate's contract end to end. An
+// operator merging 2*p inputs must call OnEndOfStream once and forward one
+// end-of-stream, not one per input; forwarding several would make a downstream
+// aggregating operator flush repeatedly in Phase 2.
+func TestMultiInputEmitsOneEndOfStream(t *testing.T) {
+	const (
+		p     = 4
+		count = 500
+	)
+	a, b := testGeneratorConfig(count), testGeneratorConfig(count)
+	b.Seed = a.Seed + 1
+
+	var flushes atomic.Int64
+	g := buildGraph(t, []graph.Vertex{
+		{ID: "srcA", Kind: graph.VertexSource, Parallelism: p,
+			NewSource: func() core.Source { return sources.NewGenerator(a) }},
+		{ID: "srcB", Kind: graph.VertexSource, Parallelism: p,
+			NewSource: func() core.Source { return sources.NewGenerator(b) }},
+		{ID: "merge", Kind: graph.VertexOperator, Parallelism: p, NewOperator: func() core.Operator {
+			return &flushCountingOperator{Operator: identity(), flushes: &flushes}
+		}},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
+			NewSink: func() core.Sink { return sinks.NewDiscard() }},
+	}, [][2]string{{"srcA", "merge"}, {"srcB", "merge"}, {"merge", "out"}})
+
+	if err := Run(context.Background(), g); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := flushes.Load(); got != p {
+		t.Errorf("OnEndOfStream ran %d times across %d subtasks with %d inputs each, want %d",
+			got, p, 2*p, p)
+	}
+}
+
+// flushCountingOperator records how often the runtime declares the stream over.
+type flushCountingOperator struct {
+	core.Operator
+	flushes *atomic.Int64
+}
+
+func (o *flushCountingOperator) OnEndOfStream(ctx core.Context) error {
+	o.flushes.Add(1)
+	return o.Operator.OnEndOfStream(ctx)
+}
+
+// TestFanOutSplitsTheStreamAcrossBothBranches keeps the fan-out case above from
+// being vacuous. If every record took the same branch, the sink contents would
+// still be right and the equivalence assertion would still pass, while the
+// topology under test was really a chain.
+func TestFanOutSplitsTheStreamAcrossBothBranches(t *testing.T) {
+	const (
+		p     = 4
+		count = 5000
+	)
+	var left, right atomic.Int64
+
+	counting := func(seen *atomic.Int64) func() core.Operator {
+		return func() core.Operator {
+			return operators.NewMap(func(r *core.Record) (*core.Record, error) {
+				seen.Add(1)
+				return r, nil
+			})
+		}
+	}
+
+	g := buildGraph(t, []graph.Vertex{
+		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
+			NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(count)) }},
+		{ID: "left", Kind: graph.VertexOperator, Parallelism: p, NewOperator: counting(&left)},
+		{ID: "right", Kind: graph.VertexOperator, Parallelism: p, NewOperator: counting(&right)},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
+			NewSink: func() core.Sink { return sinks.NewDiscard() }},
+	}, [][2]string{{"src", "left"}, {"src", "right"}, {"left", "out"}, {"right", "out"}})
+
+	if err := Run(context.Background(), g); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	l, r := left.Load(), right.Load()
+	// Split, not copied: each record went down exactly one branch.
+	if l+r != count {
+		t.Errorf("the branches saw %d records in total, want %d", l+r, count)
+	}
+	if l == 0 || r == 0 {
+		t.Errorf("one branch saw nothing: left %d, right %d", l, r)
+	}
+}
