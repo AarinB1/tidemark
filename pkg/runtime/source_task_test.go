@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/core"
+	"github.com/AarinB1/tidemark/pkg/graph"
+	"github.com/AarinB1/tidemark/pkg/sinks"
 	"github.com/AarinB1/tidemark/pkg/sources"
 )
 
@@ -283,5 +286,99 @@ func assertSameRecords(t *testing.T, got, want []*core.Record, format string, ar
 		if compareRecords(gotSorted[i], wantSorted[i]) != 0 {
 			t.Fatalf("%s: record %d: got %+v, want %+v", label, i, gotSorted[i], wantSorted[i])
 		}
+	}
+}
+
+// hidingDecorator wraps a source by embedding the core.Source interface, which
+// promotes only that interface's methods. Count is not among them, so this type
+// does not satisfy splittableSource however splittable the source inside it is.
+//
+// This is the accident the comment on splittableSource is about, written the
+// way somebody would write it by hand.
+type hidingDecorator struct {
+	core.Source
+}
+
+// forwardingDecorator wraps a source the same way but forwards Count, which is
+// all it takes to stay splittable.
+type forwardingDecorator struct {
+	core.Source
+	count int64
+}
+
+func (s *forwardingDecorator) Count() int64 { return s.count }
+
+// TestRunRefusesADecoratorThatHidesCount pins the rule that a decorator must
+// forward Count explicitly.
+//
+// The two rows are the point. The first alone would pass for any reason a job
+// might fail; the second, over the same source, same graph, and same
+// parallelism, differing only in whether Count is forwarded, is what shows the
+// refusal is about the missing Count and not something incidental to wrapping.
+//
+// Phase 4 wraps sources to inject faults at logical positions. A wrapper that
+// dropped Count would force the fault suite to parallelism 1, where the
+// concurrency bugs it exists to find do not occur, and it would still pass.
+func TestRunRefusesADecoratorThatHidesCount(t *testing.T) {
+	const (
+		count = 500
+		p     = 2
+	)
+	cfg := testGeneratorConfig(count)
+
+	tests := []struct {
+		name      string
+		newSource func() core.Source
+		wantErr   bool
+	}{
+		{
+			name: "decorator hides Count",
+			newSource: func() core.Source {
+				return &hidingDecorator{Source: sources.NewGenerator(cfg)}
+			},
+			wantErr: true,
+		},
+		{
+			name: "decorator forwards Count",
+			newSource: func() core.Source {
+				return &forwardingDecorator{Source: sources.NewGenerator(cfg), count: count}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			collect := sinks.NewCollect()
+			g := buildGraph(t, []graph.Vertex{
+				{ID: "src", Kind: graph.VertexSource, Parallelism: p, NewSource: tt.newSource},
+				{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
+				{ID: "out", Kind: graph.VertexSink, Parallelism: p,
+					NewSink: func() core.Sink { return collect }},
+			}, [][2]string{{"src", "id"}, {"id", "out"}})
+
+			err := Run(context.Background(), g)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("Run: %v", err)
+				}
+				// The forwarding decorator is not merely accepted: its subtasks
+				// read disjoint ranges and together produce the whole source.
+				assertSameRecords(t, collect.Records(), readSource(t, cfg, nil),
+					"a decorator that forwards Count at parallelism %d", p)
+				return
+			}
+			if err == nil {
+				t.Fatal("Run split a source whose decorator does not report a Count")
+			}
+			// The message has to name the vertex. A refusal that said only
+			// "source does not report a Count" would leave a job with several
+			// source vertices with nothing to point at.
+			if !strings.Contains(err.Error(), "src") {
+				t.Errorf("Run = %v, want an error naming the src vertex", err)
+			}
+			if !strings.Contains(err.Error(), "Count") {
+				t.Errorf("Run = %v, want an error naming the missing Count", err)
+			}
+		})
 	}
 }

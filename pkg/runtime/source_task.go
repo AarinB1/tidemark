@@ -15,6 +15,30 @@ import (
 // knowing how large it is. core.Source deliberately does not carry Count,
 // because an unbounded source has no answer to give; such a source is simply
 // not splittable and is rejected at parallelism > 1 rather than guessed at.
+//
+// A decorator wrapping a core.Source MUST forward Count explicitly. Embedding
+// the core.Source interface is not sufficient and is the trap:
+//
+//	type wrapper struct {         // WRONG: promotes only core.Source's
+//		core.Source           // methods, so Count is not there and the
+//	}                             // type assertion below fails.
+//
+//	type wrapper struct {         // Right: either forward Count by hand,
+//		core.Source           // or embed the concrete source type so
+//		count int64           // Count stays promoted.
+//	}
+//	func (w *wrapper) Count() int64 { return w.count }
+//
+// The failure is loud — the job is refused at parallelism > 1 rather than
+// silently having every subtask read the whole input — but the trigger is easy
+// to hit by accident, and the refusal names the missing Count rather than the
+// wrapper that dropped it.
+//
+// Phase 4's chaos harness is the case this note exists for. It wraps sources to
+// inject faults at logical positions, and a wrapper that loses splittability
+// would force the entire fault suite to parallelism 1, which is precisely where
+// the concurrency bugs it is meant to find do not appear. A fault suite that
+// quietly stopped testing the interesting configuration would still pass.
 type splittableSource interface {
 	core.Source
 	// Count returns the number of elements the source will produce from
