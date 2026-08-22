@@ -851,6 +851,10 @@ func TestRunBroadcastsWatermarksToEveryChannelOnEveryEdge(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("the generator produced no watermark; the test asserts nothing")
 	}
+	// Each operator subtask also sees its own gate's end-of-input flush, which
+	// no source emits. It is appended here rather than tolerated by a looser
+	// comparison, so this test still pins the exact sequence.
+	want = append(want, math.MaxInt64)
 
 	for _, branch := range []struct {
 		name string
