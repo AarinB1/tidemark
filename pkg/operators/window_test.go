@@ -108,6 +108,48 @@ func TestFloorModIsFlooredNotTruncated(t *testing.T) {
 	}
 }
 
+// TestSubFloorAndAddCeilClamps pins the arithmetic the window operator uses
+// at the ends of the int64 range.
+//
+// Unsaturated, eventTime - floorMod wraps to a large positive start, and
+// start+size-1 / start+size+lateness wrap to a negative fire or purge time.
+// Either way the result is a plausible-looking wrong window with no error.
+func TestSubFloorAndAddCeilClamps(t *testing.T) {
+	subTests := []struct {
+		a, b, want int64
+	}{
+		{a: 0, b: 0, want: 0},
+		{a: 100, b: 1, want: 99},
+		{a: -100, b: 1, want: -101},
+		{a: math.MinInt64, b: 1, want: math.MinInt64},
+		{a: math.MinInt64 + 5, b: 10, want: math.MinInt64},
+		{a: math.MinInt64, b: 0, want: math.MinInt64},
+		{a: math.MaxInt64, b: 1, want: math.MaxInt64 - 1},
+	}
+	for _, tt := range subTests {
+		if got := subFloor(tt.a, tt.b); got != tt.want {
+			t.Errorf("subFloor(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
+	}
+
+	addTests := []struct {
+		a, b, want int64
+	}{
+		{a: 0, b: 0, want: 0},
+		{a: 100, b: 1, want: 101},
+		{a: -100, b: 1, want: -99},
+		{a: math.MaxInt64, b: 1, want: math.MaxInt64},
+		{a: math.MaxInt64 - 5, b: 10, want: math.MaxInt64},
+		{a: math.MaxInt64, b: 0, want: math.MaxInt64},
+		{a: math.MinInt64, b: 1, want: math.MinInt64 + 1},
+	}
+	for _, tt := range addTests {
+		if got := addCeil(tt.a, tt.b); got != tt.want {
+			t.Errorf("addCeil(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
 // TestWindowAssignment pins membership at the exact boundaries and below zero.
 //
 // Half-open [start, end): the element at end belongs to the next window and the
@@ -170,6 +212,96 @@ func TestWindowAssignment(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestWindowsForClampsInsteadOfWrapping covers assignment at the bottom of
+// the int64 range.
+//
+// For event times in [MinInt64, MinInt64+slide), floorMod is positive, so
+// eventTime - floorMod wraps to a start near MaxInt64. The record is then
+// counted in windows that do not contain it. Clamped, the start stays at
+// MinInt64, which does contain the event. MinInt64+8 is the first tumbling
+// timestamp of size 100 whose aligned start still fits, and must not be
+// pulled down to the floor by an over-eager clamp.
+func TestWindowsForClampsInsteadOfWrapping(t *testing.T) {
+	tests := []struct {
+		name        string
+		size, slide int64
+		eventTime   int64
+		want        []int64
+	}{
+		{name: "tumbling at MinInt64", size: 100, slide: 100, eventTime: math.MinInt64, want: []int64{math.MinInt64}},
+		{name: "tumbling at MinInt64+1", size: 100, slide: 100, eventTime: math.MinInt64 + 1, want: []int64{math.MinInt64}},
+		{name: "tumbling last wrapping timestamp", size: 100, slide: 100, eventTime: math.MinInt64 + 7, want: []int64{math.MinInt64}},
+		{name: "tumbling first representable aligned start", size: 100, slide: 100, eventTime: math.MinInt64 + 8, want: []int64{math.MinInt64 + 8}},
+		{name: "sliding at MinInt64", size: 100, slide: 25, eventTime: math.MinInt64, want: []int64{math.MinInt64}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := NewSlidingCount(tt.size, tt.slide, 0)
+			got := w.windowsFor(nil, tt.eventTime)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("windowsFor(%d) = %v, want %v", tt.eventTime, got, tt.want)
+			}
+			for _, s := range got {
+				if s > tt.eventTime {
+					t.Errorf("window start %d is above event time %d; subtraction wrapped", s, tt.eventTime)
+				}
+			}
+		})
+	}
+
+	// The wrapped start is near MaxInt64, so the MaxInt64 watermark would
+	// emit that window: a correct-looking count for an interval the event
+	// is not in. Clamped, the record fires in a window that contains it.
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("a", math.MinInt64)
+	got := h.watermark(math.MaxInt64)
+	if !slices.Equal(got, []triple{{"a", math.MinInt64, 1}}) {
+		t.Fatalf("MinInt64 record fired %v, want window start MinInt64 with count 1", got)
+	}
+}
+
+// TestWindowFireTimeClampsInsteadOfWrapping covers start+size-1 at the top
+// of the range.
+//
+// A tumbling window whose start is itself near MaxInt64 has a fire time
+// that overflows to a large negative value, so the first ordinary watermark
+// completes it. Clamped, only the end-of-stream watermark can fire it,
+// which is when no further event time can still land in the window.
+func TestWindowFireTimeClampsInsteadOfWrapping(t *testing.T) {
+	size := int64(math.MaxInt64 - 10)
+	h := newWindowHarness(t, NewTumblingCount(size, 0))
+	h.record("a", size)
+	if got := h.watermark(0); len(got) != 0 {
+		t.Fatalf("watermark 0 fired %v; fire time wrapped below zero", got)
+	}
+	if got := h.watermark(math.MaxInt64); !slices.Equal(got, []triple{{"a", size, 1}}) {
+		t.Fatalf("fired %v, want the window starting at size with count 1", got)
+	}
+}
+
+// TestWindowPurgeClampsInsteadOfWrapping covers start+size+lateness at the
+// top of the range.
+//
+// Lateness of MaxInt64 makes the purge threshold wrap to a negative value,
+// so isPurged is true for any ordinary watermark and a late record is
+// dropped instead of held. Clamped, the threshold is MaxInt64 and the
+// window stays open for the rest of time.
+func TestWindowPurgeClampsInsteadOfWrapping(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, math.MaxInt64))
+	h.record("a", 10)
+	if got := h.watermark(99); !slices.Equal(got, []triple{{"a", 0, 1}}) {
+		t.Fatalf("watermark 99 fired %v, want a count of 1", got)
+	}
+	h.record("a", 20)
+	if got := h.watermark(200); !slices.Equal(got, []triple{{"a", 0, 2}}) {
+		t.Fatalf("watermark 200 fired %v, want the corrected count of 2; purge threshold wrapped", got)
+	}
+	if got := h.op.Dropped(); got != 0 {
+		t.Errorf("Dropped = %d, want 0: lateness of MaxInt64 must not purge", got)
 	}
 }
 

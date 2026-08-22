@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/AarinB1/tidemark/pkg/core"
 )
@@ -136,6 +137,39 @@ func floorMod(a, b int64) int64 {
 	return m
 }
 
+// subFloor returns a - b, clamped to MinInt64 rather than wrapping.
+//
+// Every caller subtracts a non-negative amount (a floorMod result, a slide).
+// Near MinInt64 that subtraction wraps to a large POSITIVE window start, so
+// the record is counted in windows near MaxInt64 instead of the ones that
+// contain it. Clamping keeps the start at MinInt64: not an aligned window,
+// but a window that contains the event. Wrapping is a plausible-looking
+// count in a window that does not. Watermark generation saturates for the
+// same reason.
+func subFloor(a, b int64) int64 {
+	d := a - b
+	if b > 0 && d > a {
+		return math.MinInt64
+	}
+	return d
+}
+
+// addCeil returns a + b, clamped to MaxInt64 rather than wrapping.
+//
+// Every caller adds a non-negative amount (size-1, size, allowedLateness).
+// A wrap makes a fire time or a purge threshold negative, so a window at
+// the top of the range fires or is dropped on the next watermark instead of
+// when its end actually arrives. Clamping holds the value at MaxInt64: the
+// gate's end-of-stream watermark is the only one that can reach it, which
+// is when no further event time can arrive anyway.
+func addCeil(a, b int64) int64 {
+	s := a + b
+	if b > 0 && s < a {
+		return math.MaxInt64
+	}
+	return s
+}
+
 // windowsFor appends to dst the starts of every window eventTime belongs to and
 // returns it.
 //
@@ -144,13 +178,22 @@ func floorMod(a, b int64) int64 {
 // order is descending and does not matter: the map decides where a count
 // accumulates and the timer heap decides the order windows fire in.
 //
+// Starts that would fall below MinInt64 are clamped rather than wrapped; the
+// loop stops when a further step cannot go lower, so a sliding assignment
+// near the floor does not append the same start twice and does not jump to
+// MaxInt64.
+//
 // dst is reused by the caller so assignment does not allocate per record.
 func (w *WindowCount) windowsFor(dst []int64, eventTime int64) []int64 {
 	dst = dst[:0]
-	start := eventTime - floorMod(eventTime, w.slide)
+	start := subFloor(eventTime, floorMod(eventTime, w.slide))
 	for n := w.size / w.slide; n > 0; n-- {
 		dst = append(dst, start)
-		start -= w.slide
+		next := subFloor(start, w.slide)
+		if next == start {
+			break
+		}
+		start = next
 	}
 	return dst
 }
@@ -173,7 +216,7 @@ func (w *WindowCount) ProcessElement(rec *core.Record, ctx core.Context) error {
 		// Registered on every record, deduplicated by the timer service. A
 		// window that has already fired was deregistered when it did, so this
 		// re-arms it and the updated count goes out on the next watermark.
-		w.timers.Register(start+w.size-1, key, start)
+		w.timers.Register(addCeil(start, w.size-1), key, start)
 	}
 	return nil
 }
@@ -224,7 +267,7 @@ func (w *WindowCount) fire(key string, start int64, ctx core.Context) error {
 // isPurged reports whether the window starting at start is past its allowed
 // lateness and so no longer held.
 func (w *WindowCount) isPurged(start int64) bool {
-	return w.watermark > start+w.size+w.allowedLateness
+	return w.watermark > addCeil(addCeil(start, w.size), w.allowedLateness)
 }
 
 // purge drops the state of every window the watermark has moved past.
