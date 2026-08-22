@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -380,5 +381,220 @@ func TestRunRefusesADecoratorThatHidesCount(t *testing.T) {
 				t.Errorf("Run = %v, want an error naming the missing Count", err)
 			}
 		})
+	}
+}
+
+// runWatermarkGenerator feeds eventTimes through a generator and returns, for
+// each emission, the index of the record that produced it and the value.
+func runWatermarkGenerator(intervalElements, maxOutOfOrderness int64, eventTimes []int64) (at []int, values []int64) {
+	g := newWatermarkGenerator(intervalElements, maxOutOfOrderness)
+	for i, t := range eventTimes {
+		if wm, ok := g.onRecord(t); ok {
+			at = append(at, i)
+			values = append(values, wm)
+		}
+	}
+	return at, values
+}
+
+// ramp returns n event times starting at base and rising by step.
+func ramp(base, step int64, n int) []int64 {
+	out := make([]int64, n)
+	for i := range out {
+		out[i] = base + int64(i)*step
+	}
+	return out
+}
+
+// TestWatermarkGeneratorEmitsOnTheElementInterval pins the interval to a count
+// of records rather than to elapsed time.
+//
+// The assertion is the exact record index of every emission, not that "some
+// watermarks arrived". A ticker-based generator satisfies the weaker claim on
+// every run and satisfies this one on none of them, which is the point:
+// invariant 6 says the fault schedule and everything a recovered run is
+// compared against must be a function of logical position, and a watermark that
+// lands after a different record on each run makes that false with no test to
+// show for it.
+func TestWatermarkGeneratorEmitsOnTheElementInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval int64
+		records  int
+		wantAt   []int
+	}{
+		{name: "every record", interval: 1, records: 4, wantAt: []int{0, 1, 2, 3}},
+		{name: "every third", interval: 3, records: 10, wantAt: []int{2, 5, 8}},
+		{name: "interval longer than the input", interval: 100, records: 20, wantAt: nil},
+		{name: "exactly one interval", interval: 5, records: 5, wantAt: []int{4}},
+		// A zero or negative interval turns generation off rather than
+		// emitting on every record or dividing by zero.
+		{name: "disabled by zero", interval: 0, records: 10, wantAt: nil},
+		{name: "disabled by a negative", interval: -1, records: 10, wantAt: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			at, _ := runWatermarkGenerator(tt.interval, 0, ramp(1000, 10, tt.records))
+			if !slices.Equal(at, tt.wantAt) {
+				t.Errorf("watermarks emitted after records %v, want %v", at, tt.wantAt)
+			}
+		})
+	}
+}
+
+// TestWatermarkGeneratorValueIsMaxSeenMinusLagMinusOne pins the value exactly.
+//
+// The minus one is the whole contract: a watermark asserts that no element with
+// event time <= w will arrive, so with out-of-orderness bounded by L the
+// largest safe claim after observing maxSeen is maxSeen-L-1. Emitting maxSeen-L
+// instead is off by one in the direction that fires a window before its last
+// element arrives, and nothing crashes.
+func TestWatermarkGeneratorValueIsMaxSeenMinusLagMinusOne(t *testing.T) {
+	tests := []struct {
+		name       string
+		lag        int64
+		eventTimes []int64
+		want       []int64
+	}{
+		{
+			name:       "in order, no lag",
+			lag:        0,
+			eventTimes: []int64{100, 200, 300, 400},
+			want:       []int64{99, 199, 299, 399},
+		},
+		{
+			name:       "in order, with lag",
+			lag:        50,
+			eventTimes: []int64{100, 200, 300, 400},
+			want:       []int64{49, 149, 249, 349},
+		},
+		{
+			// The value tracks the MAXIMUM observed, not the most recent. A
+			// generator that used the last event time would walk the watermark
+			// backwards on every out-of-order record.
+			name:       "out of order tracks the maximum",
+			lag:        10,
+			eventTimes: []int64{100, 500, 200, 300, 900, 400},
+			want:       []int64{89, 489, 889},
+		},
+		{
+			name:       "negative event times",
+			lag:        5,
+			eventTimes: []int64{-1000, -900, -800},
+			want:       []int64{-1006, -906, -806},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got := runWatermarkGenerator(1, tt.lag, tt.eventTimes)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("watermarks %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWatermarkGeneratorNeverDecreases feeds badly out-of-order input and
+// asserts the emitted sequence is strictly increasing.
+//
+// core.Operator.ProcessWatermark documents wm as monotonically non-decreasing,
+// and the gate and every window operator downstream are written against that.
+// The input here is deliberately worse than the generator's bounded lag ever
+// produces, because the property has to hold on the source's own behaviour
+// rather than on the source's input being well behaved.
+func TestWatermarkGeneratorNeverDecreases(t *testing.T) {
+	eventTimes := []int64{
+		5000, 100, 4000, 6000, 200, 5500, 7000, 50, 6500, 8000,
+		300, 7500, 9000, 1000, 8500, 10000, 400, 9500, 11000, 600,
+	}
+	for _, interval := range []int64{1, 2, 3, 7} {
+		_, got := runWatermarkGenerator(interval, 25, eventTimes)
+		for i := 1; i < len(got); i++ {
+			if got[i] <= got[i-1] {
+				t.Errorf("interval %d: watermark %d (%d) did not advance on %d",
+					interval, i, got[i], got[i-1])
+			}
+		}
+		if len(got) == 0 {
+			t.Errorf("interval %d: no watermark was emitted at all", interval)
+		}
+	}
+}
+
+// TestWatermarkGeneratorSkipsAnUnchangedValue is the other half of the
+// monotonicity rule. Reaching an interval boundary is not enough: the value has
+// to have moved. Re-emitting an unchanged watermark broadcasts to every
+// downstream channel and tells nobody anything, and a gate that saw it would
+// recompute a minimum that cannot have changed.
+func TestWatermarkGeneratorSkipsAnUnchangedValue(t *testing.T) {
+	// One high event time, then a long tail of lower ones. Only the first
+	// interval boundary can produce anything; every later one sees the same
+	// maximum.
+	eventTimes := []int64{9000, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110}
+	at, got := runWatermarkGenerator(2, 0, eventTimes)
+
+	want := []int64{8999}
+	if !slices.Equal(got, want) {
+		t.Fatalf("watermarks %v at records %v, want %v from the first boundary only", got, at, want)
+	}
+
+	// The counter still resets on every boundary, so a later record that does
+	// move the maximum is emitted at the next boundary rather than immediately.
+	// Records 12 and 13 below are the seventh boundary.
+	eventTimes = append(eventTimes, 20000, 20001)
+	at, got = runWatermarkGenerator(2, 0, eventTimes)
+	if !slices.Equal(got, []int64{8999, 20000}) || !slices.Equal(at, []int{1, 13}) {
+		t.Errorf("watermarks %v at records %v, want [8999 20000] at records [1 13]", got, at)
+	}
+}
+
+// TestWatermarkGeneratorClampsInsteadOfWrapping covers the subtraction at the
+// bottom of the int64 range.
+//
+// An event time near MinInt64 minus a lag wraps to a large POSITIVE watermark,
+// which claims every event in history has arrived and fires every open window
+// at once. The result is a plausible-looking wrong answer with no error
+// anywhere, which is the exact failure mode CLAUDE.md opens by naming. Clamped,
+// the value stays at MinInt64, which is never strictly greater than the initial
+// last-emitted value, so nothing is emitted at all.
+func TestWatermarkGeneratorClampsInsteadOfWrapping(t *testing.T) {
+	_, got := runWatermarkGenerator(1, 1000, []int64{math.MinInt64 + 10, math.MinInt64 + 20})
+	if len(got) != 0 {
+		t.Errorf("watermarks %v from event times at the bottom of the range, want none", got)
+	}
+
+	// The clamp must not swallow a value that does fit. One record above the
+	// floor and the generator emits normally again.
+	_, got = runWatermarkGenerator(1, 1000, []int64{math.MinInt64 + 10, 0})
+	if !slices.Equal(got, []int64{-1001}) {
+		t.Errorf("watermarks %v, want [-1001]", got)
+	}
+}
+
+// TestSubFloorClampsBothEnds checks the helper directly, including the rows
+// where nothing is clamped. A saturating subtraction that returned MinInt64 too
+// eagerly would silence a source whose event times are merely large and
+// negative rather than at the boundary.
+func TestSubFloorClampsBothEnds(t *testing.T) {
+	tests := []struct {
+		a, b, want int64
+	}{
+		{a: 0, b: 0, want: 0},
+		{a: 100, b: 1, want: 99},
+		{a: -100, b: 1, want: -101},
+		{a: -100, b: -1, want: -99},
+		{a: math.MinInt64, b: 1, want: math.MinInt64},
+		{a: math.MinInt64 + 5, b: 10, want: math.MinInt64},
+		{a: math.MaxInt64, b: -1, want: math.MaxInt64},
+		{a: math.MaxInt64 - 5, b: -10, want: math.MaxInt64},
+		{a: math.MinInt64, b: math.MinInt64, want: 0},
+		{a: math.MaxInt64, b: math.MaxInt64, want: 0},
+	}
+	for _, tt := range tests {
+		if got := subFloor(tt.a, tt.b); got != tt.want {
+			t.Errorf("subFloor(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
 	}
 }
