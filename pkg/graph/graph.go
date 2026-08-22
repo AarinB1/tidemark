@@ -56,6 +56,24 @@ type Vertex struct {
 	NewSource   func() core.Source
 	NewOperator func() core.Operator
 	NewSink     func() core.Sink
+
+	// WatermarkIntervalElements is how many records one subtask of a source
+	// vertex emits between two watermarks. Zero disables watermark generation,
+	// which is what a job doing no event-time work wants.
+	//
+	// It lives here, on the vertex, rather than on core.Source, because
+	// generation is the source RUNNER's job: every source needs a watermark and
+	// the policy is uniform, so a method on the interface would be polymorphism
+	// with one behaviour behind it. It is per-vertex rather than per-job
+	// because two source vertices feeding one operator can legitimately carry
+	// different out-of-orderness.
+	//
+	// Counted in ELEMENTS, never on a wall clock. See watermarkGenerator in
+	// pkg/runtime and invariant 6.
+	WatermarkIntervalElements int64
+	// MaxOutOfOrderness is how far behind the maximum observed event time one
+	// subtask of a source vertex holds its watermark, in millis.
+	MaxOutOfOrderness int64
 }
 
 // Validation failures. Each condition has its own error so that callers and
@@ -78,6 +96,9 @@ var (
 	errNoSource           = errors.New("graph has no source")
 	errNoSink             = errors.New("graph has no sink")
 	errCycle              = errors.New("graph has a cycle")
+
+	errNegativeOutOfOrderness = errors.New("MaxOutOfOrderness < 0")
+	errWatermarkOnNonSource   = errors.New("watermark configuration on a vertex that is not a source")
 )
 
 // Graph is a job under construction. The zero value is not usable; call New.
@@ -152,6 +173,9 @@ func (g *Graph) Validate() error {
 			return fmt.Errorf("vertex %q: parallelism %d: %w", id, v.Parallelism, errParallelismTooHigh)
 		}
 		if err := checkFactories(v); err != nil {
+			return fmt.Errorf("vertex %q: %w", id, err)
+		}
+		if err := checkWatermarkConfig(v); err != nil {
 			return fmt.Errorf("vertex %q: %w", id, err)
 		}
 		switch v.Kind {
@@ -244,6 +268,28 @@ func (g *Graph) sortedIDs() []string {
 	}
 	slices.Sort(ids)
 	return ids
+}
+
+// checkWatermarkConfig rejects watermark settings that would silently do the
+// wrong thing.
+//
+// A negative MaxOutOfOrderness pushes the watermark AHEAD of the maximum event
+// time observed, so a window fires before its last element has arrived. That is
+// invariant 1's failure mode reached by another route, and like that one it
+// produces slightly wrong counts rather than an error.
+//
+// Settings on an operator or a sink are rejected rather than ignored. Only a
+// source generates watermarks; every other vertex forwards what its gate gives
+// it. Ignoring the fields would let a job be configured for event time at a
+// vertex that cannot honour it and then run to completion looking fine.
+func checkWatermarkConfig(v Vertex) error {
+	if v.MaxOutOfOrderness < 0 {
+		return fmt.Errorf("%d: %w", v.MaxOutOfOrderness, errNegativeOutOfOrderness)
+	}
+	if v.Kind != VertexSource && (v.WatermarkIntervalElements != 0 || v.MaxOutOfOrderness != 0) {
+		return fmt.Errorf("%s: %w", v.Kind, errWatermarkOnNonSource)
+	}
+	return nil
 }
 
 // checkFactories requires exactly the factory matching v.Kind to be set.

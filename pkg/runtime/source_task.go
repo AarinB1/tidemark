@@ -68,13 +68,24 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 }
 
 // sourceLoop reads the records assigned to one subtask of a source vertex,
-// handing each to emit. It returns when the subtask's range is exhausted, when
-// the source reports it has no more elements, or on the first error from the
-// source, from emit, or from ctx.
+// handing each to emitRecord and each due watermark to emitWatermark. It
+// returns when the subtask's range is exhausted, when the source reports it has
+// no more elements, or on the first error from the source, from either emitter,
+// or from ctx.
+//
+// The record goes out before the watermark derived from it. Either order is
+// safe, since a watermark of maxSeen-lag-1 does not bound the record that
+// produced it, but records-then-watermark is the one that reads as what it is:
+// the watermark summarises everything already sent.
+//
+// wm is taken by value. Each subtask drives its own generator over its own
+// contiguous slice of the offset space, which is what produces the staircase
+// documented on watermarkGenerator; a generator shared between subtasks would
+// be a data race and would also collapse the per-subtask watermarks into one.
 //
 // The source must already be open: Open validates configuration, and a source
 // that failed validation must not be seeked.
-func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, emit func(*core.Record) error) error {
+func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, emitRecord func(*core.Record) error, emitWatermark func(int64) error) error {
 	end, bounded, err := seekToRange(src, parallelism, index)
 	if err != nil {
 		return err
@@ -97,8 +108,13 @@ func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, em
 		if !ok {
 			return nil
 		}
-		if err := emit(rec); err != nil {
+		if err := emitRecord(rec); err != nil {
 			return err
+		}
+		if t, ok := wm.onRecord(rec.EventTime); ok {
+			if err := emitWatermark(t); err != nil {
+				return err
+			}
 		}
 	}
 }

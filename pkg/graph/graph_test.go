@@ -381,3 +381,77 @@ func ids(vs []Vertex) []string {
 	}
 	return out
 }
+
+// TestValidateWatermarkConfig covers the two settings a source vertex carries
+// for event time.
+//
+// A negative MaxOutOfOrderness puts the watermark ahead of the maximum event
+// time observed, so a window fires before its last element arrives: invariant
+// 1's failure mode by another route, silent in exactly the same way. Watermark
+// settings on an operator or a sink are rejected rather than ignored, because
+// only a source generates watermarks and a job configured for event time at a
+// vertex that cannot honour it would otherwise run to completion looking fine.
+func TestValidateWatermarkConfig(t *testing.T) {
+	withWatermarks := func(v Vertex, interval, lag int64) Vertex {
+		v.WatermarkIntervalElements = interval
+		v.MaxOutOfOrderness = lag
+		return v
+	}
+
+	tests := []struct {
+		name     string
+		vertices []Vertex
+		wantErr  error
+	}{
+		{
+			name:     "source configured for event time",
+			vertices: []Vertex{withWatermarks(source("s"), 1000, 50), operator("m"), sink("k")},
+		},
+		{
+			// The zero value is watermark generation off, which is what a job
+			// doing no event-time work wants. It must not be a rejection.
+			name:     "no configuration anywhere",
+			vertices: []Vertex{source("s"), operator("m"), sink("k")},
+		},
+		{
+			name:     "a lag of zero on a source is not a negative lag",
+			vertices: []Vertex{withWatermarks(source("s"), 1000, 0), operator("m"), sink("k")},
+		},
+		{
+			name:     "negative lag on a source",
+			vertices: []Vertex{withWatermarks(source("s"), 1000, -1), operator("m"), sink("k")},
+			wantErr:  errNegativeOutOfOrderness,
+		},
+		{
+			name:     "interval on an operator",
+			vertices: []Vertex{source("s"), withWatermarks(operator("m"), 1000, 0), sink("k")},
+			wantErr:  errWatermarkOnNonSource,
+		},
+		{
+			name:     "lag on an operator",
+			vertices: []Vertex{source("s"), withWatermarks(operator("m"), 0, 50), sink("k")},
+			wantErr:  errWatermarkOnNonSource,
+		},
+		{
+			name:     "interval on a sink",
+			vertices: []Vertex{source("s"), operator("m"), withWatermarks(sink("k"), 1000, 0)},
+			wantErr:  errWatermarkOnNonSource,
+		},
+		{
+			// The negative check runs before the kind check, so the more
+			// specific complaint is the one reported.
+			name:     "negative lag on a sink",
+			vertices: []Vertex{source("s"), operator("m"), withWatermarks(sink("k"), 0, -1)},
+			wantErr:  errNegativeOutOfOrderness,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := build(tt.vertices, []edge{{"s", "m"}, {"m", "k"}})
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("Validate = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}

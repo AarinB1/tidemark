@@ -59,8 +59,16 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 		}
 	}()
 
-	emit := func(rec *core.Record) error { return w.EmitRecord(ctx, rec) }
-	if err := sourceLoop(ctx, src, v.Parallelism, id.index, emit); err != nil {
+	emitRecord := func(rec *core.Record) error { return w.EmitRecord(ctx, rec) }
+	// Watermarks broadcast; they never partition. A watermark that reached one
+	// subtask of a downstream vertex would leave the others with no event-time
+	// signal at all, so their windows would sit open until end of input and the
+	// gate's minimum would be pinned by the silent ones (invariants 1 and 2).
+	emitWatermark := func(t int64) error {
+		return w.Broadcast(ctx, core.NewWatermarkElement(t))
+	}
+	wm := newWatermarkGenerator(v.WatermarkIntervalElements, v.MaxOutOfOrderness)
+	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, emitRecord, emitWatermark); err != nil {
 		return fmt.Errorf("source %s: %w", id, err)
 	}
 

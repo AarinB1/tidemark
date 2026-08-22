@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/core"
@@ -164,7 +165,8 @@ func TestSourceLoopRangesDoNotOverlap(t *testing.T) {
 // duplicate every record P times and report nothing, so the request is refused.
 func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// countlessSource has no Count method, so it is not splittable.
-	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, func(*core.Record) error { return nil })
+	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, noWatermarks(),
+		func(*core.Record) error { return nil }, unexpectedWatermark(t))
 	if err == nil {
 		t.Fatal("sourceLoop split a source that does not report a Count")
 	}
@@ -172,10 +174,10 @@ func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// At parallelism 1 there is nothing to divide, so the same source is read
 	// to exhaustion.
 	var seen int
-	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, func(*core.Record) error {
+	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, noWatermarks(), func(*core.Record) error {
 		seen++
 		return nil
-	}); err != nil {
+	}, unexpectedWatermark(t)); err != nil {
 		t.Fatalf("sourceLoop at parallelism 1: %v", err)
 	}
 	if seen != 10 {
@@ -191,10 +193,10 @@ func TestSourceLoopStopsOnContextCancellation(t *testing.T) {
 	if err := src.Open(nil); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	err := sourceLoop(ctx, src, 1, 0, func(*core.Record) error {
+	err := sourceLoop(ctx, src, 1, 0, noWatermarks(), func(*core.Record) error {
 		t.Error("sourceLoop emitted a record against a cancelled context")
 		return nil
-	})
+	}, unexpectedWatermark(t))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("sourceLoop = %v, want context.Canceled", err)
 	}
@@ -208,13 +210,13 @@ func TestSourceLoopReturnsTheEmitError(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	var seen int
-	err := sourceLoop(context.Background(), src, 1, 0, func(*core.Record) error {
+	err := sourceLoop(context.Background(), src, 1, 0, noWatermarks(), func(*core.Record) error {
 		seen++
 		if seen == 3 {
 			return errEmit
 		}
 		return nil
-	})
+	}, unexpectedWatermark(t))
 	if !errors.Is(err, errEmit) {
 		t.Fatalf("sourceLoop = %v, want %v", err, errEmit)
 	}
@@ -258,10 +260,10 @@ func readSubtaskRange(t *testing.T, cfg sources.GeneratorConfig, parallelism, in
 	}()
 
 	var out []*core.Record
-	err := sourceLoop(context.Background(), src, parallelism, index, func(rec *core.Record) error {
+	err := sourceLoop(context.Background(), src, parallelism, index, noWatermarks(), func(rec *core.Record) error {
 		out = append(out, rec)
 		return nil
-	})
+	}, unexpectedWatermark(t))
 	if err != nil {
 		t.Fatalf("sourceLoop(p=%d, i=%d): %v", parallelism, index, err)
 	}
@@ -595,6 +597,272 @@ func TestSubFloorClampsBothEnds(t *testing.T) {
 	for _, tt := range tests {
 		if got := subFloor(tt.a, tt.b); got != tt.want {
 			t.Errorf("subFloor(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+// noWatermarks disables generation, for the tests that are about the range
+// logic rather than about event time.
+func noWatermarks() watermarkGenerator { return newWatermarkGenerator(0, 0) }
+
+// unexpectedWatermark is the emitter those tests pass, so "generation is
+// disabled" is asserted at every call site rather than assumed.
+func unexpectedWatermark(t *testing.T) func(int64) error {
+	return func(wm int64) error {
+		t.Helper()
+		t.Errorf("a source with watermark generation disabled emitted watermark %d", wm)
+		return nil
+	}
+}
+
+// element is one thing a source subtask put on its outputs, in the order it did
+// so. Watermarks travel in-band with records (invariant 5), so the interleaving
+// is part of what has to be asserted and a test that collected the two into
+// separate lists would not be able to see it.
+type element struct {
+	watermark bool
+	eventTime int64
+}
+
+// runSourceSubtaskLoop drives sourceLoop over a generator and returns the
+// merged element stream one subtask produced.
+func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermarkGenerator, parallelism, index int) []element {
+	t.Helper()
+	src := sources.NewGenerator(cfg)
+	if err := src.Open(nil); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() {
+		if err := src.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	var out []element
+	err := sourceLoop(context.Background(), src, parallelism, index, wm,
+		func(rec *core.Record) error {
+			out = append(out, element{eventTime: rec.EventTime})
+			return nil
+		},
+		func(t int64) error {
+			out = append(out, element{watermark: true, eventTime: t})
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("sourceLoop(p=%d, i=%d): %v", parallelism, index, err)
+	}
+	return out
+}
+
+// TestSourceLoopPutsWatermarksInBandBehindTheirRecords pins the interleaving.
+//
+// Every watermark must sit immediately after the interval-th record, in the
+// same stream, and must be no greater than maxSeen-lag-1 over everything before
+// it. A side channel would satisfy neither claim, and invariant 5 exists
+// because a watermark that overtook the records it bounds fires their windows
+// without them.
+func TestSourceLoopPutsWatermarksInBandBehindTheirRecords(t *testing.T) {
+	const (
+		count    = 200
+		interval = 25
+		lag      = 50
+	)
+	cfg := testGeneratorConfig(count)
+	cfg.MaxLag = lag
+
+	got := runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, lag), 1, 0)
+
+	records, watermarks := 0, 0
+	maxSeen := int64(math.MinInt64)
+	for i, e := range got {
+		if !e.watermark {
+			records++
+			if e.eventTime > maxSeen {
+				maxSeen = e.eventTime
+			}
+			continue
+		}
+		watermarks++
+		// Position: a watermark follows the interval-th record, so exactly
+		// interval records precede it since the previous one.
+		if records%interval != 0 {
+			t.Errorf("element %d is a watermark after %d records, not a multiple of %d", i, records, interval)
+		}
+		if want := maxSeen - lag - 1; e.eventTime != want {
+			t.Errorf("watermark %d after %d records is %d, want %d", watermarks, records, e.eventTime, want)
+		}
+	}
+	if records != count {
+		t.Errorf("the subtask emitted %d records, want %d", records, count)
+	}
+	if watermarks != count/interval {
+		t.Errorf("the subtask emitted %d watermarks, want %d", watermarks, count/interval)
+	}
+}
+
+// TestSourceLoopReturnsTheWatermarkEmitError checks that a failed watermark
+// broadcast stops the subtask rather than being dropped.
+//
+// A dropped watermark is invisible: the records keep flowing, the downstream
+// gate's minimum stops advancing, every window stays open until end of input,
+// and the job still produces the right answer at the end. It would only show up
+// in Phase 6 as unexplained state growth.
+func TestSourceLoopReturnsTheWatermarkEmitError(t *testing.T) {
+	errWatermark := errors.New("watermark broadcast failed")
+
+	src := sources.NewGenerator(testGeneratorConfig(100))
+	if err := src.Open(nil); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	var records int
+	err := sourceLoop(context.Background(), src, 1, 0, newWatermarkGenerator(10, 0),
+		func(*core.Record) error {
+			records++
+			return nil
+		},
+		func(int64) error { return errWatermark })
+	if !errors.Is(err, errWatermark) {
+		t.Fatalf("sourceLoop = %v, want %v", err, errWatermark)
+	}
+	if records != 10 {
+		t.Errorf("sourceLoop read %d records before the first watermark failed, want 10", records)
+	}
+}
+
+// TestSourceLoopWatermarksStaircaseAcrossSubtasks pins the consequence recorded
+// on watermarkGenerator, so that a later change to the offset split shows up
+// here rather than as an unexplained number in Phase 6.
+//
+// Source subtasks take contiguous offset ranges and event time rises with the
+// offset, so subtask 0's watermarks are the earliest and subtask P-1's the
+// latest, with no overlap between them. The downstream gate takes the minimum,
+// so event time advances in a staircase pinned by subtask 0 rather than
+// smoothly, and window state peaks near the size of the whole dataset. That is
+// correct and is not to be fixed by striding the split.
+func TestSourceLoopWatermarksStaircaseAcrossSubtasks(t *testing.T) {
+	const (
+		count    = 1000
+		interval = 50
+		p        = 4
+	)
+	cfg := testGeneratorConfig(count)
+	cfg.MaxLag = 0
+
+	var prevMax int64 = math.MinInt64
+	for i := range p {
+		var got []int64
+		for _, e := range runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, 0), p, i) {
+			if e.watermark {
+				got = append(got, e.eventTime)
+			}
+		}
+		if len(got) == 0 {
+			t.Fatalf("subtask %d emitted no watermark over %d records", i, count/p)
+		}
+		if got[0] <= prevMax {
+			t.Errorf("subtask %d starts at watermark %d, but subtask %d already reached %d: the ranges overlap",
+				i, got[0], i-1, prevMax)
+		}
+		prevMax = got[len(got)-1]
+	}
+}
+
+// watermarkRecorder collects, per operator instance, the watermarks the runtime
+// delivered to it.
+type watermarkRecorder struct {
+	mu   sync.Mutex
+	seen [][]int64
+}
+
+// newOperator hands out one recording operator per subtask. The runtime calls
+// the factory from each subtask's own goroutine, so allocating the slot is
+// locked.
+func (r *watermarkRecorder) newOperator() core.Operator {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, nil)
+	// The embedded operator is set explicitly. A decorator that left it nil
+	// compiles, satisfies core.Operator, and panics on the first promoted call.
+	return &watermarkRecordingOperator{Operator: identity(), rec: r, slot: len(r.seen) - 1}
+}
+
+func (r *watermarkRecorder) record(slot int, wm int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen[slot] = append(r.seen[slot], wm)
+}
+
+type watermarkRecordingOperator struct {
+	core.Operator
+	rec  *watermarkRecorder
+	slot int
+}
+
+func (o *watermarkRecordingOperator) ProcessWatermark(wm int64, ctx core.Context) error {
+	o.rec.record(o.slot, wm)
+	return o.Operator.ProcessWatermark(wm, ctx)
+}
+
+// TestRunBroadcastsWatermarksToEveryChannelOnEveryEdge is the invariant 2 claim
+// for watermarks, on the only topology where it can fail.
+//
+// One source feeding two operator vertices at parallelism 2 gives four operator
+// subtasks over two edges. A watermark must reach all four. A chain could not
+// distinguish broadcast from partition, because with one downstream subtask on
+// one edge the two are the same thing; here, partitioning within an edge would
+// give each subtask of a vertex half the watermarks, and partitioning across
+// edges would give one branch all of them and the other none.
+//
+// The assertion is the exact sequence at every subtask, not a count. Under a
+// partitioning writer each subtask still receives watermarks, just not all of
+// them, so anything weaker than equality passes under the bug.
+func TestRunBroadcastsWatermarksToEveryChannelOnEveryEdge(t *testing.T) {
+	const (
+		count    = 400
+		interval = 50
+		p        = 2
+	)
+	cfg := testGeneratorConfig(count)
+
+	var left, right watermarkRecorder
+	g := buildGraph(t, []graph.Vertex{
+		{ID: "src", Kind: graph.VertexSource, Parallelism: 1,
+			NewSource:                 func() core.Source { return sources.NewGenerator(cfg) },
+			WatermarkIntervalElements: interval,
+			MaxOutOfOrderness:         cfg.MaxLag},
+		{ID: "left", Kind: graph.VertexOperator, Parallelism: p, NewOperator: left.newOperator},
+		{ID: "right", Kind: graph.VertexOperator, Parallelism: p, NewOperator: right.newOperator},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: 1,
+			NewSink: func() core.Sink { return sinks.NewDiscard() }},
+	}, [][2]string{{"src", "left"}, {"src", "right"}, {"left", "out"}, {"right", "out"}})
+
+	if err := Run(context.Background(), g); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The source is at parallelism 1, so what it emitted is exactly what one
+	// subtask's generator produces over the whole input.
+	var want []int64
+	for _, e := range runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, cfg.MaxLag), 1, 0) {
+		if e.watermark {
+			want = append(want, e.eventTime)
+		}
+	}
+	if len(want) == 0 {
+		t.Fatal("the generator produced no watermark; the test asserts nothing")
+	}
+
+	for _, branch := range []struct {
+		name string
+		rec  *watermarkRecorder
+	}{{"left", &left}, {"right", &right}} {
+		if len(branch.rec.seen) != p {
+			t.Fatalf("%s built %d operators, want %d", branch.name, len(branch.rec.seen), p)
+		}
+		for i, got := range branch.rec.seen {
+			if !slices.Equal(got, want) {
+				t.Errorf("%s[%d] saw watermarks %v, want every one of %v", branch.name, i, got, want)
+			}
 		}
 	}
 }
