@@ -7,6 +7,7 @@ import (
 
 	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/graph"
+	"github.com/AarinB1/tidemark/pkg/state"
 	"github.com/AarinB1/tidemark/pkg/transport"
 )
 
@@ -67,8 +68,16 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 	emitWatermark := func(t int64) error {
 		return w.Broadcast(ctx, core.NewWatermarkElement(t))
 	}
+	// Barriers broadcast for the same reason watermarks do, and the consequence
+	// of getting it wrong is worse. A barrier that reached only some of a
+	// downstream vertex's subtasks leaves the others aligning on a checkpoint
+	// they will never see completed, and alignment has no timeout: the job stops
+	// producing output with no error anywhere (invariants 2 and 3).
+	emitBarrier := func(b *core.Barrier) error {
+		return w.Broadcast(ctx, core.NewBarrierElement(b))
+	}
 	wm := newWatermarkGenerator(v.WatermarkIntervalElements, v.MaxOutOfOrderness)
-	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, emitRecord, emitWatermark); err != nil {
+	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, v.BarrierIntervalElements, emitRecord, emitWatermark, emitBarrier); err != nil {
 		return fmt.Errorf("source %s: %w", id, err)
 	}
 
@@ -131,8 +140,17 @@ func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate 
 				return err
 			}
 			return w.Broadcast(ctx, e)
+		case core.KindBarrier:
+			// Forwarded and broadcast, like a watermark, and NOT handed to the
+			// operator. Phase 3a aligns barriers at the gate and forwards them;
+			// taking a snapshot when one arrives is Phase 3b, and core.Operator
+			// has no method for it precisely so that this line cannot quietly
+			// grow one.
+			if err := w.Broadcast(ctx, e); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("operator %s: unexpected %s element: barriers arrive in Phase 3", id, e.Kind)
+			return fmt.Errorf("operator %s: unexpected %s element", id, e.Kind)
 		}
 	}
 }
@@ -161,10 +179,17 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 			}
 		case core.KindWatermark:
 			oc.watermark = e.Watermark
+		case core.KindBarrier:
+			// Ignored, deliberately. A sink commits on NotifyCheckpointComplete
+			// and never at snapshot time, because data committed at snapshot
+			// time belongs to a checkpoint that may never complete and comes
+			// back as duplicates on recovery (invariant 4). Neither the
+			// notification nor the transactional sink exists yet, so there is
+			// nothing here to do but let the barrier pass.
 		case core.KindEndOfStream:
 			return nil
 		default:
-			return fmt.Errorf("sink %s: unexpected %s element: barriers arrive in Phase 3", id, e.Kind)
+			return fmt.Errorf("sink %s: unexpected %s element", id, e.Kind)
 		}
 	}
 }
@@ -179,6 +204,13 @@ type opContext struct {
 	writer    *transport.Writer
 	watermark int64
 	err       error
+	// state is this subtask's keyed state. One per subtask, made here rather
+	// than by the operator, because a subtask is the unit of state and the
+	// runtime is what decides which backend a job runs on: Memory now, Pebble
+	// in Phase 3b. Sources and sinks get one too, and neither uses it; giving
+	// them a different Context to keep it away would be a second Context
+	// implementation to keep in step for no gain.
+	state state.KeyedState
 }
 
 var _ core.Context = (*opContext)(nil)
@@ -187,6 +219,7 @@ func newOpContext(ctx context.Context, w *transport.Writer) *opContext {
 	return &opContext{
 		ctx:    ctx,
 		writer: w,
+		state:  state.NewMemory(),
 		// No watermark has been delivered, so nothing is complete yet. Starting
 		// at zero would claim that every event before 1970 had arrived.
 		watermark: math.MinInt64,
@@ -210,6 +243,9 @@ func (c *opContext) Emit(rec *core.Record) {
 
 // CurrentWatermark returns the last watermark delivered to this subtask.
 func (c *opContext) CurrentWatermark() int64 { return c.watermark }
+
+// State returns this subtask's keyed state.
+func (c *opContext) State() state.KeyedState { return c.state }
 
 // takeErr returns and clears any error stashed by Emit.
 func (c *opContext) takeErr() error {

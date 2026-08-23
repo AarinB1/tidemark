@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"slices"
 	"testing"
@@ -424,6 +425,42 @@ func (h *gateHarness) sendEndOfStream(input int) []core.StreamElement {
 	return h.send(input, core.NewEndOfStreamElement())
 }
 
+func (h *gateHarness) sendBarrier(input int, checkpointID int64) []core.StreamElement {
+	h.t.Helper()
+	return h.send(input, core.NewBarrierElement(&core.Barrier{CheckpointID: checkpointID}))
+}
+
+func (h *gateHarness) sendRecord(input int, eventTime int) []core.StreamElement {
+	h.t.Helper()
+	return h.send(input, recordFor(eventTime))
+}
+
+// describe renders an element stream as short tokens, so an assertion about
+// ORDER reads as a sequence and a failure prints as one.
+//
+// Records are identified by their event time, which recordFor also uses as the
+// key, so a token names exactly which record it is. Alignment is a claim about
+// order and nothing weaker will do: every element eventually arrives whether or
+// not the gate buffers, so a test comparing sets passes with alignment removed.
+func describe(elems []core.StreamElement) []string {
+	out := make([]string, 0, len(elems))
+	for _, e := range elems {
+		switch e.Kind {
+		case core.KindRecord:
+			out = append(out, fmt.Sprintf("r%d", e.Record.EventTime))
+		case core.KindWatermark:
+			out = append(out, fmt.Sprintf("wm%d", e.Watermark))
+		case core.KindBarrier:
+			out = append(out, fmt.Sprintf("b%d", e.Barrier.CheckpointID))
+		case core.KindEndOfStream:
+			out = append(out, "eos")
+		default:
+			out = append(out, "?"+e.Kind.String())
+		}
+	}
+	return out
+}
+
 // take drains whatever the gate has already delivered without blocking.
 func (h *gateHarness) take() []core.StreamElement {
 	var out []core.StreamElement
@@ -770,3 +807,382 @@ func TestGateKeepsRecordsInBandWithWatermarks(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// alignmentHarness runs a gate under synctest and accumulates everything it has
+// delivered, so an assertion can be made about the whole sequence rather than
+// about one step of it.
+type alignmentHarness struct {
+	*gateHarness
+	delivered []core.StreamElement
+	closed    bool
+}
+
+func newAlignmentHarness(t *testing.T, ctx context.Context, inputs int) *alignmentHarness {
+	return &alignmentHarness{gateHarness: newGateHarness(t, ctx, inputs)}
+}
+
+// close releases the gate's goroutines and returns anything delivered on the
+// way out. Every test defers it, including the ones that call it themselves,
+// because a bubble left with a blocked goroutine panics with a deadlock and
+// hides whichever assertion actually failed.
+func (h *alignmentHarness) close() []core.StreamElement {
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	return h.finish()
+}
+
+func (h *alignmentHarness) record(input, eventTime int) {
+	h.t.Helper()
+	h.delivered = append(h.delivered, h.sendRecord(input, eventTime)...)
+}
+
+func (h *alignmentHarness) barrier(input int, checkpointID int64) {
+	h.t.Helper()
+	h.delivered = append(h.delivered, h.sendBarrier(input, checkpointID)...)
+}
+
+func (h *alignmentHarness) watermark(input int, wm int64) {
+	h.t.Helper()
+	h.delivered = append(h.delivered, h.sendWatermark(input, wm)...)
+}
+
+func (h *alignmentHarness) endOfStream(input int) {
+	h.t.Helper()
+	h.delivered = append(h.delivered, h.sendEndOfStream(input)...)
+}
+
+// so far renders everything delivered up to now.
+func (h *alignmentHarness) soFar() []string { return describe(h.delivered) }
+
+func (h *alignmentHarness) assertSoFar(want []string, format string, args ...any) {
+	h.t.Helper()
+	if got := h.soFar(); !slices.Equal(got, want) {
+		h.t.Fatalf("%s: the gate had delivered %v, want %v", fmt.Sprintf(format, args...), got, want)
+	}
+}
+
+// TestGateHoldsPostBarrierElementsUntilEveryInputHasAligned is the assertion
+// alignment exists for.
+//
+// A barrier for checkpoint k separates what belongs to k from what belongs to
+// k+1. Once input 0 has sent its barrier, nothing it sends afterwards may reach
+// the operator until input 1 has sent one too, or the operator's state at the
+// snapshot would hold elements from both sides of the line.
+//
+// The assertion is the ORDER of what the gate delivered, checked at each step,
+// and it has to be: every element arrives eventually whether or not the gate
+// buffers, so a test comparing the final set passes with alignment removed
+// entirely. Two inputs at minimum, because one input is aligned the moment its
+// barrier arrives and can never show the difference.
+func TestGateHoldsPostBarrierElementsUntilEveryInputHasAligned(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h := newAlignmentHarness(t, ctx, 2)
+		defer h.close()
+
+		// Before any barrier, both inputs flow.
+		h.record(0, 1)
+		h.record(1, 2)
+		h.assertSoFar([]string{"r1", "r2"}, "before any barrier")
+
+		// Input 0 reaches the boundary. The barrier itself must not go
+		// downstream yet either: input 1 has not reached it.
+		h.barrier(0, 1)
+		h.assertSoFar([]string{"r1", "r2"}, "with barrier 1 on input 0 only")
+
+		// Everything input 0 sends now belongs to checkpoint 2 and is held.
+		h.record(0, 3)
+		h.record(0, 4)
+		h.assertSoFar([]string{"r1", "r2"}, "with two post-barrier records on input 0")
+
+		// Input 1 has not reached the boundary, so its records are still part
+		// of checkpoint 1 and go straight through.
+		h.record(1, 5)
+		h.assertSoFar([]string{"r1", "r2", "r5"}, "with a pre-barrier record on input 1")
+
+		// Alignment completes: one barrier out, then the buffer.
+		h.barrier(1, 1)
+		h.assertSoFar([]string{"r1", "r2", "r5", "b1", "r3", "r4"}, "once both inputs have aligned")
+	})
+}
+
+// TestGateDeliversBuffersInInputIndexOrder pins the drain order.
+//
+// Any fixed order is correct, since these elements were concurrent on separate
+// channels and the sink contents are a set. It is fixed rather than arbitrary
+// because the order records reach an operator decides the order its windows
+// accumulate, and an order that varied run to run would make a recovered run
+// diverge from a clean one for a reason that has nothing to do with recovery.
+//
+// Three inputs, and input 2 is the one that completes the alignment, so the
+// drain has two non-empty buffers to put in order. The records are numbered so
+// that arrival order and input order disagree: delivering them in arrival order
+// gives r10 r20 r11 r21, which is exactly what this rules out.
+func TestGateDeliversBuffersInInputIndexOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h := newAlignmentHarness(t, ctx, 3)
+		defer h.close()
+
+		h.barrier(0, 1)
+		h.barrier(1, 1)
+
+		// Interleaved on arrival, so the assertion below is about input order
+		// rather than about the order things happened to show up in.
+		h.record(0, 10)
+		h.record(1, 20)
+		h.record(0, 11)
+		h.record(1, 21)
+		h.assertSoFar(nil, "with two inputs aligned and one still to come")
+
+		h.barrier(2, 1)
+		h.assertSoFar([]string{"b1", "r10", "r11", "r20", "r21"}, "once the third input aligned")
+	})
+}
+
+// TestGateForwardsOneBarrierPerCheckpointNotOnePerInput is the absorption
+// claim, and it is the same shape as the one for end-of-stream.
+//
+// Four inputs deliver barrier 1, and exactly one leaves the gate. Forwarding
+// one per input would give a downstream operator four barriers for one
+// checkpoint, so its own gate would align four times on a checkpoint that
+// happened once, and the count of checkpoints in flight would be wrong at every
+// stage of a deep job.
+func TestGateForwardsOneBarrierPerCheckpointNotOnePerInput(t *testing.T) {
+	for _, inputs := range []int{2, 4} {
+		t.Run(itoa(int64(inputs)), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				h := newAlignmentHarness(t, ctx, inputs)
+				defer h.close()
+
+				for i := range inputs {
+					h.barrier(i, 1)
+					if i < inputs-1 {
+						h.assertSoFar(nil, "with %d of %d inputs aligned", i+1, inputs)
+					}
+				}
+				h.assertSoFar([]string{"b1"}, "once every one of %d inputs aligned", inputs)
+
+				// And the barrier that came out is the checkpoint, not one of
+				// several: a second pass over the same checkpoint would be a
+				// duplicate.
+				h.barrier(0, 2)
+				for i := 1; i < inputs; i++ {
+					h.barrier(i, 2)
+				}
+				h.assertSoFar([]string{"b1", "b2"}, "after a second checkpoint over %d inputs", inputs)
+			})
+		})
+	}
+}
+
+// TestGateExcludesAnExhaustedInputFromAlignment is the one that keeps a job
+// from hanging at the tail.
+//
+// Two source vertices with different record counts inject different numbers of
+// barriers, so an input that has finished will never send the barrier the gate
+// is waiting for. Alignment has no timeout and nothing reports an error: the
+// job stops producing output, and the symptom is a run that ends short with
+// every component looking healthy.
+//
+// The exclusion is the same rule the watermark minimum uses, through the same
+// live() helper. This test drives it from the alignment side and
+// TestGateExcludesAnExhaustedInputFromTheMinimum from the other.
+func TestGateExcludesAnExhaustedInputFromAlignment(t *testing.T) {
+	t.Run("end of stream arrives before the barrier that would complete", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			h := newAlignmentHarness(t, ctx, 3)
+			defer h.close()
+
+			h.barrier(0, 1)
+			h.record(0, 10)
+			h.barrier(1, 1)
+			h.assertSoFar(nil, "with input 2 still live and not aligned")
+
+			// Input 2 finishes without ever sending barrier 1. It is dropped
+			// out of alignment, which is what completes the checkpoint.
+			h.endOfStream(2)
+			h.assertSoFar([]string{"b1", "r10"}, "once the third input reported end of stream")
+		})
+	})
+
+	t.Run("end of stream arrives before the alignment starts", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			h := newAlignmentHarness(t, ctx, 2)
+			defer h.close()
+
+			// Nothing comes out: input 0 has said nothing about event time, so
+			// it pins the minimum at its initial value and dropping input 1
+			// cannot raise it.
+			h.endOfStream(1)
+			h.assertSoFar(nil, "after one of two inputs finished")
+
+			// One live input left, so its barrier completes the checkpoint on
+			// its own. The exhausted one is not waited for.
+			h.barrier(0, 1)
+			h.record(0, 7)
+			h.assertSoFar([]string{"b1", "r7"}, "once the only live input aligned")
+		})
+	})
+}
+
+// TestGateAlignsConsecutiveCheckpoints runs two checkpoints with records
+// interleaved on both sides of both barriers.
+//
+// The second alignment has to start from what the first one released, since
+// input 0's barrier 2 is sitting in the buffer drained by checkpoint 1. A gate
+// that delivered a drained barrier straight out instead of putting it back
+// through the same path would forward barrier 2 immediately and let input 0's
+// checkpoint-3 records past it, which is the original bug one level down.
+func TestGateAlignsConsecutiveCheckpoints(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h := newAlignmentHarness(t, ctx, 2)
+		defer h.close()
+
+		h.record(0, 1)
+		h.record(1, 2)
+
+		// Input 0 races ahead: it reaches barrier 1, then barrier 2, with
+		// records between and after.
+		h.barrier(0, 1)
+		h.record(0, 3) // checkpoint 2
+		h.barrier(0, 2)
+		h.record(0, 4) // checkpoint 3
+		h.record(1, 5) // still checkpoint 1: input 1 has sent no barrier
+		h.assertSoFar([]string{"r1", "r2", "r5"}, "with input 0 two checkpoints ahead")
+
+		// Input 1 reaches barrier 1. Checkpoint 1 closes and the buffer is
+		// released, but only as far as input 0's barrier 2: r4 is behind it and
+		// stays held, because checkpoint 2 is now aligning and input 0 has
+		// already delivered its barrier for it.
+		h.barrier(1, 1)
+		h.assertSoFar([]string{"r1", "r2", "r5", "b1", "r3"}, "once checkpoint 1 aligned")
+
+		h.record(1, 6) // checkpoint 2 on input 1, which is not yet aligned for it
+		h.assertSoFar([]string{"r1", "r2", "r5", "b1", "r3", "r6"}, "with input 1 still inside checkpoint 2")
+
+		h.barrier(1, 2)
+		h.assertSoFar([]string{"r1", "r2", "r5", "b1", "r3", "r6", "b2", "r4"}, "once checkpoint 2 aligned")
+	})
+}
+
+// TestGateWatermarkMinimumSurvivesAlignment is the interaction between the two
+// per-input rules this gate now holds.
+//
+// A watermark on an input that has NOT aligned goes through the minimum exactly
+// as before: alignment must not freeze an input out of it. A watermark on an
+// input that HAS aligned is held with the rest of that input's stream and takes
+// part in the minimum when it is released, which is later but not never.
+//
+// Holding it is not incidental. The records already buffered on that input are
+// BELOW that watermark in its stream, so releasing the watermark first would
+// declare their event time complete before they arrived and the window operator
+// downstream would drop every one of them as late. That is invariant 5: the
+// order the elements were sent in is the order they mean something in.
+func TestGateWatermarkMinimumSurvivesAlignment(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h := newAlignmentHarness(t, ctx, 2)
+		defer h.close()
+
+		// Both inputs speak before any barrier: the minimum is 100.
+		h.watermark(0, 100)
+		h.assertSoFar(nil, "with only one input having sent a watermark")
+		h.watermark(1, 100)
+		h.assertSoFar([]string{"wm100"}, "with both inputs at 100")
+
+		h.barrier(0, 1)
+
+		// Input 0 is aligned. Its record and its watermark are both held, and
+		// the record is below the watermark in its stream.
+		h.record(0, 150)
+		h.watermark(0, 300)
+		h.assertSoFar([]string{"wm100"}, "with a held watermark on the aligned input")
+
+		// Input 1 is not aligned, so its watermark still moves the minimum. The
+		// minimum is min(100, 200) over the live inputs, and input 0 is frozen
+		// at 100 while it is held, so nothing advances yet.
+		h.watermark(1, 200)
+		h.assertSoFar([]string{"wm100"}, "with input 1 ahead but input 0 held at 100")
+
+		// Alignment completes. The barrier goes first, then input 0's buffer in
+		// order: the record, and only then the watermark that bounds it. The
+		// minimum becomes min(300, 200) = 200.
+		h.barrier(1, 1)
+		h.assertSoFar([]string{"wm100", "b1", "r150", "wm200"}, "once alignment completed")
+
+		// And the released watermark really did participate: input 0 is at 300
+		// now, so input 1 moving to 400 puts the minimum there.
+		h.watermark(1, 400)
+		h.assertSoFar([]string{"wm100", "b1", "r150", "wm200", "wm300"}, "after the aligned input's watermark was taken into the minimum")
+	})
+}
+
+// TestGateWithOneInputPassesBarriersStraightThrough checks that the single
+// input case falls out of the general rule rather than being handled apart from
+// it.
+//
+// One input is aligned the instant its barrier arrives, so nothing is ever
+// buffered and the barrier is forwarded on the same call. A chain at
+// parallelism 1 is the commonest topology there is; if it needed its own path,
+// the general path would be the one that never ran in most tests.
+func TestGateWithOneInputPassesBarriersStraightThrough(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h := newAlignmentHarness(t, ctx, 1)
+		defer h.close()
+
+		h.record(0, 1)
+		h.barrier(0, 1)
+		h.record(0, 2)
+		h.barrier(0, 2)
+		h.record(0, 3)
+		h.assertSoFar([]string{"r1", "b1", "r2", "b2", "r3"}, "on a single-input gate")
+	})
+}
+
+// TestGateDrainsBuffersBeforeTheEndOfInputFlush covers the tail.
+//
+// remaining reaches zero only once every input's end-of-stream has been
+// DELIVERED, and an aligned input's end-of-stream is held with the rest of its
+// stream. So the MaxInt64 flush and the end-of-stream cannot be queued ahead of
+// records still sitting in a buffer. Getting this wrong loses the last
+// checkpoint's records from the sink, which reads as a windowing bug.
+func TestGateDrainsBuffersBeforeTheEndOfInputFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h := newAlignmentHarness(t, ctx, 2)
+		defer h.close()
+
+		h.barrier(0, 1)
+		h.record(0, 10)
+		h.endOfStream(0)
+		h.assertSoFar(nil, "with input 0 aligned, holding a record and its end of stream")
+
+		// Input 1 aligns and then finishes. The drain has to put r10 out before
+		// anything about the end of input.
+		h.barrier(1, 1)
+		h.endOfStream(1)
+		h.assertSoFar([]string{"b1", "r10", "wm" + itoa(math.MaxInt64), "eos"}, "at the end of input")
+
+		// Nothing further, and the gate closes.
+		if rest := describe(h.close()); len(rest) != 0 {
+			t.Errorf("the gate delivered %v after its end of stream", rest)
+		}
+	})
+}

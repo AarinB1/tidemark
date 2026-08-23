@@ -2,6 +2,7 @@ package sources
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/core"
@@ -20,7 +21,19 @@ func testConfig(seed uint64) GeneratorConfig {
 		EventTimeStep:  10,
 		MaxLag:         250,
 		ValueSize:      20,
+		AmountRange:    1000,
 	}
+}
+
+// amountOf decodes the amount out of a record, reading the layout documented on
+// GeneratorConfig rather than calling the generator's own decoder. The layout is
+// the contract two packages depend on, so the test writes it out again.
+func amountOf(t *testing.T, rec *core.Record) uint64 {
+	t.Helper()
+	if len(rec.Value) < 8 {
+		t.Fatalf("value is %d bytes, too short to hold an amount", len(rec.Value))
+	}
+	return binary.BigEndian.Uint64(rec.Value[:8])
 }
 
 func open(t *testing.T, cfg GeneratorConfig) *Generator {
@@ -251,7 +264,9 @@ func TestExhaustsExactlyAtCount(t *testing.T) {
 }
 
 func TestValueSize(t *testing.T) {
-	sizes := []int{0, 1, 8, 20, 64}
+	// 8 is the floor, since the amount occupies the first eight bytes. Sizes
+	// below it are rejected by Open; see TestOpenRejectsBadConfig.
+	sizes := []int{8, 20, 64}
 	for _, size := range sizes {
 		t.Run(name(uint64(size)), func(t *testing.T) {
 			cfg := testConfig(seeds[2])
@@ -261,6 +276,100 @@ func TestValueSize(t *testing.T) {
 				if len(rec.Value) != size {
 					t.Fatalf("value is %d bytes, want %d", len(rec.Value), size)
 				}
+			}
+		})
+	}
+}
+
+// TestAmountIsAPureFunctionOfSeedAndOffset is invariant 7 applied to the field
+// this step adds.
+//
+// The amount of element n must depend on (Seed, n) and on nothing else. Three
+// things could make it depend on something else, and each is checked here: the
+// number of elements read before it, which is what a held *rand.Rand would make
+// it depend on and what SeekTo must not have to reconstruct; the size of the
+// record, since the padding shares the same value bytes; and the seed, which
+// must actually separate two streams rather than leaving them equal.
+//
+// A snapshot in Phase 3b records a source offset and a recovery replays from
+// it. If the amount at an offset were not a pure function of that offset, a
+// recovered run would aggregate different numbers over the same records and the
+// only symptom would be a total that does not match.
+func TestAmountIsAPureFunctionOfSeedAndOffset(t *testing.T) {
+	const offset = 137
+
+	for _, seed := range seeds {
+		t.Run(name(seed), func(t *testing.T) {
+			cfg := testConfig(seed)
+
+			// Read from zero, then seek straight to the same offset.
+			sequential := readN(t, open(t, cfg), offset+1)[offset]
+			seeked := open(t, cfg)
+			if err := seeked.SeekTo(offset); err != nil {
+				t.Fatalf("SeekTo: %v", err)
+			}
+			if got, want := amountOf(t, readN(t, seeked, 1)[0]), amountOf(t, sequential); got != want {
+				t.Errorf("element %d decodes to %d after a seek and %d after a sequential read", offset, got, want)
+			}
+
+			// Same offset, three record sizes. The padding after byte 8 differs
+			// between them; the amount must not.
+			want := amountOf(t, sequential)
+			for _, size := range []int{8, 20, 64} {
+				sized := cfg
+				sized.ValueSize = size
+				if got := amountOf(t, readN(t, open(t, sized), offset+1)[offset]); got != want {
+					t.Errorf("at ValueSize %d element %d decodes to %d, want %d: the padding is reaching the amount",
+						size, offset, got, want)
+				}
+			}
+		})
+	}
+
+	// Two seeds must not describe the same amounts. Without this the three
+	// assertions above would all hold for a generator that ignored the seed.
+	a := readN(t, open(t, testConfig(seeds[0])), 256)
+	b := readN(t, open(t, testConfig(seeds[1])), 256)
+	same := 0
+	for i := range a {
+		if amountOf(t, a[i]) == amountOf(t, b[i]) {
+			same++
+		}
+	}
+	if same == len(a) {
+		t.Error("two seeds produced identical amounts at every offset; the amount does not depend on the seed")
+	}
+}
+
+// TestAmountIsWithinRange pins the bound the aggregate is reasoned about with.
+//
+// A sum over n elements is at most n*(AmountRange-1), which is what keeps a
+// Phase 6 aggregate away from the int64 ceiling. The range must be half-open:
+// an amount equal to AmountRange means the modulo is wrong by one and the bound
+// no longer holds.
+func TestAmountIsWithinRange(t *testing.T) {
+	ranges := []int64{1, 2, 7, 1000, 1 << 40}
+	for _, r := range ranges {
+		t.Run(itoa(uint64(r)), func(t *testing.T) {
+			cfg := testConfig(seeds[2])
+			cfg.AmountRange = r
+			distinct := make(map[uint64]bool)
+			for _, rec := range readN(t, open(t, cfg), 2000) {
+				got := amountOf(t, rec)
+				if got >= uint64(r) {
+					t.Fatalf("amount %d is not below AmountRange %d", got, r)
+				}
+				distinct[got] = true
+			}
+			// A range of one has exactly one legal amount, so it is the row
+			// that says the bound is exclusive. Above that, a generator
+			// returning a constant would satisfy the bound and nothing else, so
+			// the spread is asserted too.
+			if r == 1 && len(distinct) != 1 {
+				t.Fatalf("AmountRange 1 produced %d distinct amounts, want only 0", len(distinct))
+			}
+			if r > 1 && len(distinct) < 2 {
+				t.Errorf("AmountRange %d produced %d distinct amount(s) over 2000 records", r, len(distinct))
 			}
 		})
 	}
@@ -276,6 +385,17 @@ func TestOpenRejectsBadConfig(t *testing.T) {
 		{name: "zero cardinality", mutate: func(c *GeneratorConfig) { c.KeyCardinality = 0 }},
 		{name: "negative lag", mutate: func(c *GeneratorConfig) { c.MaxLag = -1 }},
 		{name: "negative value size", mutate: func(c *GeneratorConfig) { c.ValueSize = -1 }},
+		// Below 8 there is nowhere to put the amount. A generator that
+		// truncated it instead would hand the aggregation path a number that
+		// depends on the record size.
+		{name: "zero value size", mutate: func(c *GeneratorConfig) { c.ValueSize = 0 }},
+		{name: "value size of one", mutate: func(c *GeneratorConfig) { c.ValueSize = 1 }},
+		{name: "value size one below the amount", mutate: func(c *GeneratorConfig) { c.ValueSize = 7 }},
+		// A range of zero divides by zero; a negative one converts to an
+		// enormous unsigned modulus and produces amounts far outside anything
+		// the caller asked for.
+		{name: "zero amount range", mutate: func(c *GeneratorConfig) { c.AmountRange = 0 }},
+		{name: "negative amount range", mutate: func(c *GeneratorConfig) { c.AmountRange = -1 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/core"
+	"github.com/AarinB1/tidemark/pkg/state"
 )
 
 // emitContext records what an operator emits. It stands in for the runtime's
@@ -14,10 +15,22 @@ import (
 type emitContext struct {
 	emitted   []*core.Record
 	watermark int64
+	state     state.KeyedState
 }
 
 func (c *emitContext) Emit(rec *core.Record)   { c.emitted = append(c.emitted, rec) }
 func (c *emitContext) CurrentWatermark() int64 { return c.watermark }
+
+// State hands out one Memory per context, made on first use so that a test that
+// never touches state does not carry one. It stands in for the per-subtask
+// state the runtime provides; a test sharing one across two operators would be
+// sharing what the runtime keeps apart.
+func (c *emitContext) State() state.KeyedState {
+	if c.state == nil {
+		c.state = state.NewMemory()
+	}
+	return c.state
+}
 
 func rec(key string, eventTime int64) *core.Record {
 	return &core.Record{Key: []byte(key), Value: []byte(key), EventTime: eventTime}

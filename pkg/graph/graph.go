@@ -58,8 +58,9 @@ type Vertex struct {
 	NewSink     func() core.Sink
 
 	// WatermarkIntervalElements is how many records one subtask of a source
-	// vertex emits between two watermarks. Zero disables watermark generation,
-	// which is what a job doing no event-time work wants.
+	// vertex emits between two watermarks. It must be positive on a source and
+	// zero on every other vertex; see checkSourceSettings for why a source may
+	// not switch generation off by leaving it unset.
 	//
 	// It lives here, on the vertex, rather than on core.Source, because
 	// generation is the source RUNNER's job: every source needs a watermark and
@@ -74,6 +75,16 @@ type Vertex struct {
 	// MaxOutOfOrderness is how far behind the maximum observed event time one
 	// subtask of a source vertex holds its watermark, in millis.
 	MaxOutOfOrderness int64
+	// BarrierIntervalElements is how many records one subtask of a source
+	// vertex emits between two checkpoint barriers. It must be positive on a
+	// source and zero on every other vertex.
+	//
+	// Counted in ELEMENTS, never on a wall clock, and injected regardless of
+	// data volume. That is invariant 3: a barrier's position in the stream is
+	// what makes a recovered run reproducible from a seed, and a barrier placed
+	// by a timer lands somewhere different on every run. See barrierGenerator
+	// in pkg/runtime.
+	BarrierIntervalElements int64
 }
 
 // Validation failures. Each condition has its own error so that callers and
@@ -99,6 +110,9 @@ var (
 
 	errNegativeOutOfOrderness = errors.New("MaxOutOfOrderness < 0")
 	errWatermarkOnNonSource   = errors.New("watermark configuration on a vertex that is not a source")
+	errBarrierOnNonSource     = errors.New("barrier configuration on a vertex that is not a source")
+	errWatermarkIntervalUnset = errors.New("WatermarkIntervalElements < 1 on a source")
+	errBarrierIntervalUnset   = errors.New("BarrierIntervalElements < 1 on a source")
 )
 
 // Graph is a job under construction. The zero value is not usable; call New.
@@ -175,7 +189,7 @@ func (g *Graph) Validate() error {
 		if err := checkFactories(v); err != nil {
 			return fmt.Errorf("vertex %q: %w", id, err)
 		}
-		if err := checkWatermarkConfig(v); err != nil {
+		if err := checkSourceSettings(v); err != nil {
 			return fmt.Errorf("vertex %q: %w", id, err)
 		}
 		switch v.Kind {
@@ -270,8 +284,8 @@ func (g *Graph) sortedIDs() []string {
 	return ids
 }
 
-// checkWatermarkConfig rejects watermark settings that would silently do the
-// wrong thing.
+// checkSourceSettings rejects the three per-source settings when they would
+// silently do the wrong thing.
 //
 // A negative MaxOutOfOrderness pushes the watermark AHEAD of the maximum event
 // time observed, so a window fires before its last element has arrived. That is
@@ -279,15 +293,47 @@ func (g *Graph) sortedIDs() []string {
 // produces slightly wrong counts rather than an error.
 //
 // Settings on an operator or a sink are rejected rather than ignored. Only a
-// source generates watermarks; every other vertex forwards what its gate gives
-// it. Ignoring the fields would let a job be configured for event time at a
-// vertex that cannot honour it and then run to completion looking fine.
-func checkWatermarkConfig(v Vertex) error {
+// source generates watermarks and only a source injects barriers; every other
+// vertex forwards what its gate gives it. Ignoring the fields would let a job
+// be configured for event time, or for a checkpoint interval, at a vertex that
+// cannot honour either, and then run to completion looking fine. Each field is
+// reported separately so the error names the one that was set: a message saying
+// only "watermark configuration" leaves the reader looking at two.
+//
+// A source must state a POSITIVE interval for both.
+//
+// For barriers the reason is arithmetic: the runtime divides by the interval to
+// work out how many barriers every subtask injects, so zero has no reading at
+// all.
+//
+// For watermarks the reason is the failure mode this file keeps designing
+// against. Zero used to switch generation off. A source that emits no watermark
+// leaves every downstream window open until the gate's end-of-input flush, so
+// the job still produces exactly the right answer while holding the whole run's
+// state to the last element. Nothing errors and nothing looks wrong until state
+// size is the thing being measured. Requiring the interval makes the
+// granularity something a job states rather than something it falls into.
+func checkSourceSettings(v Vertex) error {
 	if v.MaxOutOfOrderness < 0 {
-		return fmt.Errorf("%d: %w", v.MaxOutOfOrderness, errNegativeOutOfOrderness)
+		return fmt.Errorf("MaxOutOfOrderness %d: %w", v.MaxOutOfOrderness, errNegativeOutOfOrderness)
 	}
-	if v.Kind != VertexSource && (v.WatermarkIntervalElements != 0 || v.MaxOutOfOrderness != 0) {
-		return fmt.Errorf("%s: %w", v.Kind, errWatermarkOnNonSource)
+	if v.Kind != VertexSource {
+		if v.WatermarkIntervalElements != 0 {
+			return fmt.Errorf("%s: WatermarkIntervalElements %d: %w", v.Kind, v.WatermarkIntervalElements, errWatermarkOnNonSource)
+		}
+		if v.MaxOutOfOrderness != 0 {
+			return fmt.Errorf("%s: MaxOutOfOrderness %d: %w", v.Kind, v.MaxOutOfOrderness, errWatermarkOnNonSource)
+		}
+		if v.BarrierIntervalElements != 0 {
+			return fmt.Errorf("%s: BarrierIntervalElements %d: %w", v.Kind, v.BarrierIntervalElements, errBarrierOnNonSource)
+		}
+		return nil
+	}
+	if v.WatermarkIntervalElements < 1 {
+		return fmt.Errorf("WatermarkIntervalElements %d: %w", v.WatermarkIntervalElements, errWatermarkIntervalUnset)
+	}
+	if v.BarrierIntervalElements < 1 {
+		return fmt.Errorf("BarrierIntervalElements %d: %w", v.BarrierIntervalElements, errBarrierIntervalUnset)
 	}
 	return nil
 }

@@ -1,12 +1,15 @@
 package operators
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"math"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/AarinB1/tidemark/pkg/state"
 )
 
 // triple is what a fired window looks like once decoded: the unit the batch
@@ -60,6 +63,12 @@ func (h *windowHarness) endOfStream() []triple {
 }
 
 // take decodes everything emitted since the last call.
+//
+// The window start is DERIVED, not read: the operator stamps a fired window
+// with its end-1, so the start is EventTime-(size-1) and the harness has to
+// undo the same saturating arithmetic the operator applied. Reading EventTime
+// as a window start would silently shift every expectation in this file by
+// size-1 and every row would still look plausible.
 func (h *windowHarness) take() []triple {
 	h.t.Helper()
 	var out []triple
@@ -68,7 +77,7 @@ func (h *windowHarness) take() []triple {
 		if err != nil {
 			h.t.Fatalf("DecodeCount: %v", err)
 		}
-		out = append(out, triple{key: string(r.Key), windowStart: r.EventTime, count: count})
+		out = append(out, triple{key: string(r.Key), windowStart: subFloor(r.EventTime, h.op.size-1), count: count})
 	}
 	h.seen = len(h.ctx.emitted)
 	return out
@@ -275,11 +284,31 @@ func TestWindowFireTimeClampsInsteadOfWrapping(t *testing.T) {
 	size := int64(math.MaxInt64 - 10)
 	h := newWindowHarness(t, NewTumblingCount(size, 0))
 	h.record("a", size)
-	if got := h.watermark(0); len(got) != 0 {
-		t.Fatalf("watermark 0 fired %v; fire time wrapped below zero", got)
+	if got := len(h.ctx.emitted); got != 0 {
+		t.Fatalf("the record emitted %d rows on arrival", got)
 	}
-	if got := h.watermark(math.MaxInt64); !slices.Equal(got, []triple{{"a", size, 1}}) {
-		t.Fatalf("fired %v, want the window starting at size with count 1", got)
+	if h.watermark(0); len(h.ctx.emitted) != 0 {
+		t.Fatalf("watermark 0 fired a window; fire time wrapped below zero")
+	}
+
+	// Asserted on the record rather than through the harness's triple. This
+	// window's end is not representable, so end-1 saturates at MaxInt64 and the
+	// start cannot be recovered from it. That is the one case where the emitted
+	// event time is lossy, and it is harmless: no event time above MaxInt64 is
+	// left for a downstream stage to be late against.
+	h.watermark(math.MaxInt64)
+	if len(h.ctx.emitted) != 1 {
+		t.Fatalf("the MaxInt64 flush fired %d rows, want 1", len(h.ctx.emitted))
+	}
+	got := h.ctx.emitted[0]
+	if string(got.Key) != "a" {
+		t.Errorf("fired key %q, want \"a\"", got.Key)
+	}
+	if got.EventTime != math.MaxInt64 {
+		t.Errorf("fired event time %d, want MaxInt64: start+size-1 must saturate rather than wrap", got.EventTime)
+	}
+	if count, err := DecodeCount(got.Value); err != nil || count != 1 {
+		t.Errorf("fired count %d (err %v), want 1", count, err)
 	}
 }
 
@@ -679,9 +708,9 @@ func TestWindowSnapshotRefuses(t *testing.T) {
 // the sink and the oracle both read.
 //
 // The key must survive intact: it is what the record partitions on downstream,
-// and an empty one is refused by the writer. Event time carries the window
-// start, which is what makes the emitted stream a (key, windowStart, count)
-// triple with nothing else to decode.
+// and an empty one is refused by the writer. Event time carries the window's
+// end-1; see TestWindowEmitsEndMinusOneSoTheOutputIsNotLateDownstream for why
+// that and not the start.
 func TestWindowEmitsTheKeyUnchanged(t *testing.T) {
 	h := newWindowHarness(t, NewTumblingCount(100, 0))
 	h.record("\x00\x01\xff", 10)
@@ -694,10 +723,254 @@ func TestWindowEmitsTheKeyUnchanged(t *testing.T) {
 	if string(got.Key) != "\x00\x01\xff" {
 		t.Errorf("emitted key %x, want the input key unchanged", got.Key)
 	}
-	if got.EventTime != 0 {
-		t.Errorf("emitted event time %d, want the window start 0", got.EventTime)
+	if got.EventTime != 99 {
+		t.Errorf("emitted event time %d, want 99, the end-1 of window [0, 100)", got.EventTime)
 	}
 	if len(got.Key) == 0 {
 		t.Error("emitted an unkeyed record, which the writer refuses to partition")
+	}
+}
+
+// TestWindowEmitsEndMinusOneSoTheOutputIsNotLateDownstream is the property the
+// emitted event time exists for.
+//
+// A watermark w asserts that no element with event time <= w will arrive, and
+// this operator fires [start, end) at the first w >= end-1. That same watermark
+// passed windowStart long before, so an output stamped with windowStart is
+// already behind the watermark that released it and a second event-time stage
+// would see the whole stream as late and drop it. The assertion is therefore
+// not "the event time equals end-1" on its own but that it is NOT BELOW the
+// firing watermark, which is what windowStart violates and what a chained
+// operator actually depends on. Nexmark q5 is two event-time stages and lands
+// in Phase 6.
+//
+// A sliding row is included because size and slide differ there: under
+// windowStart the gap to the firing watermark is size-1 regardless of the
+// slide, so a fix that used slide-1 would pass a tumbling-only test.
+func TestWindowEmitsEndMinusOneSoTheOutputIsNotLateDownstream(t *testing.T) {
+	tests := []struct {
+		name        string
+		size, slide int64
+		eventTime   int64
+		// fireAt is the watermark that completes the earliest window the record
+		// lands in, and the whole set fires by the last one below.
+		watermarks []int64
+	}{
+		{name: "tumbling", size: 100, slide: 100, eventTime: 10, watermarks: []int64{99}},
+		{name: "tumbling negative", size: 100, slide: 100, eventTime: -1, watermarks: []int64{-1}},
+		{name: "sliding", size: 100, slide: 25, eventTime: 99, watermarks: []int64{99, 124, 149, 174}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newWindowHarness(t, NewSlidingCount(tt.size, tt.slide, 0))
+			h.record("k", tt.eventTime)
+
+			fired := 0
+			for _, wm := range tt.watermarks {
+				before := len(h.ctx.emitted)
+				h.watermark(wm)
+				for _, r := range h.ctx.emitted[before:] {
+					fired++
+					if r.EventTime < wm {
+						t.Errorf("a window fired at watermark %d carrying event time %d, which that watermark has already passed: every downstream event-time operator sees this output as late",
+							wm, r.EventTime)
+					}
+					// And it is exactly end-1, not merely at or above the
+					// watermark: anything larger would claim the window can
+					// hold an element it cannot.
+					start := subFloor(r.EventTime, tt.size-1)
+					if got, want := r.EventTime, addCeil(start, tt.size-1); got != want {
+						t.Errorf("window [%d, %d) emitted event time %d, want its end-1 %d",
+							start, start+tt.size, got, want)
+					}
+				}
+			}
+			if want := int(tt.size / tt.slide); fired != want {
+				t.Fatalf("%d windows fired, want %d; the assertion above saw the wrong number of rows", fired, want)
+			}
+		})
+	}
+}
+
+// nilStateContext is a Context that provides no keyed state.
+type nilStateContext struct{ emitContext }
+
+func (nilStateContext) State() state.KeyedState { return nil }
+
+// TestWindowOpenRefusesWithoutState pins that the operator takes its state from
+// the runtime rather than making its own.
+//
+// An operator that fell back to a private map would run correctly and
+// checkpoint as empty, so a recovery would come back with every open window
+// gone and nothing to point at. Refusing at Open turns that into a job that
+// does not start.
+func TestWindowOpenRefusesWithoutState(t *testing.T) {
+	if err := NewTumblingCount(100, 0).Open(&nilStateContext{}); err == nil {
+		t.Error("Open accepted a Context with no keyed state")
+	}
+}
+
+// TestWindowStateLayout pins the two encodings Phase 3b has to serialise and
+// read back.
+//
+// The composite key is the record key bytes then the window start as a
+// big-endian int64, and the value is the aggregate as a big-endian int64. Both
+// are asserted against bytes written out by hand here rather than against
+// appendStateKey, which would be the operator agreeing with itself.
+//
+// The negative window start matters: a start below zero has its top bit set, so
+// an encoding that wrote it as anything other than the raw two's-complement
+// bytes would still round-trip through this operator and only disagree with a
+// snapshot written by a different one.
+func TestWindowStateLayout(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("ab", 150)
+	h.record("ab", 160)
+	h.record("ab", -50)
+	h.record("z", 150)
+
+	want := []struct {
+		key   string
+		start int64
+		count int64
+	}{
+		{key: "ab", start: -100, count: 1},
+		{key: "ab", start: 100, count: 2},
+		{key: "z", start: 100, count: 1},
+	}
+
+	st := h.ctx.State()
+	for _, w := range want {
+		var stateKey []byte
+		stateKey = append(stateKey, w.key...)
+		var startBytes [8]byte
+		binary.BigEndian.PutUint64(startBytes[:], uint64(w.start))
+		stateKey = append(stateKey, startBytes[:]...)
+
+		value, ok := st.Get(stateKey)
+		if !ok {
+			t.Fatalf("no state under key %q + window start %d", w.key, w.start)
+		}
+		if len(value) != 8 {
+			t.Fatalf("value for (%q, %d) is %d bytes, want 8", w.key, w.start, len(value))
+		}
+		if got := int64(binary.BigEndian.Uint64(value)); got != w.count {
+			t.Errorf("(%q, %d) holds %d, want %d", w.key, w.start, got, w.count)
+		}
+	}
+
+	// Exactly those three entries, so a stray write under some other key would
+	// be caught rather than ignored.
+	entries := 0
+	st.Iterate(func(k, v []byte) bool { entries++; return true })
+	if entries != len(want) {
+		t.Errorf("state holds %d entries, want %d", entries, len(want))
+	}
+}
+
+// TestWindowStateGroupsAKeysWindowsTogether is what putting the window start
+// AFTER the record key buys.
+//
+// Sorted iteration must visit all of one key's windows before any of the next
+// key's, so a scan for a key is a scan of a contiguous run. Phase 3b's Pebble
+// backend depends on it, and so does anything that wants a key's state without
+// reading the whole of it.
+func TestWindowStateGroupsAKeysWindowsTogether(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	// Interleaved on purpose: the grouping must come from the layout, not from
+	// the order the records arrived in.
+	for _, eventTime := range []int64{0, 100, 200, 300} {
+		for _, key := range []string{"kc", "ka", "kb"} {
+			h.record(key, eventTime)
+		}
+	}
+
+	var order []string
+	h.ctx.State().Iterate(func(k, v []byte) bool {
+		order = append(order, string(k[:len(k)-8]))
+		return true
+	})
+	if len(order) != 12 {
+		t.Fatalf("state holds %d entries, want 12", len(order))
+	}
+
+	// One contiguous run per key, in key order, four windows each.
+	want := []string{"ka", "ka", "ka", "ka", "kb", "kb", "kb", "kb", "kc", "kc", "kc", "kc"}
+	if !slices.Equal(order, want) {
+		t.Errorf("sorted iteration visited keys in order %q, want %q: a key's windows are not contiguous", order, want)
+	}
+}
+
+// TestWindowPurgeRemovesStateAndNotJustTimers checks that the scan the
+// watermark drives actually frees the entry.
+//
+// Firing a window deregisters its timer either way, so a purge that never
+// deleted anything would produce identical output and leave state growing for
+// the length of the run. That is the Phase 6 state-size target failing silently.
+func TestWindowPurgeRemovesStateAndNotJustTimers(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("a", 10)
+	h.record("a", 150)
+
+	entries := func() int {
+		n := 0
+		h.ctx.State().Iterate(func(k, v []byte) bool { n++; return true })
+		return n
+	}
+	if got := entries(); got != 2 {
+		t.Fatalf("state holds %d entries after two records in two windows, want 2", got)
+	}
+
+	// 99 fires [0, 100) but does not purge it: with lateness 0 the window is
+	// held until the watermark passes end.
+	h.watermark(99)
+	if got := entries(); got != 2 {
+		t.Errorf("state holds %d entries at the firing watermark, want 2: the window is still open for late records", got)
+	}
+
+	h.watermark(101)
+	if got := entries(); got != 1 {
+		t.Fatalf("state holds %d entries past the purge threshold, want 1", got)
+	}
+	// And it is the right one that survived.
+	if _, ok := h.ctx.State().Get(appendStateKey(nil, "a", 100)); !ok {
+		t.Error("the purge removed the window that is still open")
+	}
+	if _, ok := h.ctx.State().Get(appendStateKey(nil, "a", 0)); ok {
+		t.Error("the purged window still holds state")
+	}
+}
+
+// TestWindowStartOfRoundTripsThroughTheCompositeKey covers the split back, at
+// the ends of the range and for keys of different lengths.
+func TestWindowStartOfRoundTripsThroughTheCompositeKey(t *testing.T) {
+	keys := []string{"", "a", "ab", "\x00\xff\x00", "aaaaaaaaaaaaaaaa"}
+	starts := []int64{0, 1, -1, 100, -100, math.MaxInt64, math.MinInt64}
+	for _, key := range keys {
+		for _, start := range starts {
+			composite := appendStateKey(nil, key, start)
+			if got, want := len(composite), len(key)+8; got != want {
+				t.Fatalf("composite key for (%q, %d) is %d bytes, want %d", key, start, got, want)
+			}
+			got, err := windowStartOf(composite)
+			if err != nil {
+				t.Fatalf("windowStartOf(%q, %d): %v", key, start, err)
+			}
+			if got != start {
+				t.Errorf("windowStartOf for (%q, %d) = %d", key, start, got)
+			}
+			if k := string(composite[:len(composite)-8]); k != key {
+				t.Errorf("the key half of the composite for (%q, %d) is %q", key, start, k)
+			}
+		}
+	}
+
+	// Anything shorter than the window start is reported rather than read past
+	// the front of the slice.
+	for _, short := range [][]byte{nil, {1}, make([]byte, 7)} {
+		if _, err := windowStartOf(short); !errors.Is(err, errStateKeyTooShort) {
+			t.Errorf("windowStartOf(%d bytes) = %v, want %v", len(short), err, errStateKeyTooShort)
+		}
 	}
 }

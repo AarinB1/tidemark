@@ -10,6 +10,29 @@ import (
 
 // GeneratorConfig parameterises a Generator. The same config and the same seed
 // always describe the same finite sequence of records.
+//
+// # Value layout
+//
+// Value is a fixed binary record, not opaque bytes:
+//
+//	bytes 0..7    amount, big-endian uint64, drawn from [0, AmountRange)
+//	bytes 8..end  padding derived from (Seed, n), out to ValueSize
+//
+// The layout is documented here, on the config, because more than one place
+// decodes it and they are in different packages: an aggregating operator reads
+// the amount out of a record, and the batch oracle reads it out again
+// independently to say what that operator should have produced. If the two ever
+// disagree about where the amount lives, the symptom is not a decode error. It
+// is a sum that is wrong, which is the hardest kind of bug this engine has.
+//
+// The number lives in Value rather than in a new field on core.Record. Nexmark
+// records carry several numbers at once (auction id, bidder, price), so one
+// typed field would not be enough and a second would not settle it either; and
+// Phase 7 has to serialise a Record across a process boundary regardless, at
+// which point a documented fixed binary layout is exactly the thing that has to
+// exist. Settling it now rather than in Phase 6 keeps it out of the snapshot
+// format Phase 3b is about to write and out of the restore path that would
+// follow it.
 type GeneratorConfig struct {
 	Seed           uint64
 	Count          int64 // number of records; must be > 0 in Phase 0
@@ -17,7 +40,8 @@ type GeneratorConfig struct {
 	BaseEventTime  int64 // millis since the Unix epoch
 	EventTimeStep  int64 // millis of event time per offset
 	MaxLag         int64 // millis of bounded out-of-orderness
-	ValueSize      int   // bytes
+	ValueSize      int   // bytes; must be >= 8, which the amount occupies
+	AmountRange    int64 // amounts are drawn from [0, AmountRange); must be >= 1
 }
 
 // Salts separating the three derived streams. Independent streams come from
@@ -25,9 +49,10 @@ type GeneratorConfig struct {
 // counter makes element n depend on how many elements were drawn before it,
 // which is exactly what SeekTo must not have to reconstruct.
 const (
-	keySalt   = 0x1
-	valueSalt = 0x2
-	timeSalt  = 0x3
+	keySalt    = 0x1
+	valueSalt  = 0x2
+	timeSalt   = 0x3
+	amountSalt = 0x4
 )
 
 // Generator is a seekable, deterministic source.
@@ -60,8 +85,10 @@ func (g *Generator) Open(ctx core.Context) error {
 		return fmt.Errorf("generator: KeyCardinality is %d, must be > 0", g.cfg.KeyCardinality)
 	case g.cfg.MaxLag < 0:
 		return fmt.Errorf("generator: MaxLag is %d, must be >= 0", g.cfg.MaxLag)
-	case g.cfg.ValueSize < 0:
-		return fmt.Errorf("generator: ValueSize is %d, must be >= 0", g.cfg.ValueSize)
+	case g.cfg.ValueSize < 8:
+		return fmt.Errorf("generator: ValueSize is %d, must be >= 8: the amount occupies the first 8 bytes of Value", g.cfg.ValueSize)
+	case g.cfg.AmountRange < 1:
+		return fmt.Errorf("generator: AmountRange is %d, must be >= 1", g.cfg.AmountRange)
 	}
 	return nil
 }
@@ -112,18 +139,37 @@ func (g *Generator) keyOf(n int64) []byte {
 	return buf[:]
 }
 
-// valueOf returns ValueSize bytes derived from (Seed, n). The bytes are filled
-// from successive mixes of one per-element base so the whole value, not just
-// its first 8 bytes, is a function of the element index.
+// valueOf returns ValueSize bytes in the layout documented on GeneratorConfig:
+// the amount in the first eight, then padding out to ValueSize.
+//
+// The padding starts at byte 8 rather than being written from byte 0 and partly
+// overwritten, and it is derived from its own salt. That is what makes the
+// amount independent of ValueSize: element n of a given seed decodes to the
+// same amount whether the record carries 8 bytes or 64. A layout where the
+// padding decided the amount would make the aggregate a function of a size
+// knob, and every comparison against the oracle would then depend on the two
+// agreeing about that knob as well as about the arithmetic.
 func (g *Generator) valueOf(n int64) []byte {
 	v := make([]byte, g.cfg.ValueSize)
+	binary.BigEndian.PutUint64(v[:8], g.amountOf(n))
 	base := mix(g.cfg.Seed^valueSalt, uint64(n))
 	var buf [8]byte
-	for i := 0; i < len(v); i += 8 {
+	for i := 8; i < len(v); i += 8 {
 		binary.BigEndian.PutUint64(buf[:], mix(base, uint64(i/8)))
 		copy(v[i:], buf[:])
 	}
 	return v
+}
+
+// amountOf returns the amount of element n: a pure function of (Seed, n) in
+// [0, AmountRange), derived from its own salt like every other field.
+//
+// It is a separate stream rather than a slice of the value stream so that
+// nothing about the padding can move it. Aggregation over these amounts is what
+// Nexmark q5 and q7 need, and what the window operator's count is a sum of ones
+// standing in for until Phase 6.
+func (g *Generator) amountOf(n int64) uint64 {
+	return mix(g.cfg.Seed^amountSalt, uint64(n)) % uint64(g.cfg.AmountRange)
 }
 
 // timeOf returns the event time of element n: the in-order time for that offset

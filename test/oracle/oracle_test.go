@@ -341,6 +341,7 @@ func testConfig(seed uint64, count int64) sources.GeneratorConfig {
 		EventTimeStep:  10,
 		MaxLag:         200,
 		ValueSize:      8,
+		AmountRange:    1000,
 	}
 }
 

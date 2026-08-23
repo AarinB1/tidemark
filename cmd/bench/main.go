@@ -151,12 +151,20 @@ func benchGraph(records int64, p int, seed uint64, keys int64) (*graph.Graph, er
 		EventTimeStep:  1,
 		MaxLag:         500,
 		ValueSize:      16,
+		AmountRange:    1000,
 	}
 
 	g := graph.New()
 	vertices := []graph.Vertex{
 		{ID: "source", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+			NewSource: func() core.Source { return sources.NewGenerator(cfg) },
+			// Deliberately coarse against a two-million record run: twenty
+			// broadcasts of each per subtask. This job measures record
+			// throughput, and a tight interval here would move the number
+			// without the record path having changed.
+			WatermarkIntervalElements: 100000,
+			MaxOutOfOrderness:         cfg.MaxLag,
+			BarrierIntervalElements:   100000},
 		{ID: "identity", Kind: graph.VertexOperator, Parallelism: p,
 			NewOperator: func() core.Operator {
 				return operators.NewMap(func(rec *core.Record) (*core.Record, error) { return rec, nil })

@@ -25,6 +25,7 @@ func testGeneratorConfig(count int64) sources.GeneratorConfig {
 		EventTimeStep:  10,
 		MaxLag:         50,
 		ValueSize:      8,
+		AmountRange:    1000,
 	}
 }
 
@@ -46,7 +47,10 @@ func chainWith(t *testing.T, newSource func() core.Source, newOperator func() co
 	t.Helper()
 	g := graph.New()
 	vertices := []graph.Vertex{
-		{ID: "src", Kind: graph.VertexSource, Parallelism: 1, NewSource: newSource},
+		{ID: "src", Kind: graph.VertexSource, Parallelism: 1,
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 newSource},
 		{ID: "id", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: newOperator},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: 1, NewSink: newSink},
 	}
@@ -90,9 +94,12 @@ func TestRunFiltersAndDrops(t *testing.T) {
 
 	g := graph.New()
 	vertices := []graph.Vertex{
-		{ID: "src", Kind: graph.VertexSource, Parallelism: 1, NewSource: func() core.Source {
-			return sources.NewGenerator(testGeneratorConfig(count))
-		}},
+		{ID: "src", Kind: graph.VertexSource, Parallelism: 1,
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource: func() core.Source {
+				return sources.NewGenerator(testGeneratorConfig(count))
+			}},
 		{ID: "even", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: func() core.Operator {
 			return operators.NewFilter(func(r *core.Record) bool { return r.EventTime%2 == 0 })
 		}},
@@ -268,12 +275,15 @@ func TestRunCancelledMidRun(t *testing.T) {
 
 		g := graph.New()
 		vertices := []graph.Vertex{
-			{ID: "src", Kind: graph.VertexSource, Parallelism: 1, NewSource: func() core.Source {
-				return &closeRecordingSource{
-					Source: sources.NewGenerator(testGeneratorConfig(count)),
-					closes: &srcCloses,
-				}
-			}},
+			{ID: "src", Kind: graph.VertexSource, Parallelism: 1,
+				WatermarkIntervalElements: testWatermarkInterval,
+				BarrierIntervalElements:   testBarrierInterval,
+				NewSource: func() core.Source {
+					return &closeRecordingSource{
+						Source: sources.NewGenerator(testGeneratorConfig(count)),
+						closes: &srcCloses,
+					}
+				}},
 			{ID: "id", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: func() core.Operator {
 				return &closeRecordingOperator{
 					Operator: identity(),
@@ -338,7 +348,9 @@ func TestRunCancelledMidRun(t *testing.T) {
 func TestRunRejectsInvalidGraph(t *testing.T) {
 	g := graph.New()
 	if err := g.AddVertex(graph.Vertex{ID: "src", Kind: graph.VertexSource, Parallelism: 1,
-		NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(1)) }}); err != nil {
+		WatermarkIntervalElements: testWatermarkInterval,
+		BarrierIntervalElements:   testBarrierInterval,
+		NewSource:                 func() core.Source { return sources.NewGenerator(testGeneratorConfig(1)) }}); err != nil {
 		t.Fatalf("AddVertex: %v", err)
 	}
 	if err := Run(context.Background(), g); err == nil {

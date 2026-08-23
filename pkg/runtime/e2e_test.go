@@ -114,6 +114,7 @@ func e2eConfig(seed uint64, count int64) sources.GeneratorConfig {
 		EventTimeStep:  5,
 		MaxLag:         100,
 		ValueSize:      16,
+		AmountRange:    1000,
 	}
 }
 
@@ -136,7 +137,9 @@ func e2eGraph(t *testing.T, cfg sources.GeneratorConfig, keep func(*core.Record)
 	g := graph.New()
 	vertices := []graph.Vertex{
 		{ID: "source", Kind: graph.VertexSource, Parallelism: 1,
-			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(cfg) }},
 		{ID: "operator", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: newOperator},
 		{ID: "sink", Kind: graph.VertexSink, Parallelism: 1,
 			NewSink: func() core.Sink { return sink }},

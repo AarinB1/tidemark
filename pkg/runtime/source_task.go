@@ -68,15 +68,22 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 }
 
 // sourceLoop reads the records assigned to one subtask of a source vertex,
-// handing each to emitRecord and each due watermark to emitWatermark. It
-// returns when the subtask's range is exhausted, when the source reports it has
-// no more elements, or on the first error from the source, from either emitter,
-// or from ctx.
+// handing each to emitRecord, each due watermark to emitWatermark, and each due
+// barrier to emitBarrier. It returns when the subtask's range is exhausted,
+// when the source reports it has no more elements, or on the first error from
+// the source, from any emitter, or from ctx.
 //
 // The record goes out before the watermark derived from it. Either order is
 // safe, since a watermark of maxSeen-lag-1 does not bound the record that
 // produced it, but records-then-watermark is the one that reads as what it is:
-// the watermark summarises everything already sent.
+// the watermark summarises everything already sent. The barrier goes out last
+// of the three, so it closes a checkpoint over exactly the elements already
+// emitted.
+//
+// Both control elements go out on the SAME stream as the records, in the order
+// shown, which is invariant 5. A barrier on a side channel could overtake the
+// records it is meant to separate, and every element on the wrong side of it
+// would be checkpointed into the wrong epoch.
 //
 // wm is taken by value. Each subtask drives its own generator over its own
 // contiguous slice of the offset space, which is what produces the staircase
@@ -85,11 +92,12 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 //
 // The source must already be open: Open validates configuration, and a source
 // that failed validation must not be seeked.
-func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, emitRecord func(*core.Record) error, emitWatermark func(int64) error) error {
-	end, bounded, err := seekToRange(src, parallelism, index)
+func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, barrierIntervalElements int64, emitRecord func(*core.Record) error, emitWatermark func(int64) error, emitBarrier func(*core.Barrier) error) error {
+	end, bounded, count, err := seekToRange(src, parallelism, index)
 	if err != nil {
 		return err
 	}
+	br := newBarrierGenerator(barrierIntervalElements, maxBarriers(count, parallelism, barrierIntervalElements, bounded))
 
 	for {
 		// Checked every element so that a subtask whose consumer is keeping up,
@@ -116,6 +124,15 @@ func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm
 				return err
 			}
 		}
+		// After the watermark, so that a barrier injected on the same element
+		// carries the watermark that element produced rather than the previous
+		// one. Nothing depends on the value, but "the last watermark this
+		// subtask emitted" has to mean one thing rather than two.
+		if id, ok := br.onRecord(); ok {
+			if err := emitBarrier(&core.Barrier{CheckpointID: id, Timestamp: wm.lastEmitted}); err != nil {
+				return err
+			}
+		}
 	}
 }
 
@@ -127,19 +144,101 @@ func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm
 // above parallelism 1 there is no safe reading of the request and it is an
 // error rather than a silent read of the whole input by every subtask, which
 // would duplicate every record P times.
-func seekToRange(src core.Source, parallelism, index int) (end int64, bounded bool, err error) {
+func seekToRange(src core.Source, parallelism, index int) (end int64, bounded bool, count int64, err error) {
 	s, ok := src.(splittableSource)
 	if !ok {
 		if parallelism > 1 {
-			return 0, false, fmt.Errorf("source does not report a Count and cannot be split across %d subtasks", parallelism)
+			return 0, false, 0, fmt.Errorf("source does not report a Count and cannot be split across %d subtasks", parallelism)
 		}
-		return 0, false, nil
+		return 0, false, 0, nil
 	}
-	start, end := sourceRange(s.Count(), parallelism, index)
+	count = s.Count()
+	start, end := sourceRange(count, parallelism, index)
 	if err := src.SeekTo(start); err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
-	return end, true, nil
+	return end, true, count, nil
+}
+
+// unboundedBarriers is the barrier budget of a source that reports no Count.
+//
+// Such a source is refused above parallelism 1 by seekToRange, so a job that
+// has one has exactly one source subtask on that vertex and there is no second
+// subtask for it to agree with. It injects a barrier every interval elements
+// for as long as it produces them.
+const unboundedBarriers = -1
+
+// maxBarriers is how many barriers EVERY subtask of a source vertex injects.
+//
+// Contiguous ranges are equal in length only up to integer division: count 10
+// at parallelism 4 gives ranges of 2, 3, 2 and 3. A subtask injecting a barrier
+// every interval elements of its OWN range would therefore inject more barriers
+// from a longer range than from a shorter one, and a downstream operator
+// aligning on the last one would wait for a barrier that no subtask is ever
+// going to send. Alignment has no timeout and nothing reports an error: the job
+// simply stops producing output, which is the failure mode invariant 3 is
+// written against.
+//
+// So the budget comes from the FLOOR of count/parallelism, which every range is
+// at least as long as, and every subtask gets that same number. Elements past
+// it in a longer range still flow; they carry no barrier.
+func maxBarriers(count int64, parallelism int, intervalElements int64, bounded bool) int64 {
+	if !bounded {
+		return unboundedBarriers
+	}
+	if intervalElements <= 0 {
+		return 0
+	}
+	return (count / int64(parallelism)) / intervalElements
+}
+
+// barrierGenerator decides when a source subtask injects a checkpoint barrier.
+//
+// The interval is counted in ELEMENTS and never on a wall clock. This is
+// invariant 3, and invariant 6 is the general rule behind it: a barrier
+// injected on a timer lands at a different logical position on every run, so a
+// recovered run cannot be compared against a clean one and a fault schedule
+// keyed to "after the second barrier" means a different thing each time. It is
+// also why injection does not depend on data volume: a quiet source that
+// stopped injecting would stall alignment everywhere downstream of it.
+//
+// Checkpoint IDs start at 1 and are contiguous within a subtask. Every subtask
+// of a vertex counts within its own range, so barrier k is injected after
+// k*interval of that subtask's elements, and all of them stop at the same
+// budget; see maxBarriers.
+//
+// The generator holds a count and a budget and nothing else, which is what
+// makes an injection point a pure function of the subtask's element index.
+type barrierGenerator struct {
+	intervalElements int64
+	// maxBarriers is the number this subtask will inject, or unboundedBarriers.
+	maxBarriers int64
+
+	sinceLast int64
+	injected  int64
+}
+
+func newBarrierGenerator(intervalElements, maxBarriers int64) barrierGenerator {
+	return barrierGenerator{intervalElements: intervalElements, maxBarriers: maxBarriers}
+}
+
+// onRecord counts one element and reports the checkpoint ID to inject, if any.
+// The caller emits the record first, so a barrier never precedes an element
+// belonging to the checkpoint it closes.
+func (g *barrierGenerator) onRecord() (checkpointID int64, ok bool) {
+	if g.intervalElements <= 0 {
+		return 0, false
+	}
+	if g.maxBarriers != unboundedBarriers && g.injected >= g.maxBarriers {
+		return 0, false
+	}
+	g.sinceLast++
+	if g.sinceLast < g.intervalElements {
+		return 0, false
+	}
+	g.sinceLast = 0
+	g.injected++
+	return g.injected, true
 }
 
 // watermarkGenerator decides when a source subtask emits a watermark and what
