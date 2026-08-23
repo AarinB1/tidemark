@@ -41,7 +41,9 @@ func parallelChain(t *testing.T, cfg sources.GeneratorConfig, p int, sink core.S
 	t.Helper()
 	return buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(cfg) }},
 		{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
 			NewSink: func() core.Sink { return sink }},
@@ -85,7 +87,9 @@ func TestRunSendsAKeyToOneSinkSubtask(t *testing.T) {
 
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(cfg) }},
 		{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
 			NewSink: func() core.Sink { return collects[next.Add(1)-1] }},
@@ -197,7 +201,10 @@ func TestRunAtParallelismCallsCloseExactlyOncePerSubtask(t *testing.T) {
 			}
 
 			g := buildGraph(t, []graph.Vertex{
-				{ID: "src", Kind: graph.VertexSource, Parallelism: p, NewSource: newSource},
+				{ID: "src", Kind: graph.VertexSource, Parallelism: p,
+					WatermarkIntervalElements: testWatermarkInterval,
+					BarrierIntervalElements:   testBarrierInterval,
+					NewSource:                 newSource},
 				{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: func() core.Operator {
 					return &closeRecordingOperator{Operator: identity(), closes: &opCloses}
 				}},
@@ -240,7 +247,9 @@ func TestRunAtParallelismReportsTheFailingSubtask(t *testing.T) {
 	const p = 8
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(50000)) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(testGeneratorConfig(50000)) }},
 		{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
 			NewSink: func() core.Sink { return &failingSink{failAt: 10} }},
@@ -261,7 +270,9 @@ func TestRunAtParallelismUnwindsOnCancellation(t *testing.T) {
 	var sinkCloses atomic.Int64
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(1000000)) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(testGeneratorConfig(1000000)) }},
 		{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p, NewSink: func() core.Sink {
 			return &closeRecordingSink{Sink: sinks.NewDiscard(), closes: &sinkCloses}
@@ -286,7 +297,9 @@ func TestRunAtParallelismUnwindsOnCancellation(t *testing.T) {
 func TestRunRejectsAnUnkeyedRecord(t *testing.T) {
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: 2,
-			NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(100)) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(testGeneratorConfig(100)) }},
 		{ID: "strip", Kind: graph.VertexOperator, Parallelism: 2, NewOperator: func() core.Operator {
 			return operators.NewMap(func(r *core.Record) (*core.Record, error) {
 				return &core.Record{Value: r.Value, EventTime: r.EventTime}, nil
@@ -320,7 +333,9 @@ func TestWireCreatesOneChannelPerSubtaskPair(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g := buildGraph(t, []graph.Vertex{
 				{ID: "src", Kind: graph.VertexSource, Parallelism: tt.sourceP,
-					NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(1)) }},
+					WatermarkIntervalElements: testWatermarkInterval,
+					BarrierIntervalElements:   testBarrierInterval,
+					NewSource:                 func() core.Source { return sources.NewGenerator(testGeneratorConfig(1)) }},
 				{ID: "id", Kind: graph.VertexOperator, Parallelism: tt.operatorP, NewOperator: identity},
 				{ID: "out", Kind: graph.VertexSink, Parallelism: tt.sinkP,
 					NewSink: func() core.Sink { return sinks.NewDiscard() }},
@@ -412,7 +427,9 @@ func fanOutGraph(t *testing.T, cfg sources.GeneratorConfig, p int, sink core.Sin
 	t.Helper()
 	return buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(cfg) }},
 		{ID: "left", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 		{ID: "right", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
@@ -427,9 +444,13 @@ func multiInputGraph(t *testing.T, a, b sources.GeneratorConfig, p int, sink cor
 	t.Helper()
 	return buildGraph(t, []graph.Vertex{
 		{ID: "srcA", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(a) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(a) }},
 		{ID: "srcB", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(b) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(b) }},
 		{ID: "merge", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
 			NewSink: func() core.Sink { return sink }},
@@ -527,9 +548,13 @@ func TestMultiInputEmitsOneEndOfStream(t *testing.T) {
 	var flushes atomic.Int64
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "srcA", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(a) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(a) }},
 		{ID: "srcB", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(b) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(b) }},
 		{ID: "merge", Kind: graph.VertexOperator, Parallelism: p, NewOperator: func() core.Operator {
 			return &flushCountingOperator{Operator: identity(), flushes: &flushes}
 		}},
@@ -609,7 +634,9 @@ func TestFanOutSendsTheCompleteStreamToEveryBranch(t *testing.T) {
 
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(cfg) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(cfg) }},
 		{ID: "left", Kind: graph.VertexOperator, Parallelism: p, NewOperator: recording(&left)},
 		{ID: "right", Kind: graph.VertexOperator, Parallelism: p, NewOperator: recording(&right)},
 		{ID: "out", Kind: graph.VertexSink, Parallelism: p,
@@ -642,7 +669,9 @@ func TestWireGroupsOutputsByDownstreamVertex(t *testing.T) {
 	)
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: sourceP,
-			NewSource: func() core.Source { return sources.NewGenerator(testGeneratorConfig(1)) }},
+			WatermarkIntervalElements: testWatermarkInterval,
+			BarrierIntervalElements:   testBarrierInterval,
+			NewSource:                 func() core.Source { return sources.NewGenerator(testGeneratorConfig(1)) }},
 		// "left" sorts before "right", so the groups must come out in that
 		// order whatever order the edges were added in.
 		{ID: "right", Kind: graph.VertexOperator, Parallelism: rightP, NewOperator: identity},

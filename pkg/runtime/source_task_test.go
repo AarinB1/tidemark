@@ -14,10 +14,20 @@ import (
 	"github.com/AarinB1/tidemark/pkg/graph"
 	"github.com/AarinB1/tidemark/pkg/sinks"
 	"github.com/AarinB1/tidemark/pkg/sources"
+	"github.com/AarinB1/tidemark/pkg/transport"
 )
 
 // parallelismLevels is the set every equivalence assertion in Phase 1 runs at.
 var parallelismLevels = []int{1, 2, 4, 8}
+
+// Every source vertex must state both per-subtask intervals, so these are what
+// the graph-level tests in this package use wherever the interval itself is not
+// the thing under test. Large enough that they cost nothing on the long runs;
+// the tests that are about injection set their own.
+const (
+	testWatermarkInterval = 1000
+	testBarrierInterval   = 1000
+)
 
 func TestSourceRangePartitionsTheOffsetSpace(t *testing.T) {
 	tests := []struct {
@@ -165,8 +175,8 @@ func TestSourceLoopRangesDoNotOverlap(t *testing.T) {
 // duplicate every record P times and report nothing, so the request is refused.
 func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// countlessSource has no Count method, so it is not splittable.
-	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, noWatermarks(),
-		func(*core.Record) error { return nil }, unexpectedWatermark(t))
+	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, noWatermarks(), noBarriers(),
+		func(*core.Record) error { return nil }, unexpectedWatermark(t), unexpectedBarrier(t))
 	if err == nil {
 		t.Fatal("sourceLoop split a source that does not report a Count")
 	}
@@ -174,10 +184,10 @@ func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// At parallelism 1 there is nothing to divide, so the same source is read
 	// to exhaustion.
 	var seen int
-	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, noWatermarks(), func(*core.Record) error {
+	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
 		seen++
 		return nil
-	}, unexpectedWatermark(t)); err != nil {
+	}, unexpectedWatermark(t), unexpectedBarrier(t)); err != nil {
 		t.Fatalf("sourceLoop at parallelism 1: %v", err)
 	}
 	if seen != 10 {
@@ -193,10 +203,10 @@ func TestSourceLoopStopsOnContextCancellation(t *testing.T) {
 	if err := src.Open(nil); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	err := sourceLoop(ctx, src, 1, 0, noWatermarks(), func(*core.Record) error {
+	err := sourceLoop(ctx, src, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
 		t.Error("sourceLoop emitted a record against a cancelled context")
 		return nil
-	}, unexpectedWatermark(t))
+	}, unexpectedWatermark(t), unexpectedBarrier(t))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("sourceLoop = %v, want context.Canceled", err)
 	}
@@ -210,13 +220,13 @@ func TestSourceLoopReturnsTheEmitError(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	var seen int
-	err := sourceLoop(context.Background(), src, 1, 0, noWatermarks(), func(*core.Record) error {
+	err := sourceLoop(context.Background(), src, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
 		seen++
 		if seen == 3 {
 			return errEmit
 		}
 		return nil
-	}, unexpectedWatermark(t))
+	}, unexpectedWatermark(t), unexpectedBarrier(t))
 	if !errors.Is(err, errEmit) {
 		t.Fatalf("sourceLoop = %v, want %v", err, errEmit)
 	}
@@ -260,10 +270,10 @@ func readSubtaskRange(t *testing.T, cfg sources.GeneratorConfig, parallelism, in
 	}()
 
 	var out []*core.Record
-	err := sourceLoop(context.Background(), src, parallelism, index, noWatermarks(), func(rec *core.Record) error {
+	err := sourceLoop(context.Background(), src, parallelism, index, noWatermarks(), noBarriers(), func(rec *core.Record) error {
 		out = append(out, rec)
 		return nil
-	}, unexpectedWatermark(t))
+	}, unexpectedWatermark(t), unexpectedBarrier(t))
 	if err != nil {
 		t.Fatalf("sourceLoop(p=%d, i=%d): %v", parallelism, index, err)
 	}
@@ -353,7 +363,10 @@ func TestRunRefusesADecoratorThatHidesCount(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			collect := sinks.NewCollect()
 			g := buildGraph(t, []graph.Vertex{
-				{ID: "src", Kind: graph.VertexSource, Parallelism: p, NewSource: tt.newSource},
+				{ID: "src", Kind: graph.VertexSource, Parallelism: p,
+					WatermarkIntervalElements: testWatermarkInterval,
+					BarrierIntervalElements:   testBarrierInterval,
+					NewSource:                 tt.newSource},
 				{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
 				{ID: "out", Kind: graph.VertexSink, Parallelism: p,
 					NewSink: func() core.Sink { return collect }},
@@ -615,18 +628,46 @@ func unexpectedWatermark(t *testing.T) func(int64) error {
 	}
 }
 
-// element is one thing a source subtask put on its outputs, in the order it did
-// so. Watermarks travel in-band with records (invariant 5), so the interleaving
-// is part of what has to be asserted and a test that collected the two into
-// separate lists would not be able to see it.
-type element struct {
-	watermark bool
-	eventTime int64
+// noBarriers is the interval that disables injection, for the tests about the
+// range logic or about event time rather than about checkpoints. graph.Validate
+// refuses a source configured this way; sourceLoop still has to behave, because
+// a loop that divided by the interval unconditionally would panic here rather
+// than in the validator where the mistake is.
+func noBarriers() int64 { return 0 }
+
+// unexpectedBarrier is the matching emitter.
+func unexpectedBarrier(t *testing.T) func(*core.Barrier) error {
+	return func(b *core.Barrier) error {
+		t.Helper()
+		t.Errorf("a source with barrier injection disabled injected checkpoint %d", b.CheckpointID)
+		return nil
+	}
 }
+
+// element is one thing a source subtask put on its outputs, in the order it did
+// so.
+//
+// Records, watermarks and barriers travel in ONE stream (invariant 5), so the
+// interleaving is part of what has to be asserted: a harness that collected the
+// three into separate lists could not tell a barrier that landed after the
+// right number of elements from one that landed anywhere at all. The kind is
+// carried rather than a pair of booleans so that "not a watermark" cannot
+// quietly come to mean "a record".
+type element struct {
+	kind      core.ElementKind
+	eventTime int64
+	// barrier fields, meaningful only when kind is KindBarrier.
+	checkpointID int64
+	timestamp    int64
+}
+
+func (e element) isRecord() bool    { return e.kind == core.KindRecord }
+func (e element) isWatermark() bool { return e.kind == core.KindWatermark }
+func (e element) isBarrier() bool   { return e.kind == core.KindBarrier }
 
 // runSourceSubtaskLoop drives sourceLoop over a generator and returns the
 // merged element stream one subtask produced.
-func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermarkGenerator, parallelism, index int) []element {
+func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermarkGenerator, barrierInterval int64, parallelism, index int) []element {
 	t.Helper()
 	src := sources.NewGenerator(cfg)
 	if err := src.Open(nil); err != nil {
@@ -639,13 +680,17 @@ func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermar
 	}()
 
 	var out []element
-	err := sourceLoop(context.Background(), src, parallelism, index, wm,
+	err := sourceLoop(context.Background(), src, parallelism, index, wm, barrierInterval,
 		func(rec *core.Record) error {
-			out = append(out, element{eventTime: rec.EventTime})
+			out = append(out, element{kind: core.KindRecord, eventTime: rec.EventTime})
 			return nil
 		},
 		func(t int64) error {
-			out = append(out, element{watermark: true, eventTime: t})
+			out = append(out, element{kind: core.KindWatermark, eventTime: t})
+			return nil
+		},
+		func(b *core.Barrier) error {
+			out = append(out, element{kind: core.KindBarrier, checkpointID: b.CheckpointID, timestamp: b.Timestamp})
 			return nil
 		})
 	if err != nil {
@@ -670,12 +715,12 @@ func TestSourceLoopPutsWatermarksInBandBehindTheirRecords(t *testing.T) {
 	cfg := testGeneratorConfig(count)
 	cfg.MaxLag = lag
 
-	got := runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, lag), 1, 0)
+	got := runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, lag), noBarriers(), 1, 0)
 
 	records, watermarks := 0, 0
 	maxSeen := int64(math.MinInt64)
 	for i, e := range got {
-		if !e.watermark {
+		if e.isRecord() {
 			records++
 			if e.eventTime > maxSeen {
 				maxSeen = e.eventTime
@@ -715,12 +760,12 @@ func TestSourceLoopReturnsTheWatermarkEmitError(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	var records int
-	err := sourceLoop(context.Background(), src, 1, 0, newWatermarkGenerator(10, 0),
+	err := sourceLoop(context.Background(), src, 1, 0, newWatermarkGenerator(10, 0), noBarriers(),
 		func(*core.Record) error {
 			records++
 			return nil
 		},
-		func(int64) error { return errWatermark })
+		func(int64) error { return errWatermark }, unexpectedBarrier(t))
 	if !errors.Is(err, errWatermark) {
 		t.Fatalf("sourceLoop = %v, want %v", err, errWatermark)
 	}
@@ -751,8 +796,8 @@ func TestSourceLoopWatermarksStaircaseAcrossSubtasks(t *testing.T) {
 	var prevMax int64 = math.MinInt64
 	for i := range p {
 		var got []int64
-		for _, e := range runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, 0), p, i) {
-			if e.watermark {
+		for _, e := range runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, 0), noBarriers(), p, i) {
+			if e.isWatermark() {
 				got = append(got, e.eventTime)
 			}
 		}
@@ -827,6 +872,7 @@ func TestRunBroadcastsWatermarksToEveryChannelOnEveryEdge(t *testing.T) {
 	var left, right watermarkRecorder
 	g := buildGraph(t, []graph.Vertex{
 		{ID: "src", Kind: graph.VertexSource, Parallelism: 1,
+			BarrierIntervalElements:   testBarrierInterval,
 			NewSource:                 func() core.Source { return sources.NewGenerator(cfg) },
 			WatermarkIntervalElements: interval,
 			MaxOutOfOrderness:         cfg.MaxLag},
@@ -843,8 +889,8 @@ func TestRunBroadcastsWatermarksToEveryChannelOnEveryEdge(t *testing.T) {
 	// The source is at parallelism 1, so what it emitted is exactly what one
 	// subtask's generator produces over the whole input.
 	var want []int64
-	for _, e := range runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, cfg.MaxLag), 1, 0) {
-		if e.watermark {
+	for _, e := range runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(interval, cfg.MaxLag), noBarriers(), 1, 0) {
+		if e.isWatermark() {
 			want = append(want, e.eventTime)
 		}
 	}
@@ -867,6 +913,354 @@ func TestRunBroadcastsWatermarksToEveryChannelOnEveryEdge(t *testing.T) {
 			if !slices.Equal(got, want) {
 				t.Errorf("%s[%d] saw watermarks %v, want every one of %v", branch.name, i, got, want)
 			}
+		}
+	}
+}
+
+// barriersOf reduces an element stream to the barriers in it.
+func barriersOf(elems []element) []element {
+	var out []element
+	for _, e := range elems {
+		if e.isBarrier() {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestMaxBarriersIsTheSameForEverySubtask is invariant 3's deadlock guard,
+// stated on the arithmetic before any stream exists.
+//
+// Contiguous ranges are equal in length only up to integer division. Every
+// subtask must inject the SAME number of barriers, because a downstream
+// operator aligning on barrier k waits for one from every live input and there
+// is no timeout: a subtask that never sends barrier k stops the job with no
+// error anywhere. The budget therefore comes from the floor of count/P, which
+// every range is at least as long as.
+func TestMaxBarriersIsTheSameForEverySubtask(t *testing.T) {
+	tests := []struct {
+		name        string
+		count       int64
+		parallelism int
+		interval    int64
+		want        int64
+	}{
+		{name: "exact division", count: 1000, parallelism: 4, interval: 50, want: 5},
+		// Ranges of 2, 3, 2, 3. The floor is 2, so nobody injects at all.
+		{name: "remainder below the interval", count: 10, parallelism: 4, interval: 5, want: 0},
+		// Ranges of 250, 251, 250, 250. Subtask 1 reaches its 250th element
+		// like the rest and stops there; its 251st carries no barrier.
+		{name: "remainder above the interval", count: 1001, parallelism: 4, interval: 100, want: 2},
+		{name: "one subtask", count: 1000, parallelism: 1, interval: 100, want: 10},
+		{name: "interval longer than the input", count: 10, parallelism: 1, interval: 100, want: 0},
+		{name: "empty input", count: 0, parallelism: 4, interval: 10, want: 0},
+		{name: "more subtasks than records", count: 3, parallelism: 8, interval: 1, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := maxBarriers(tt.count, tt.parallelism, tt.interval, true)
+			if got != tt.want {
+				t.Fatalf("maxBarriers(count=%d, p=%d, interval=%d) = %d, want %d",
+					tt.count, tt.parallelism, tt.interval, got, tt.want)
+			}
+			// Every subtask's range is at least as long as the budget needs,
+			// which is the property the number is chosen for.
+			for i := range tt.parallelism {
+				start, end := sourceRange(tt.count, tt.parallelism, i)
+				if need := got * tt.interval; end-start < need {
+					t.Errorf("subtask %d holds %d elements but is asked for %d barriers, which needs %d",
+						i, end-start, got, need)
+				}
+			}
+		})
+	}
+
+	// A source with no Count is uncapped. seekToRange refuses such a source
+	// above parallelism 1, so there is no second subtask to agree with.
+	if got := maxBarriers(0, 1, 10, false); got != unboundedBarriers {
+		t.Errorf("maxBarriers for an unbounded source = %d, want %d", got, unboundedBarriers)
+	}
+}
+
+// TestEverySourceSubtaskInjectsTheSameBarrierCount is the same claim through
+// the loop rather than the arithmetic, at three parallelisms.
+//
+// The count that matters is per SUBTASK and not per vertex: a vertex total
+// would be satisfied by one subtask injecting all of them, which is exactly the
+// arrangement that deadlocks alignment.
+func TestEverySourceSubtaskInjectsTheSameBarrierCount(t *testing.T) {
+	const interval = 25
+	// 1001 is deliberately not a multiple of any parallelism below, so the
+	// ranges differ in length in every row.
+	counts := []int64{1001, 1000, 37}
+
+	for _, count := range counts {
+		cfg := testGeneratorConfig(count)
+		for _, p := range []int{1, 2, 4} {
+			t.Run(fmt.Sprintf("count%d/p%d", count, p), func(t *testing.T) {
+				want := maxBarriers(count, p, interval, true)
+				for i := range p {
+					got := barriersOf(runSourceSubtaskLoop(t, cfg, noWatermarks(), interval, p, i))
+					if int64(len(got)) != want {
+						t.Errorf("subtask %d of %d injected %d barriers, want %d: a downstream operator aligning on the last one waits forever",
+							i, p, len(got), want)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestBarriersLandAtTheSpecifiedElementPositions pins where a barrier sits in
+// the stream, which is what invariants 3 and 6 are about.
+//
+// Barrier k follows the k*interval-th element of the SUBTASK's own range, in
+// the same stream as the records (invariant 5). Position, not count: a
+// generator that injected the right number of barriers at the wrong places
+// would make a recovered run replay from a different point, and the only
+// symptom is a diff in the output that looks like a windowing bug.
+func TestBarriersLandAtTheSpecifiedElementPositions(t *testing.T) {
+	const (
+		count    = 400
+		interval = 25
+		p        = 2
+	)
+	cfg := testGeneratorConfig(count)
+
+	for i := range p {
+		got := runSourceSubtaskLoop(t, cfg, noWatermarks(), interval, p, i)
+
+		records, barriers := 0, 0
+		for j, e := range got {
+			if e.isRecord() {
+				records++
+				continue
+			}
+			if !e.isBarrier() {
+				t.Fatalf("subtask %d element %d is a %s, but watermarks are disabled here", i, j, e.kind)
+			}
+			barriers++
+			if records != barriers*interval {
+				t.Errorf("subtask %d: barrier %d follows %d records, want %d",
+					i, barriers, records, barriers*interval)
+			}
+		}
+		start, end := sourceRange(count, p, i)
+		if int64(records) != end-start {
+			t.Errorf("subtask %d emitted %d records, want its range of %d", i, records, end-start)
+		}
+		if want := maxBarriers(count, p, interval, true); int64(barriers) != want {
+			t.Fatalf("subtask %d injected %d barriers, want %d", i, barriers, want)
+		}
+	}
+}
+
+// TestCheckpointIDsAreContiguousFromOne pins the numbering.
+//
+// A checkpoint coordinator in Phase 3b matches a barrier to the checkpoint it
+// belongs to by ID. An ID that started at zero would collide with the zero
+// value of an int64 field, and a gap would leave a checkpoint that every
+// subtask waits on and none ever announces.
+func TestCheckpointIDsAreContiguousFromOne(t *testing.T) {
+	const (
+		count    = 500
+		interval = 10
+		p        = 2
+	)
+	cfg := testGeneratorConfig(count)
+
+	for i := range p {
+		got := barriersOf(runSourceSubtaskLoop(t, cfg, noWatermarks(), interval, p, i))
+		if len(got) == 0 {
+			t.Fatalf("subtask %d injected no barrier; the test asserts nothing", i)
+		}
+		for k, e := range got {
+			if want := int64(k + 1); e.checkpointID != want {
+				t.Fatalf("subtask %d barrier %d carries checkpoint ID %d, want %d",
+					i, k, e.checkpointID, want)
+			}
+		}
+	}
+}
+
+// TestBarrierTimestampIsTheLastWatermarkAndNotAClock pins the metadata field,
+// which exists to be looked at and not to be computed from.
+//
+// It carries the watermark that source subtask most recently emitted, which is
+// a function of (seed, offset) and therefore the same on a replay. A wall clock
+// there would be different on every run and would quietly make a snapshot
+// comparison in Phase 3b fail for a reason that has nothing to do with state.
+//
+// Before the subtask's first watermark there is nothing to carry, and the
+// generator's initial value stands: MinInt64 says "no watermark yet" rather
+// than claiming 1970.
+func TestBarrierTimestampIsTheLastWatermarkAndNotAClock(t *testing.T) {
+	const (
+		count             = 300
+		barrierInterval   = 20
+		watermarkInterval = 50
+	)
+	cfg := testGeneratorConfig(count)
+
+	got := runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(watermarkInterval, cfg.MaxLag), barrierInterval, 1, 0)
+
+	lastWatermark := int64(math.MinInt64)
+	barriers, afterFirstWatermark := 0, 0
+	for _, e := range got {
+		switch {
+		case e.isWatermark():
+			lastWatermark = e.eventTime
+		case e.isBarrier():
+			barriers++
+			if e.timestamp != lastWatermark {
+				t.Errorf("barrier %d carries timestamp %d, want the last emitted watermark %d",
+					e.checkpointID, e.timestamp, lastWatermark)
+			}
+			if lastWatermark != math.MinInt64 {
+				afterFirstWatermark++
+			}
+		}
+	}
+	if barriers == 0 {
+		t.Fatal("no barrier was injected; the test asserts nothing")
+	}
+	if afterFirstWatermark == 0 {
+		t.Error("every barrier arrived before the first watermark, so the timestamp was never compared against a real value")
+	}
+
+	// The same subtask replayed produces the same timestamps. That is the whole
+	// claim: it is deterministic, which a clock is not.
+	again := barriersOf(runSourceSubtaskLoop(t, cfg, newWatermarkGenerator(watermarkInterval, cfg.MaxLag), barrierInterval, 1, 0))
+	first := barriersOf(got)
+	if len(again) != len(first) {
+		t.Fatalf("a replay injected %d barriers, want %d", len(again), len(first))
+	}
+	for k := range first {
+		if again[k].timestamp != first[k].timestamp {
+			t.Errorf("barrier %d carried timestamp %d on one run and %d on a replay",
+				first[k].checkpointID, first[k].timestamp, again[k].timestamp)
+		}
+	}
+}
+
+// TestSourceSubtaskBroadcastsBarriersToEveryChannel is the invariant 2 claim
+// for barriers, on the only shape where it can fail.
+//
+// Two downstream vertices, each at parallelism 2, gives one source subtask four
+// output channels in two groups. A barrier must reach all four. A record
+// partitions WITHIN a group and copies ACROSS groups; a barrier does neither,
+// it goes everywhere, and the two mistakes look different: partitioning within
+// a group sends barrier k to one subtask of a vertex, and partitioning across
+// groups sends it to one branch. Either way some subtask aligns on a checkpoint
+// whose barrier never arrives, alignment has no timeout, and the job stops
+// producing output with nothing to point at.
+//
+// The assertion is the exact sequence of checkpoint IDs on every channel, not a
+// count: under a partitioning writer each channel still receives barriers, just
+// not all of them.
+//
+// A chain cannot state this. With one downstream vertex at parallelism 1 there
+// is one channel, and broadcast and partition are the same thing.
+func TestSourceSubtaskBroadcastsBarriersToEveryChannel(t *testing.T) {
+	const (
+		count    = 400
+		interval = 50
+		width    = 2
+	)
+	cfg := testGeneratorConfig(count)
+
+	// Two groups of two: one group per downstream vertex, one channel per
+	// subtask of it. This is the shape wire() builds for a source feeding two
+	// operator vertices at parallelism 2.
+	groups := make([][]transport.Output, 2)
+	chans := make([][]*transport.Channel, len(groups))
+	for gi := range groups {
+		for range width {
+			ch := transport.NewChannel(transport.DefaultCapacity)
+			chans[gi] = append(chans[gi], ch)
+			groups[gi] = append(groups[gi], ch)
+		}
+	}
+
+	v := graph.Vertex{
+		ID: "src", Kind: graph.VertexSource, Parallelism: 1,
+		NewSource:                 func() core.Source { return sources.NewGenerator(cfg) },
+		WatermarkIntervalElements: testWatermarkInterval,
+		MaxOutOfOrderness:         cfg.MaxLag,
+		BarrierIntervalElements:   interval,
+	}
+
+	// Drained concurrently: the subtask blocks once a channel fills, and it
+	// closes every output on the way out, which is what ends each drain.
+	type drained struct {
+		barriers []int64
+		records  int
+	}
+	results := make([][]drained, len(chans))
+	var wg sync.WaitGroup
+	for gi := range chans {
+		results[gi] = make([]drained, len(chans[gi]))
+		for ci, ch := range chans[gi] {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var d drained
+				for {
+					e, ok := ch.Recv()
+					if !ok {
+						results[gi][ci] = d
+						return
+					}
+					switch e.Kind {
+					case core.KindRecord:
+						d.records++
+					case core.KindBarrier:
+						d.barriers = append(d.barriers, e.Barrier.CheckpointID)
+					}
+				}
+			}()
+		}
+	}
+
+	if err := runSubtask(context.Background(), v, 0, nil, groups); err != nil {
+		t.Fatalf("runSubtask: %v", err)
+	}
+	wg.Wait()
+
+	var want []int64
+	for k := int64(1); k <= maxBarriers(count, 1, interval, true); k++ {
+		want = append(want, k)
+	}
+	if len(want) == 0 {
+		t.Fatal("the source injected no barrier; the test asserts nothing")
+	}
+
+	for gi := range results {
+		for ci, d := range results[gi] {
+			if !slices.Equal(d.barriers, want) {
+				t.Errorf("group %d channel %d saw checkpoints %v, want every one of %v", gi, ci, d.barriers, want)
+			}
+		}
+	}
+
+	// The records did NOT go everywhere, which is what says the assertion above
+	// is about broadcast rather than about the writer sending everything to
+	// every channel. Each group receives the whole stream, partitioned across
+	// its channels.
+	for gi := range results {
+		total := 0
+		for ci, d := range results[gi] {
+			if d.records == 0 {
+				t.Errorf("group %d channel %d received no record at all", gi, ci)
+			}
+			if d.records == count {
+				t.Errorf("group %d channel %d received all %d records; they are meant to partition within a group", gi, ci, count)
+			}
+			total += d.records
+		}
+		if total != count {
+			t.Errorf("group %d received %d records in total, want %d", gi, total, count)
 		}
 	}
 }

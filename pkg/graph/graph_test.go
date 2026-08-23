@@ -36,8 +36,19 @@ func (nopSink) Open(core.Context) error  { return nil }
 func (nopSink) Write(*core.Record) error { return nil }
 func (nopSink) Close() error             { return nil }
 
+// helperInterval is what the source helper below sets for both per-source
+// intervals. A source vertex must state a positive value for each, so a helper
+// that left them at zero would make every structural test in this file fail on
+// a settings complaint instead of on the structure it is about.
+const helperInterval = 1000
+
 func source(id string) Vertex {
-	return Vertex{ID: id, Kind: VertexSource, Parallelism: 1, NewSource: func() core.Source { return nopSource{} }}
+	return Vertex{
+		ID: id, Kind: VertexSource, Parallelism: 1,
+		NewSource:                 func() core.Source { return nopSource{} },
+		WatermarkIntervalElements: helperInterval,
+		BarrierIntervalElements:   helperInterval,
+	}
 }
 
 func operator(id string) Vertex {
@@ -382,8 +393,8 @@ func ids(vs []Vertex) []string {
 	return out
 }
 
-// TestValidateWatermarkConfig covers the two settings a source vertex carries
-// for event time.
+// TestValidateSourceSettings covers the three settings only a source vertex may
+// carry.
 //
 // A negative MaxOutOfOrderness puts the watermark ahead of the maximum event
 // time observed, so a window fires before its last element arrives: invariant
@@ -391,14 +402,28 @@ func ids(vs []Vertex) []string {
 // settings on an operator or a sink are rejected rather than ignored, because
 // only a source generates watermarks and a job configured for event time at a
 // vertex that cannot honour it would otherwise run to completion looking fine.
+// The same holds for a barrier interval: only a source injects barriers.
+//
+// A source that leaves either interval unset is rejected for the mirror-image
+// reason. Zero barriers cannot be divided by. Zero watermarks used to mean
+// generation off, and a source that emits none leaves every downstream window
+// open until the gate's end-of-input flush: the job produces the right answer
+// while holding the whole run's state to the last element, and nothing errors.
 // Each rejection is also checked for naming the FIELD, not just the vertex.
-// Both settings share one sentinel on a non-source, so an error that said only
-// "watermark configuration" would leave the reader looking at two fields.
-func TestValidateWatermarkConfig(t *testing.T) {
-	withWatermarks := func(v Vertex, interval, lag int64) Vertex {
+// Several settings share one sentinel on a non-source, so an error that said
+// only "watermark configuration" would leave the reader looking at two fields.
+func TestValidateSourceSettings(t *testing.T) {
+	// configured writes all three settings, so a row states exactly what it
+	// means rather than inheriting the helper's defaults for the ones it is not
+	// about.
+	configured := func(v Vertex, interval, lag, barrier int64) Vertex {
 		v.WatermarkIntervalElements = interval
 		v.MaxOutOfOrderness = lag
+		v.BarrierIntervalElements = barrier
 		return v
+	}
+	withWatermarks := func(v Vertex, interval, lag int64) Vertex {
+		return configured(v, interval, lag, v.BarrierIntervalElements)
 	}
 
 	tests := []struct {
@@ -410,18 +435,58 @@ func TestValidateWatermarkConfig(t *testing.T) {
 		wantMentions []string
 	}{
 		{
-			name:     "source configured for event time",
-			vertices: []Vertex{withWatermarks(source("s"), 1000, 50), operator("m"), sink("k")},
+			name:     "source configured for event time and checkpoints",
+			vertices: []Vertex{configured(source("s"), 1000, 50, 500), operator("m"), sink("k")},
 		},
 		{
 			name:     "a lag of zero on a source is not a negative lag",
-			vertices: []Vertex{withWatermarks(source("s"), 1000, 0), operator("m"), sink("k")},
+			vertices: []Vertex{configured(source("s"), 1000, 0, 500), operator("m"), sink("k")},
 		},
 		{
-			// The zero value is watermark generation off, which is what a job
-			// doing no event-time work wants. It must not be a rejection.
-			name:     "no configuration anywhere",
-			vertices: []Vertex{source("s"), operator("m"), sink("k")},
+			name:     "an interval of one is the smallest valid setting for either",
+			vertices: []Vertex{configured(source("s"), 1, 0, 1), operator("m"), sink("k")},
+		},
+		{
+			// Zero used to mean watermark generation off. A source that emits
+			// none leaves every window open to the end-of-input flush and
+			// nothing errors, which is the failure this rejection exists for.
+			name:         "no watermark interval on a source",
+			vertices:     []Vertex{configured(source("s"), 0, 0, 500), operator("m"), sink("k")},
+			wantErr:      errWatermarkIntervalUnset,
+			wantMentions: []string{`"s"`, "WatermarkIntervalElements"},
+		},
+		{
+			name:         "negative watermark interval on a source",
+			vertices:     []Vertex{configured(source("s"), -1, 0, 500), operator("m"), sink("k")},
+			wantErr:      errWatermarkIntervalUnset,
+			wantMentions: []string{`"s"`, "WatermarkIntervalElements"},
+		},
+		{
+			// The runtime divides the subtask's share of the input by this to
+			// work out how many barriers every subtask injects, so zero has no
+			// reading at all.
+			name:         "no barrier interval on a source",
+			vertices:     []Vertex{configured(source("s"), 1000, 0, 0), operator("m"), sink("k")},
+			wantErr:      errBarrierIntervalUnset,
+			wantMentions: []string{`"s"`, "BarrierIntervalElements"},
+		},
+		{
+			name:         "negative barrier interval on a source",
+			vertices:     []Vertex{configured(source("s"), 1000, 0, -1), operator("m"), sink("k")},
+			wantErr:      errBarrierIntervalUnset,
+			wantMentions: []string{`"s"`, "BarrierIntervalElements"},
+		},
+		{
+			name:         "barrier interval on an operator",
+			vertices:     []Vertex{source("s"), configured(operator("m"), 0, 0, 500), sink("k")},
+			wantErr:      errBarrierOnNonSource,
+			wantMentions: []string{`"m"`, "BarrierIntervalElements"},
+		},
+		{
+			name:         "barrier interval on a sink",
+			vertices:     []Vertex{source("s"), operator("m"), configured(sink("k"), 0, 0, 500)},
+			wantErr:      errBarrierOnNonSource,
+			wantMentions: []string{`"k"`, "BarrierIntervalElements"},
 		},
 		{
 			name:         "negative lag on a source",

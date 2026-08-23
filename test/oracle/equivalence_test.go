@@ -38,6 +38,12 @@ const allowedLateness = 0
 // TestWindowsFireOnWatermarksAndNotOnlyAtEndOfInput below pins.
 const watermarkInterval = 100
 
+// barrierInterval is how many records a source subtask emits between two
+// checkpoint barriers. Phase 3a does not snapshot, so barriers change nothing
+// about the answers below; they flow so that the equivalence suite runs the
+// same element stream the checkpointing phases will.
+const barrierInterval = 100
+
 // depthRecords is the per-source record count for the depth matrix. Three
 // topologies at three parallelisms under -race is slow, and 10k is enough to
 // give every key a hundred windows.
@@ -80,6 +86,7 @@ func sourceVertex(id string, cfg sources.GeneratorConfig, p int) graph.Vertex {
 		NewSource:                 func() core.Source { return sources.NewGenerator(cfg) },
 		WatermarkIntervalElements: watermarkInterval,
 		MaxOutOfOrderness:         cfg.MaxLag,
+		BarrierIntervalElements:   barrierInterval,
 	}
 }
 

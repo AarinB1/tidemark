@@ -77,6 +77,12 @@ func identityGraph(cfg sources.GeneratorConfig, sink core.Sink) (*graph.Graph, e
 			Kind:        graph.VertexSource,
 			Parallelism: 1,
 			NewSource:   func() core.Source { return sources.NewGenerator(cfg) },
+			// Both counted in elements, never on a clock. The identity job does
+			// no event-time work, but a source vertex has to state a
+			// granularity for each rather than fall into one.
+			WatermarkIntervalElements: 10000,
+			MaxOutOfOrderness:         cfg.MaxLag,
+			BarrierIntervalElements:   10000,
 		},
 		{
 			ID:          "identity",

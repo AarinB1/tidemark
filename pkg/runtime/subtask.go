@@ -68,8 +68,16 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 	emitWatermark := func(t int64) error {
 		return w.Broadcast(ctx, core.NewWatermarkElement(t))
 	}
+	// Barriers broadcast for the same reason watermarks do, and the consequence
+	// of getting it wrong is worse. A barrier that reached only some of a
+	// downstream vertex's subtasks leaves the others aligning on a checkpoint
+	// they will never see completed, and alignment has no timeout: the job stops
+	// producing output with no error anywhere (invariants 2 and 3).
+	emitBarrier := func(b *core.Barrier) error {
+		return w.Broadcast(ctx, core.NewBarrierElement(b))
+	}
 	wm := newWatermarkGenerator(v.WatermarkIntervalElements, v.MaxOutOfOrderness)
-	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, emitRecord, emitWatermark); err != nil {
+	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, v.BarrierIntervalElements, emitRecord, emitWatermark, emitBarrier); err != nil {
 		return fmt.Errorf("source %s: %w", id, err)
 	}
 
@@ -132,8 +140,17 @@ func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate 
 				return err
 			}
 			return w.Broadcast(ctx, e)
+		case core.KindBarrier:
+			// Forwarded and broadcast, like a watermark, and NOT handed to the
+			// operator. Phase 3a aligns barriers at the gate and forwards them;
+			// taking a snapshot when one arrives is Phase 3b, and core.Operator
+			// has no method for it precisely so that this line cannot quietly
+			// grow one.
+			if err := w.Broadcast(ctx, e); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("operator %s: unexpected %s element: barriers arrive in Phase 3", id, e.Kind)
+			return fmt.Errorf("operator %s: unexpected %s element", id, e.Kind)
 		}
 	}
 }
@@ -162,10 +179,17 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 			}
 		case core.KindWatermark:
 			oc.watermark = e.Watermark
+		case core.KindBarrier:
+			// Ignored, deliberately. A sink commits on NotifyCheckpointComplete
+			// and never at snapshot time, because data committed at snapshot
+			// time belongs to a checkpoint that may never complete and comes
+			// back as duplicates on recovery (invariant 4). Neither the
+			// notification nor the transactional sink exists yet, so there is
+			// nothing here to do but let the barrier pass.
 		case core.KindEndOfStream:
 			return nil
 		default:
-			return fmt.Errorf("sink %s: unexpected %s element: barriers arrive in Phase 3", id, e.Kind)
+			return fmt.Errorf("sink %s: unexpected %s element", id, e.Kind)
 		}
 	}
 }
