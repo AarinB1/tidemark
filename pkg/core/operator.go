@@ -1,18 +1,34 @@
 package core
 
-import "io"
+import (
+	"io"
+
+	"github.com/AarinB1/tidemark/pkg/state"
+)
 
 // Context is the operator's handle on the runtime.
 //
-// It is deliberately smaller than it will eventually be: State() arrives with
-// the state backend and RegisterEventTimeTimer() with event-time processing.
-// Nothing is stubbed here in advance.
+// It is deliberately smaller than it will eventually be. Nothing is stubbed
+// here in advance: State() is here because the state backend is here, and
+// RegisterEventTimeTimer() is still absent because event-time timers are held
+// by the operator that fires them rather than by the runtime.
 type Context interface {
 	// Emit forwards rec to the downstream channels.
 	Emit(rec *Record)
 	// CurrentWatermark returns the watermark most recently delivered to the
 	// operator, or the initial minimum if none has arrived.
 	CurrentWatermark() int64
+	// State returns the keyed state of this subtask.
+	//
+	// One state per subtask, handed out rather than created by the operator, so
+	// that the runtime decides which backend a job runs on: Memory now, Pebble
+	// in Phase 3b. An operator that made its own map could not be checkpointed
+	// without every operator being taught about the backend separately.
+	//
+	// This is a method on an interface that already exists, not a new
+	// interface, and the import runs one way: pkg/core depends on pkg/state and
+	// pkg/state depends on nothing in this repository.
+	State() state.KeyedState
 }
 
 // Operator is the user-defined computation run by a subtask. The runtime calls

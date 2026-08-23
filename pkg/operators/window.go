@@ -8,24 +8,52 @@ import (
 	"math"
 
 	"github.com/AarinB1/tidemark/pkg/core"
+	"github.com/AarinB1/tidemark/pkg/state"
 )
 
-// windowKey identifies one window of one key. string(key) is the map key
-// because a []byte cannot be one.
+// State layout. Both halves are documented here because Phase 3b serialises
+// this state and the restore path has to read back exactly what was written.
 //
-// That conversion allocates on every lookup, once per record per window, which
-// is the hottest path this operator has. It stays for now: Phase 3 replaces
-// this map with the state backend, which is keyed by bytes and will not need
-// the conversion, and building a byte-keyed structure here to be thrown away
-// then is work spent on the wrong phase.
-type windowKey struct {
-	key         string
-	windowStart int64
-}
+//	key    the record's key bytes, then the window start as a big-endian int64
+//	value  the aggregate as a big-endian int64, eight bytes
+//
+// The window start goes AFTER the record key so that sorted iteration groups
+// one key's windows together: a scan for a key is a scan of a contiguous run,
+// which is what the Pebble backend in Phase 3b wants and what Memory's sorted
+// Iterate already gives. It is fixed-width, so the split back into (key, start)
+// is the last eight bytes and everything before them, with no separator and no
+// ambiguity: two composite keys can only be equal if they are the same length,
+// hence the same key length, hence the same key and the same start.
+//
+// Big-endian for the same reason the generator's keys are: byte order and
+// numeric order agree over non-negative values, so a window start sorts where
+// it compares. They part company below zero, since a negative int64 has its top
+// bit set and sorts above every positive one. That costs nothing here, because
+// the grouping this layout is for is by KEY and the run for one key stays
+// contiguous whatever order its window starts fall in.
+//
+// One caveat, recorded because it is invisible until it bites: the grouping
+// holds only while no record key is a prefix of another. Every key in this
+// engine is the generator's fixed eight bytes, so it holds. A variable-length
+// key would interleave two keys' runs and would need a length prefix.
+//
+// The windowKey struct that used to key an in-memory map is gone with it, and
+// so is the per-record string conversion its Phase 2 comment flagged as this
+// operator's hottest allocation: KeyedState takes bytes, so the composite key
+// is appended into one reused buffer and never converted. One conversion per
+// record remains and it is NOT this one. timerService deduplicates on a struct
+// holding a Go string, so registering a timer still needs a string; that is
+// timers.go's to fix and not this file's.
+const windowStartBytes = 8
 
 // errCountTooShort is returned by DecodeCount for a value that is not an
 // encoded count.
 var errCountTooShort = errors.New("value is shorter than an encoded count")
+
+// errStateKeyTooShort is returned when state holds a key that cannot carry a
+// window start. Only this operator writes to its own state, so it means the
+// layout above and the code below have come apart.
+var errStateKeyTooShort = errors.New("state key is shorter than an encoded window start")
 
 // WindowCount counts the records in each (key, window).
 //
@@ -67,9 +95,16 @@ type WindowCount struct {
 	slide           int64
 	allowedLateness int64
 
-	counts  map[windowKey]int64
+	// state holds one entry per open (key, window); see the layout above. It is
+	// handed over by Open rather than made here, so the runtime decides which
+	// backend the job runs on.
+	state   state.KeyedState
 	timers  *timerService
 	scratch []int64
+	// keyBuf is the composite key under construction, reused across records so
+	// that assignment does not allocate. KeyedState.Put copies what it is
+	// given, which is what makes reusing it safe.
+	keyBuf []byte
 
 	// watermark is the last one delivered. It decides what has been purged and
 	// therefore what is late enough to drop.
@@ -113,7 +148,6 @@ func NewSlidingCount(size, slide, allowedLateness int64) *WindowCount {
 		size:            size,
 		slide:           slide,
 		allowedLateness: allowedLateness,
-		counts:          make(map[windowKey]int64),
 		timers:          newTimerService(),
 		// No watermark has been delivered, so nothing is complete and nothing
 		// has been purged. Starting at zero would claim every window before
@@ -126,7 +160,21 @@ func NewSlidingCount(size, slide, allowedLateness int64) *WindowCount {
 // runtime's initial CurrentWatermark.
 const minWatermark = -1 << 63
 
-func (w *WindowCount) Open(ctx core.Context) error { return nil }
+// Open takes the subtask's keyed state.
+//
+// Taken here rather than made in the constructor because the constructor is a
+// func() core.Operator held by a graph.Vertex and has no Context to ask. A nil
+// state is refused rather than replaced with a private map: an operator quietly
+// running on state the runtime does not know about would checkpoint as empty
+// and restore as empty, and the only symptom would be windows missing after a
+// recovery.
+func (w *WindowCount) Open(ctx core.Context) error {
+	w.state = ctx.State()
+	if w.state == nil {
+		return errors.New("operators: WindowCount: the runtime provided no keyed state")
+	}
+	return nil
+}
 
 // Dropped returns the number of (record, window) assignments discarded because
 // their window had already been purged.
@@ -219,6 +267,9 @@ func (w *WindowCount) windowsFor(dst []int64, eventTime int64) []int64 {
 // is what keeps a dropped record from silently resurrecting a window that has
 // already been reported and forgotten.
 func (w *WindowCount) ProcessElement(rec *core.Record, ctx core.Context) error {
+	// One conversion per record, and it is the timer service's: timerKey holds
+	// a Go string. Reused for the composite state key below, which takes a
+	// string only so that this is the sole conversion rather than a second one.
 	key := string(rec.Key)
 	w.scratch = w.windowsFor(w.scratch, rec.EventTime)
 	for _, start := range w.scratch {
@@ -226,13 +277,59 @@ func (w *WindowCount) ProcessElement(rec *core.Record, ctx core.Context) error {
 			w.dropped++
 			continue
 		}
-		w.counts[windowKey{key: key, windowStart: start}]++
+		w.keyBuf = appendStateKey(w.keyBuf[:0], key, start)
+		count, err := w.currentCount(w.keyBuf, start)
+		if err != nil {
+			return err
+		}
+		var value [8]byte
+		binary.BigEndian.PutUint64(value[:], uint64(count+1))
+		w.state.Put(w.keyBuf, value[:])
 		// Registered on every record, deduplicated by the timer service. A
 		// window that has already fired was deregistered when it did, so this
 		// re-arms it and the updated count goes out on the next watermark.
 		w.timers.Register(addCeil(start, w.size-1), key, start)
 	}
 	return nil
+}
+
+// currentCount reads the aggregate held for one composite key, or zero if the
+// window has no state yet.
+//
+// A stored value that does not decode is reported rather than treated as zero.
+// Only this operator writes to its own state, so a short value means the layout
+// and the code have come apart, and continuing from zero would fold a real
+// count into a fresh one and produce a plausible number.
+func (w *WindowCount) currentCount(stateKey []byte, start int64) (int64, error) {
+	v, ok := w.state.Get(stateKey)
+	if !ok {
+		return 0, nil
+	}
+	count, err := DecodeCount(v)
+	if err != nil {
+		return 0, fmt.Errorf("window starting at %d: %w", start, err)
+	}
+	return count, nil
+}
+
+// appendStateKey appends the composite state key for (key, windowStart) to dst
+// and returns it. See the layout at the top of this file.
+//
+// It takes dst so the caller can reuse one buffer across records: KeyedState
+// copies what Put is given, so nothing retains the slice.
+func appendStateKey(dst []byte, key string, windowStart int64) []byte {
+	dst = append(dst, key...)
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(windowStart))
+	return append(dst, buf[:]...)
+}
+
+// windowStartOf reads the window start back out of a composite state key.
+func windowStartOf(stateKey []byte) (int64, error) {
+	if len(stateKey) < windowStartBytes {
+		return 0, fmt.Errorf("%d bytes: %w", len(stateKey), errStateKeyTooShort)
+	}
+	return int64(binary.BigEndian.Uint64(stateKey[len(stateKey)-windowStartBytes:])), nil
 }
 
 // ProcessWatermark fires every window the watermark completes, then purges the
@@ -256,19 +353,23 @@ func (w *WindowCount) ProcessWatermark(wm int64, ctx core.Context) error {
 	}); err != nil {
 		return err
 	}
-	w.purge()
-	return nil
+	return w.purge()
 }
 
 // fire emits the current aggregate for one window.
 func (w *WindowCount) fire(key string, start int64, ctx core.Context) error {
-	count, ok := w.counts[windowKey{key: key, windowStart: start}]
+	w.keyBuf = appendStateKey(w.keyBuf[:0], key, start)
+	value, ok := w.state.Get(w.keyBuf)
 	if !ok {
 		// Unreachable: purge runs after Advance and only removes windows whose
 		// timers that same Advance has already fired. Reported rather than
 		// emitted as a zero, because a window count of zero is indistinguishable
 		// from a real answer once it reaches the sink.
 		return fmt.Errorf("window [%d, %d) for key %x fired with no state", start, start+w.size, key)
+	}
+	count, err := DecodeCount(value)
+	if err != nil {
+		return fmt.Errorf("window [%d, %d) for key %x: %w", start, start+w.size, key, err)
 	}
 	// End-1, saturating: the largest event time this window can contain, and
 	// exactly the watermark that fired it. See the type comment for why the
@@ -292,16 +393,25 @@ func (w *WindowCount) isPurged(start int64) bool {
 // A scan of the open windows on every watermark. That is O(open windows) rather
 // than O(purged), and it is the obvious implementation: the alternative is a
 // second timer per window, which would collide with the firing timer in a
-// service that deduplicates on (key, windowStart). Phase 3 replaces this map
-// and can revisit it. Deleting during a range over a map is defined behaviour,
-// and the iteration order being random does not matter because nothing here
-// depends on which window is removed first.
-func (w *WindowCount) purge() {
-	for k := range w.counts {
-		if w.isPurged(k.windowStart) {
-			delete(w.counts, k)
+// service that deduplicates on (key, windowStart).
+//
+// KeyedState.Iterate permits the callback to delete the entry it is handed,
+// which is what this does. Nothing here depends on the order the scan runs in;
+// the order is sorted anyway, because Phase 3b's snapshots need it to be.
+func (w *WindowCount) purge() error {
+	var err error
+	w.state.Iterate(func(stateKey, value []byte) bool {
+		start, decodeErr := windowStartOf(stateKey)
+		if decodeErr != nil {
+			err = decodeErr
+			return false
 		}
-	}
+		if w.isPurged(start) {
+			w.state.Delete(stateKey)
+		}
+		return true
+	})
+	return err
 }
 
 // OnEndOfStream does nothing, deliberately.

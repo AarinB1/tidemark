@@ -7,6 +7,7 @@ import (
 
 	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/graph"
+	"github.com/AarinB1/tidemark/pkg/state"
 	"github.com/AarinB1/tidemark/pkg/transport"
 )
 
@@ -179,6 +180,13 @@ type opContext struct {
 	writer    *transport.Writer
 	watermark int64
 	err       error
+	// state is this subtask's keyed state. One per subtask, made here rather
+	// than by the operator, because a subtask is the unit of state and the
+	// runtime is what decides which backend a job runs on: Memory now, Pebble
+	// in Phase 3b. Sources and sinks get one too, and neither uses it; giving
+	// them a different Context to keep it away would be a second Context
+	// implementation to keep in step for no gain.
+	state state.KeyedState
 }
 
 var _ core.Context = (*opContext)(nil)
@@ -187,6 +195,7 @@ func newOpContext(ctx context.Context, w *transport.Writer) *opContext {
 	return &opContext{
 		ctx:    ctx,
 		writer: w,
+		state:  state.NewMemory(),
 		// No watermark has been delivered, so nothing is complete yet. Starting
 		// at zero would claim that every event before 1970 had arrived.
 		watermark: math.MinInt64,
@@ -210,6 +219,9 @@ func (c *opContext) Emit(rec *core.Record) {
 
 // CurrentWatermark returns the last watermark delivered to this subtask.
 func (c *opContext) CurrentWatermark() int64 { return c.watermark }
+
+// State returns this subtask's keyed state.
+func (c *opContext) State() state.KeyedState { return c.state }
 
 // takeErr returns and clears any error stashed by Emit.
 func (c *opContext) takeErr() error {
