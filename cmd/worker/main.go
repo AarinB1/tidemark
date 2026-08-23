@@ -48,6 +48,7 @@ func run(job string, records int64, seed uint64, keys int64) error {
 		EventTimeStep:  1,
 		MaxLag:         500,
 		ValueSize:      16,
+		AmountRange:    1000,
 	}, collect)
 	if err != nil {
 		return err

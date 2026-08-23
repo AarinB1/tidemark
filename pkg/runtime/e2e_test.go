@@ -114,6 +114,7 @@ func e2eConfig(seed uint64, count int64) sources.GeneratorConfig {
 		EventTimeStep:  5,
 		MaxLag:         100,
 		ValueSize:      16,
+		AmountRange:    1000,
 	}
 }
 

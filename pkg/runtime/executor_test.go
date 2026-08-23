@@ -25,6 +25,7 @@ func testGeneratorConfig(count int64) sources.GeneratorConfig {
 		EventTimeStep:  10,
 		MaxLag:         50,
 		ValueSize:      8,
+		AmountRange:    1000,
 	}
 }
 

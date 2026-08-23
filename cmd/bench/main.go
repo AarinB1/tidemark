@@ -151,6 +151,7 @@ func benchGraph(records int64, p int, seed uint64, keys int64) (*graph.Graph, er
 		EventTimeStep:  1,
 		MaxLag:         500,
 		ValueSize:      16,
+		AmountRange:    1000,
 	}
 
 	g := graph.New()
