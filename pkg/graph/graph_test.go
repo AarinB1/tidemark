@@ -391,6 +391,9 @@ func ids(vs []Vertex) []string {
 // settings on an operator or a sink are rejected rather than ignored, because
 // only a source generates watermarks and a job configured for event time at a
 // vertex that cannot honour it would otherwise run to completion looking fine.
+// Each rejection is also checked for naming the FIELD, not just the vertex.
+// Both settings share one sentinel on a non-source, so an error that said only
+// "watermark configuration" would leave the reader looking at two fields.
 func TestValidateWatermarkConfig(t *testing.T) {
 	withWatermarks := func(v Vertex, interval, lag int64) Vertex {
 		v.WatermarkIntervalElements = interval
@@ -402,10 +405,17 @@ func TestValidateWatermarkConfig(t *testing.T) {
 		name     string
 		vertices []Vertex
 		wantErr  error
+		// wantMentions is a substring the message must carry: the vertex ID and
+		// the field that was wrong.
+		wantMentions []string
 	}{
 		{
 			name:     "source configured for event time",
 			vertices: []Vertex{withWatermarks(source("s"), 1000, 50), operator("m"), sink("k")},
+		},
+		{
+			name:     "a lag of zero on a source is not a negative lag",
+			vertices: []Vertex{withWatermarks(source("s"), 1000, 0), operator("m"), sink("k")},
 		},
 		{
 			// The zero value is watermark generation off, which is what a job
@@ -414,35 +424,36 @@ func TestValidateWatermarkConfig(t *testing.T) {
 			vertices: []Vertex{source("s"), operator("m"), sink("k")},
 		},
 		{
-			name:     "a lag of zero on a source is not a negative lag",
-			vertices: []Vertex{withWatermarks(source("s"), 1000, 0), operator("m"), sink("k")},
+			name:         "negative lag on a source",
+			vertices:     []Vertex{withWatermarks(source("s"), 1000, -1), operator("m"), sink("k")},
+			wantErr:      errNegativeOutOfOrderness,
+			wantMentions: []string{`"s"`, "MaxOutOfOrderness"},
 		},
 		{
-			name:     "negative lag on a source",
-			vertices: []Vertex{withWatermarks(source("s"), 1000, -1), operator("m"), sink("k")},
-			wantErr:  errNegativeOutOfOrderness,
+			name:         "interval on an operator",
+			vertices:     []Vertex{source("s"), withWatermarks(operator("m"), 1000, 0), sink("k")},
+			wantErr:      errWatermarkOnNonSource,
+			wantMentions: []string{`"m"`, "WatermarkIntervalElements"},
 		},
 		{
-			name:     "interval on an operator",
-			vertices: []Vertex{source("s"), withWatermarks(operator("m"), 1000, 0), sink("k")},
-			wantErr:  errWatermarkOnNonSource,
+			name:         "lag on an operator",
+			vertices:     []Vertex{source("s"), withWatermarks(operator("m"), 0, 50), sink("k")},
+			wantErr:      errWatermarkOnNonSource,
+			wantMentions: []string{`"m"`, "MaxOutOfOrderness"},
 		},
 		{
-			name:     "lag on an operator",
-			vertices: []Vertex{source("s"), withWatermarks(operator("m"), 0, 50), sink("k")},
-			wantErr:  errWatermarkOnNonSource,
-		},
-		{
-			name:     "interval on a sink",
-			vertices: []Vertex{source("s"), operator("m"), withWatermarks(sink("k"), 1000, 0)},
-			wantErr:  errWatermarkOnNonSource,
+			name:         "interval on a sink",
+			vertices:     []Vertex{source("s"), operator("m"), withWatermarks(sink("k"), 1000, 0)},
+			wantErr:      errWatermarkOnNonSource,
+			wantMentions: []string{`"k"`, "WatermarkIntervalElements"},
 		},
 		{
 			// The negative check runs before the kind check, so the more
 			// specific complaint is the one reported.
-			name:     "negative lag on a sink",
-			vertices: []Vertex{source("s"), operator("m"), withWatermarks(sink("k"), 0, -1)},
-			wantErr:  errNegativeOutOfOrderness,
+			name:         "negative lag on a sink",
+			vertices:     []Vertex{source("s"), operator("m"), withWatermarks(sink("k"), 0, -1)},
+			wantErr:      errNegativeOutOfOrderness,
+			wantMentions: []string{`"k"`, "MaxOutOfOrderness"},
 		},
 	}
 
@@ -450,7 +461,12 @@ func TestValidateWatermarkConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := build(tt.vertices, []edge{{"s", "m"}, {"m", "k"}})
 			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("Validate = %v, want %v", err, tt.wantErr)
+				t.Fatalf("Validate = %v, want %v", err, tt.wantErr)
+			}
+			for _, want := range tt.wantMentions {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Validate = %q, which does not name %s", err, want)
+				}
 			}
 		})
 	}

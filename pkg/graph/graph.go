@@ -281,13 +281,21 @@ func (g *Graph) sortedIDs() []string {
 // Settings on an operator or a sink are rejected rather than ignored. Only a
 // source generates watermarks; every other vertex forwards what its gate gives
 // it. Ignoring the fields would let a job be configured for event time at a
-// vertex that cannot honour it and then run to completion looking fine.
+// vertex that cannot honour it and then run to completion looking fine. The two
+// fields are reported separately so the error names the one that was set: a
+// message that only says "watermark configuration" leaves the reader looking at
+// both.
 func checkWatermarkConfig(v Vertex) error {
 	if v.MaxOutOfOrderness < 0 {
-		return fmt.Errorf("%d: %w", v.MaxOutOfOrderness, errNegativeOutOfOrderness)
+		return fmt.Errorf("MaxOutOfOrderness %d: %w", v.MaxOutOfOrderness, errNegativeOutOfOrderness)
 	}
-	if v.Kind != VertexSource && (v.WatermarkIntervalElements != 0 || v.MaxOutOfOrderness != 0) {
-		return fmt.Errorf("%s: %w", v.Kind, errWatermarkOnNonSource)
+	if v.Kind != VertexSource {
+		if v.WatermarkIntervalElements != 0 {
+			return fmt.Errorf("%s: WatermarkIntervalElements %d: %w", v.Kind, v.WatermarkIntervalElements, errWatermarkOnNonSource)
+		}
+		if v.MaxOutOfOrderness != 0 {
+			return fmt.Errorf("%s: MaxOutOfOrderness %d: %w", v.Kind, v.MaxOutOfOrderness, errWatermarkOnNonSource)
+		}
 	}
 	return nil
 }
