@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/AarinB1/tidemark/pkg/core"
 )
@@ -67,13 +68,24 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 }
 
 // sourceLoop reads the records assigned to one subtask of a source vertex,
-// handing each to emit. It returns when the subtask's range is exhausted, when
-// the source reports it has no more elements, or on the first error from the
-// source, from emit, or from ctx.
+// handing each to emitRecord and each due watermark to emitWatermark. It
+// returns when the subtask's range is exhausted, when the source reports it has
+// no more elements, or on the first error from the source, from either emitter,
+// or from ctx.
+//
+// The record goes out before the watermark derived from it. Either order is
+// safe, since a watermark of maxSeen-lag-1 does not bound the record that
+// produced it, but records-then-watermark is the one that reads as what it is:
+// the watermark summarises everything already sent.
+//
+// wm is taken by value. Each subtask drives its own generator over its own
+// contiguous slice of the offset space, which is what produces the staircase
+// documented on watermarkGenerator; a generator shared between subtasks would
+// be a data race and would also collapse the per-subtask watermarks into one.
 //
 // The source must already be open: Open validates configuration, and a source
 // that failed validation must not be seeked.
-func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, emit func(*core.Record) error) error {
+func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, emitRecord func(*core.Record) error, emitWatermark func(int64) error) error {
 	end, bounded, err := seekToRange(src, parallelism, index)
 	if err != nil {
 		return err
@@ -96,8 +108,13 @@ func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, em
 		if !ok {
 			return nil
 		}
-		if err := emit(rec); err != nil {
+		if err := emitRecord(rec); err != nil {
 			return err
+		}
+		if t, ok := wm.onRecord(rec.EventTime); ok {
+			if err := emitWatermark(t); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -123,4 +140,127 @@ func seekToRange(src core.Source, parallelism, index int) (end int64, bounded bo
 		return 0, false, err
 	}
 	return end, true, nil
+}
+
+// watermarkGenerator decides when a source subtask emits a watermark and what
+// value it carries.
+//
+// Generation lives in the source runner rather than on core.Source. Every
+// source needs a watermark and the policy is uniform across all of them, so a
+// method on the interface would be polymorphism with exactly one behaviour
+// behind it. core.Source is already at the size CLAUDE.md justifies, and an
+// interface method added to support one implementation is the abstraction the
+// scope rules forbid.
+//
+// The interval is counted in ELEMENTS. Not on a ticker, not on a wall clock,
+// and not "at least every so often". A time-based interval makes the position
+// of every watermark within the element stream a function of the Go scheduler,
+// so the same seed replays a different stream and a recovered run cannot be
+// compared against a clean one. Invariant 6 states the general rule; this is
+// its first instance.
+//
+// There is deliberately no final MaxInt64 watermark at end of input. The gate
+// emits that once every one of its inputs has finished. Two mechanisms for one
+// job means neither gets exercised properly by any test, and the one that
+// silently stopped working would take the tail windows with it.
+//
+// # Known consequence: the staircase
+//
+// Source subtasks split the offset space into contiguous ranges, and the
+// generator derives event time as Base + n*Step - lag(n). Subtask 0 therefore
+// covers the earliest event times and subtask P-1 the latest. At parallelism P
+// the downstream gate's minimum is pinned near subtask 0's watermark until
+// subtask 0 exhausts its range, so event time advances in a staircase rather
+// than smoothly, and window state peaks near the size of the whole dataset
+// instead of near one window's worth.
+//
+// This is correct. Final sink contents are unaffected, because the gate's
+// MaxInt64 at end of input flushes whatever is still open. What it means is
+// that checkpoint size in Phase 3 and the state-size target in Phase 6 have to
+// be measured against this topology deliberately rather than reasoned about
+// from window size, and that a strided source split would change the number.
+// Do not "fix" it here by reordering the split: contiguous ranges are what make
+// a source subtask's recovery state a single integer.
+type watermarkGenerator struct {
+	// intervalElements is the number of records between two emissions. Zero or
+	// negative disables generation entirely, which is what a source in a job
+	// that does no event-time work wants.
+	intervalElements int64
+	// maxOutOfOrderness is how far behind the maximum observed event time a
+	// watermark is held, in millis.
+	maxOutOfOrderness int64
+
+	sinceLast    int64
+	maxEventTime int64
+	lastEmitted  int64
+}
+
+// newWatermarkGenerator returns a generator that has observed nothing.
+func newWatermarkGenerator(intervalElements, maxOutOfOrderness int64) watermarkGenerator {
+	return watermarkGenerator{
+		intervalElements:  intervalElements,
+		maxOutOfOrderness: maxOutOfOrderness,
+		// Nothing has been observed and nothing has been emitted. Starting
+		// either at zero would claim that every event before 1970 had arrived.
+		maxEventTime: math.MinInt64,
+		lastEmitted:  math.MinInt64,
+	}
+}
+
+// onRecord observes one element's event time and reports the watermark to emit,
+// if any. The caller emits the record first and the watermark after it, so a
+// watermark never precedes a record it is meant to bound.
+//
+// ok is false far more often than it is true: a watermark is due only every
+// intervalElements records, and even then only when the value it would carry is
+// strictly greater than the last one emitted. Re-emitting an unchanged
+// watermark costs a broadcast to every downstream channel and tells nobody
+// anything.
+func (g *watermarkGenerator) onRecord(eventTime int64) (wm int64, ok bool) {
+	if eventTime > g.maxEventTime {
+		g.maxEventTime = eventTime
+	}
+	if g.intervalElements <= 0 {
+		return 0, false
+	}
+
+	// Counted, and reset, on every interval boundary whether or not a watermark
+	// comes out of it. The interval is a count of records, not a count of
+	// emissions: making it the latter would bunch emissions together after a
+	// stretch of out-of-order data.
+	g.sinceLast++
+	if g.sinceLast < g.intervalElements {
+		return 0, false
+	}
+	g.sinceLast = 0
+
+	// Minus one because a watermark asserts that no element with event time
+	// <= w will arrive, and an element at exactly maxObserved-maxOutOfOrderness
+	// still may.
+	candidate := subFloor(subFloor(g.maxEventTime, g.maxOutOfOrderness), 1)
+	if candidate <= g.lastEmitted {
+		return 0, false
+	}
+	g.lastEmitted = candidate
+	return candidate, true
+}
+
+// subFloor returns a - b, clamped to the int64 range rather than wrapping.
+//
+// A wrap here is the worst class of bug this engine has. Subtracting a lag from
+// a very negative event time wraps to a large POSITIVE watermark, which fires
+// every open window at once and produces a plausible-looking wrong answer with
+// no error anywhere. Clamping holds the value at the minimum instead, which
+// emits nothing at all, because MinInt64 is never strictly greater than the
+// initial last-emitted value.
+func subFloor(a, b int64) int64 {
+	d := a - b
+	switch {
+	case b < 0 && d < a:
+		return math.MaxInt64
+	case b > 0 && d > a:
+		return math.MinInt64
+	default:
+		return d
+	}
 }
