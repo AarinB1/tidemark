@@ -227,37 +227,63 @@ func mergeCounts(a, b map[Key]int64) map[Key]int64 {
 }
 
 // TestEngineMatchesOracleAcrossSeeds is the breadth half of the exit criterion:
-// a hundred seeds, both window types, on the simplest topology.
+// a hundred seeds, both window types, on the smallest topology that can fail
+// invariant 1.
 //
 // Breadth is what catches an off-by-one at a boundary that one seed's data
-// happens not to land on. It is deliberately at parallelism 1 and on a chain,
-// because at a hundred seeds the run has to be cheap, and depth is the other
-// test's job.
+// happens not to land on. It stays at parallelism 1, because at a hundred seeds
+// the run has to be cheap and parallelism is the depth matrix's job.
+//
+// It does NOT stay on a chain. A window operator fed by one source vertex at
+// parallelism 1 has exactly one input, and over one input the minimum and the
+// maximum are the same number, so every seed here would pass against a gate
+// taking the maximum. Two source vertices give the gate two inputs at no extra
+// cost: the record count is split between them, so a hundred seeds runs the
+// same number of records it always did.
+//
+// The two sources must cover DIFFERENT event-time ranges, and that is the whole
+// of what makes this evidence rather than decoration. Identical ranges keep the
+// minimum and the maximum within one lag of each other, so a maximum gate
+// produces the right answer and the test passes under the bug. Five million
+// milliseconds apart, against a span of twenty thousand each, a maximum gate
+// races event time to the later source's range while the earlier source is
+// still sending: the earlier source's windows are purged out from under it, its
+// records are dropped, and both the comparison and the drop count say so.
 func TestEngineMatchesOracleAcrossSeeds(t *testing.T) {
 	const (
 		seeds = 100
-		count = 4000
+		// Per source. Two sources, so the records per run are unchanged from
+		// when this was a chain.
+		count = 2000
 	)
 
 	for _, s := range specs {
 		t.Run(s.name, func(t *testing.T) {
 			for seed := uint64(1); seed <= seeds; seed++ {
-				cfg := equivalenceConfig(seed, count)
+				a := equivalenceConfig(seed, count)
+				b := equivalenceConfig(seed+1000, count)
+				b.BaseEventTime = a.BaseEventTime + 5_000_000
 
 				factory := newWindowFactory(s.spec)
 				collect := sinks.NewCollect()
 				run(t, buildGraph(t, []graph.Vertex{
-					sourceVertex("src", cfg, 1),
+					sourceVertex("srcA", a, 1),
+					sourceVertex("srcB", b, 1),
 					{ID: "win", Kind: graph.VertexOperator, Parallelism: 1, NewOperator: factory.newOperator},
 					{ID: "out", Kind: graph.VertexSink, Parallelism: 1,
 						NewSink: func() core.Sink { return collect }},
-				}, [][2]string{{"src", "win"}, {"win", "out"}}))
+				}, [][2]string{{"srcA", "win"}, {"srcB", "win"}, {"win", "out"}}))
 
-				want, err := Counts(cfg, s.spec)
+				countsA, err := Counts(a, s.spec)
 				if err != nil {
-					t.Fatalf("Counts: %v", err)
+					t.Fatalf("Counts(a): %v", err)
 				}
-				assertSameTriples(t, triplesOf(t, s.spec.Size, collect.Records()), Sorted(want), "seed %d", seed)
+				countsB, err := Counts(b, s.spec)
+				if err != nil {
+					t.Fatalf("Counts(b): %v", err)
+				}
+				assertSameTriples(t, triplesOf(t, s.spec.Size, collect.Records()),
+					Sorted(mergeCounts(countsA, countsB)), "seed %d", seed)
 				if dropped := factory.dropped(); dropped != 0 {
 					t.Fatalf("seed %d: %d records were dropped as late, but the watermark allows for the generator's full lag",
 						seed, dropped)
