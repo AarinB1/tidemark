@@ -166,11 +166,16 @@ func run(t *testing.T, g *graph.Graph) {
 
 // triplesOf decodes fired windows into the comparison form.
 //
-// A record's event time carries the window start and its value the count, so
-// this is a decode rather than a computation. Sorted, because the sink contents
-// are a set: the subtasks of a window vertex finish their windows concurrently
-// and comparing emission order would be a broken test.
-func triplesOf(t *testing.T, recs []*core.Record) []Triple {
+// The window start is DERIVED from the emitted event time, not read off it. A
+// fired window carries its end-1, which is what keeps the operator's output
+// from being late against the watermark that released it, so the start is
+// EventTime+1-size and size is the specification this run was given. Reading
+// the event time as a start would shift every row by size-1 against the oracle.
+//
+// Sorted, because the sink contents are a set: the subtasks of a window vertex
+// finish their windows concurrently and comparing emission order would be a
+// broken test.
+func triplesOf(t *testing.T, size int64, recs []*core.Record) []Triple {
 	t.Helper()
 	out := make([]Triple, 0, len(recs))
 	for _, r := range recs {
@@ -178,7 +183,7 @@ func triplesOf(t *testing.T, recs []*core.Record) []Triple {
 		if err != nil {
 			t.Fatalf("DecodeCount: %v", err)
 		}
-		out = append(out, Triple{Key: string(r.Key), WindowStart: r.EventTime, Count: count})
+		out = append(out, Triple{Key: string(r.Key), WindowStart: r.EventTime + 1 - size, Count: count})
 	}
 	slices.SortFunc(out, CompareTriples)
 	return out
@@ -252,7 +257,7 @@ func TestEngineMatchesOracleAcrossSeeds(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Counts: %v", err)
 				}
-				assertSameTriples(t, triplesOf(t, collect.Records()), Sorted(want), "seed %d", seed)
+				assertSameTriples(t, triplesOf(t, s.spec.Size, collect.Records()), Sorted(want), "seed %d", seed)
 				if dropped := factory.dropped(); dropped != 0 {
 					t.Fatalf("seed %d: %d records were dropped as late, but the watermark allows for the generator's full lag",
 						seed, dropped)
@@ -325,7 +330,7 @@ func checkChain(t *testing.T, seed uint64, spec Spec, p int) {
 	if err != nil {
 		t.Fatalf("Counts: %v", err)
 	}
-	assertSameTriples(t, triplesOf(t, collect.Records()), Sorted(want), "chain at parallelism %d", p)
+	assertSameTriples(t, triplesOf(t, spec.Size, collect.Records()), Sorted(want), "chain at parallelism %d", p)
 	assertNothingDropped(t, factory, "chain at parallelism %d", p)
 }
 
@@ -357,7 +362,7 @@ func checkMultiInput(t *testing.T, seed uint64, spec Spec, p int) {
 	if err != nil {
 		t.Fatalf("Counts(b): %v", err)
 	}
-	assertSameTriples(t, triplesOf(t, collect.Records()), Sorted(mergeCounts(countsA, countsB)),
+	assertSameTriples(t, triplesOf(t, spec.Size, collect.Records()), Sorted(mergeCounts(countsA, countsB)),
 		"multi-input at parallelism %d", p)
 	assertNothingDropped(t, factory, "multi-input at parallelism %d", p)
 }
@@ -403,7 +408,7 @@ func checkFanOut(t *testing.T, seed uint64, spec Spec, p int) {
 		if err != nil {
 			t.Fatalf("Counts(%s): %v", branch.name, err)
 		}
-		assertSameTriples(t, triplesOf(t, branch.seen.seen()), Sorted(want),
+		assertSameTriples(t, triplesOf(t, branch.spec.Size, branch.seen.seen()), Sorted(want),
 			"the %s branch (size %d slide %d) at parallelism %d",
 			branch.name, branch.spec.Size, branch.spec.Slide, p)
 		assertNothingDropped(t, branch.factory, "the %s branch at parallelism %d", branch.name, p)
@@ -599,7 +604,7 @@ func TestWindowsFireOnWatermarksAndNotOnlyAtEndOfInput(t *testing.T) {
 
 			// The answer still has to be right, or the counts below measure
 			// nothing.
-			assertSameTriples(t, triplesOf(t, collect.Records()), want, "the probed topology")
+			assertSameTriples(t, triplesOf(t, spec.Size, collect.Records()), want, "the probed topology")
 
 			before, atEnd := factory.totals()
 			if before == 0 {
@@ -631,14 +636,17 @@ type arrivalProbe struct {
 	arrivals []arrival
 }
 
+// arrival pairs one fired window with the watermark its subtask already held.
+// fireTime is the emitted event time, which for a fired window is its end-1 and
+// therefore exactly the watermark that released it upstream.
 type arrival struct {
-	windowStart int64
-	watermark   int64
+	fireTime  int64
+	watermark int64
 }
 
 func (p *arrivalProbe) ProcessElement(rec *core.Record, ctx core.Context) error {
 	p.mu.Lock()
-	p.arrivals = append(p.arrivals, arrival{windowStart: rec.EventTime, watermark: ctx.CurrentWatermark()})
+	p.arrivals = append(p.arrivals, arrival{fireTime: rec.EventTime, watermark: ctx.CurrentWatermark()})
 	p.mu.Unlock()
 	return p.Operator.ProcessElement(rec, ctx)
 }
@@ -662,11 +670,16 @@ func (p *arrivalProbe) seen() []arrival {
 //
 // A chain of window -> operator is the shortest topology where the difference
 // is visible. The window at [start, end) fires on the first watermark at or
-// above end-1, so under the correct ordering the downstream subtask still holds
-// the previous watermark when the record lands, and that one is below end-1 or
-// the window would have fired earlier. Under the wrong ordering it holds the
-// firing watermark itself, which is at or above end-1. The assertion is that
-// gap, on every record.
+// above end-1, and stamps the emitted record with end-1. Under the correct
+// ordering the downstream subtask still holds the PREVIOUS watermark when that
+// record lands, and that one is strictly below end-1 or the window would have
+// fired earlier. Under the wrong ordering it holds the firing watermark itself,
+// which is at or above end-1. The assertion is that gap, on every record.
+//
+// The comparison is against the emitted event time directly rather than against
+// a window start recomputed from it. Those are the same number now that a fired
+// window carries its end-1, and deriving a start only to add size-1 back would
+// leave the test passing under an output stamped anywhere at all.
 func TestWindowEmissionsReachDownstreamBeforeTheirWatermark(t *testing.T) {
 	const size = 1000
 	cfg := equivalenceConfig(7, 5000)
@@ -698,9 +711,9 @@ func TestWindowEmissionsReachDownstreamBeforeTheirWatermark(t *testing.T) {
 			continue
 		}
 		checked++
-		if fireAt := a.windowStart + size - 1; a.watermark >= fireAt {
-			t.Fatalf("the window at %d reached the downstream operator with the watermark already at %d, but that window fires at %d: the watermark was broadcast ahead of the records it bounds",
-				a.windowStart, a.watermark, fireAt)
+		if a.watermark >= a.fireTime {
+			t.Fatalf("the window [%d, %d) reached the downstream operator with the watermark already at %d, but that window fires at %d: the watermark was broadcast ahead of the records it bounds",
+				a.fireTime+1-size, a.fireTime+1, a.watermark, a.fireTime)
 		}
 	}
 	if checked == 0 {

@@ -38,13 +38,27 @@ var errCountTooShort = errors.New("value is shorter than an encoded count")
 // accumulate path.
 //
 // A fired window is emitted as a record: the key unchanged, EventTime set to
-// the WINDOW START, and Value the count as eight big-endian bytes. Event time
-// carrying the window start rather than the conventional end-1 is what makes
-// the emitted stream a (key, windowStart, count) triple directly, which is what
-// the oracle compares against. It also means the emitted record's event time is
-// behind the watermark that produced it. Nothing downstream in Phase 2 does
-// event-time work on the output, but chaining a second window operator onto
-// this one would need a different choice, and this is where to make it.
+// the window's END-1, and Value the count as eight big-endian bytes.
+//
+// End-1 is REQUIRED, not conventional. A watermark w asserts that no element
+// with event time <= w will arrive. This window fires at w >= end-1, and that
+// watermark passed windowStart on its way there, so a record stamped with
+// windowStart carries an event time an already-forwarded watermark has gone
+// past: every downstream event-time operator would see this operator's entire
+// output as late and drop all of it. End-1 is the largest event time the window
+// can contain and is exactly the watermark that completes it, so the emitted
+// record is the newest thing the window could have held and is never behind the
+// watermark that released it.
+//
+// This is not a Phase 7 concern. Nexmark q5 is a sliding-window count followed
+// by a selection over those counts, which is two event-time stages in one job,
+// and that lands in Phase 6.
+//
+// No information is lost: windowStart is EventTime+1-size and every reader
+// already knows the size it asked for. The one exception is a window whose end
+// is not representable, where end-1 saturates at MaxInt64 and the start cannot
+// be recovered; such a window has no downstream event time left to be late
+// against either.
 //
 // One subtask owns one operator and the runtime calls it from one goroutine. No
 // locking.
@@ -256,10 +270,13 @@ func (w *WindowCount) fire(key string, start int64, ctx core.Context) error {
 		// from a real answer once it reaches the sink.
 		return fmt.Errorf("window [%d, %d) for key %x fired with no state", start, start+w.size, key)
 	}
+	// End-1, saturating: the largest event time this window can contain, and
+	// exactly the watermark that fired it. See the type comment for why the
+	// window start would make the whole output late downstream.
 	ctx.Emit(&core.Record{
 		Key:       []byte(key),
 		Value:     encodeCount(count),
-		EventTime: start,
+		EventTime: addCeil(start, w.size-1),
 	})
 	return nil
 }

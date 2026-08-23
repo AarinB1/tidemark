@@ -60,6 +60,12 @@ func (h *windowHarness) endOfStream() []triple {
 }
 
 // take decodes everything emitted since the last call.
+//
+// The window start is DERIVED, not read: the operator stamps a fired window
+// with its end-1, so the start is EventTime-(size-1) and the harness has to
+// undo the same saturating arithmetic the operator applied. Reading EventTime
+// as a window start would silently shift every expectation in this file by
+// size-1 and every row would still look plausible.
 func (h *windowHarness) take() []triple {
 	h.t.Helper()
 	var out []triple
@@ -68,7 +74,7 @@ func (h *windowHarness) take() []triple {
 		if err != nil {
 			h.t.Fatalf("DecodeCount: %v", err)
 		}
-		out = append(out, triple{key: string(r.Key), windowStart: r.EventTime, count: count})
+		out = append(out, triple{key: string(r.Key), windowStart: subFloor(r.EventTime, h.op.size-1), count: count})
 	}
 	h.seen = len(h.ctx.emitted)
 	return out
@@ -275,11 +281,31 @@ func TestWindowFireTimeClampsInsteadOfWrapping(t *testing.T) {
 	size := int64(math.MaxInt64 - 10)
 	h := newWindowHarness(t, NewTumblingCount(size, 0))
 	h.record("a", size)
-	if got := h.watermark(0); len(got) != 0 {
-		t.Fatalf("watermark 0 fired %v; fire time wrapped below zero", got)
+	if got := len(h.ctx.emitted); got != 0 {
+		t.Fatalf("the record emitted %d rows on arrival", got)
 	}
-	if got := h.watermark(math.MaxInt64); !slices.Equal(got, []triple{{"a", size, 1}}) {
-		t.Fatalf("fired %v, want the window starting at size with count 1", got)
+	if h.watermark(0); len(h.ctx.emitted) != 0 {
+		t.Fatalf("watermark 0 fired a window; fire time wrapped below zero")
+	}
+
+	// Asserted on the record rather than through the harness's triple. This
+	// window's end is not representable, so end-1 saturates at MaxInt64 and the
+	// start cannot be recovered from it. That is the one case where the emitted
+	// event time is lossy, and it is harmless: no event time above MaxInt64 is
+	// left for a downstream stage to be late against.
+	h.watermark(math.MaxInt64)
+	if len(h.ctx.emitted) != 1 {
+		t.Fatalf("the MaxInt64 flush fired %d rows, want 1", len(h.ctx.emitted))
+	}
+	got := h.ctx.emitted[0]
+	if string(got.Key) != "a" {
+		t.Errorf("fired key %q, want \"a\"", got.Key)
+	}
+	if got.EventTime != math.MaxInt64 {
+		t.Errorf("fired event time %d, want MaxInt64: start+size-1 must saturate rather than wrap", got.EventTime)
+	}
+	if count, err := DecodeCount(got.Value); err != nil || count != 1 {
+		t.Errorf("fired count %d (err %v), want 1", count, err)
 	}
 }
 
@@ -679,9 +705,9 @@ func TestWindowSnapshotRefuses(t *testing.T) {
 // the sink and the oracle both read.
 //
 // The key must survive intact: it is what the record partitions on downstream,
-// and an empty one is refused by the writer. Event time carries the window
-// start, which is what makes the emitted stream a (key, windowStart, count)
-// triple with nothing else to decode.
+// and an empty one is refused by the writer. Event time carries the window's
+// end-1; see TestWindowEmitsEndMinusOneSoTheOutputIsNotLateDownstream for why
+// that and not the start.
 func TestWindowEmitsTheKeyUnchanged(t *testing.T) {
 	h := newWindowHarness(t, NewTumblingCount(100, 0))
 	h.record("\x00\x01\xff", 10)
@@ -694,10 +720,72 @@ func TestWindowEmitsTheKeyUnchanged(t *testing.T) {
 	if string(got.Key) != "\x00\x01\xff" {
 		t.Errorf("emitted key %x, want the input key unchanged", got.Key)
 	}
-	if got.EventTime != 0 {
-		t.Errorf("emitted event time %d, want the window start 0", got.EventTime)
+	if got.EventTime != 99 {
+		t.Errorf("emitted event time %d, want 99, the end-1 of window [0, 100)", got.EventTime)
 	}
 	if len(got.Key) == 0 {
 		t.Error("emitted an unkeyed record, which the writer refuses to partition")
+	}
+}
+
+// TestWindowEmitsEndMinusOneSoTheOutputIsNotLateDownstream is the property the
+// emitted event time exists for.
+//
+// A watermark w asserts that no element with event time <= w will arrive, and
+// this operator fires [start, end) at the first w >= end-1. That same watermark
+// passed windowStart long before, so an output stamped with windowStart is
+// already behind the watermark that released it and a second event-time stage
+// would see the whole stream as late and drop it. The assertion is therefore
+// not "the event time equals end-1" on its own but that it is NOT BELOW the
+// firing watermark, which is what windowStart violates and what a chained
+// operator actually depends on. Nexmark q5 is two event-time stages and lands
+// in Phase 6.
+//
+// A sliding row is included because size and slide differ there: under
+// windowStart the gap to the firing watermark is size-1 regardless of the
+// slide, so a fix that used slide-1 would pass a tumbling-only test.
+func TestWindowEmitsEndMinusOneSoTheOutputIsNotLateDownstream(t *testing.T) {
+	tests := []struct {
+		name        string
+		size, slide int64
+		eventTime   int64
+		// fireAt is the watermark that completes the earliest window the record
+		// lands in, and the whole set fires by the last one below.
+		watermarks []int64
+	}{
+		{name: "tumbling", size: 100, slide: 100, eventTime: 10, watermarks: []int64{99}},
+		{name: "tumbling negative", size: 100, slide: 100, eventTime: -1, watermarks: []int64{-1}},
+		{name: "sliding", size: 100, slide: 25, eventTime: 99, watermarks: []int64{99, 124, 149, 174}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newWindowHarness(t, NewSlidingCount(tt.size, tt.slide, 0))
+			h.record("k", tt.eventTime)
+
+			fired := 0
+			for _, wm := range tt.watermarks {
+				before := len(h.ctx.emitted)
+				h.watermark(wm)
+				for _, r := range h.ctx.emitted[before:] {
+					fired++
+					if r.EventTime < wm {
+						t.Errorf("a window fired at watermark %d carrying event time %d, which that watermark has already passed: every downstream event-time operator sees this output as late",
+							wm, r.EventTime)
+					}
+					// And it is exactly end-1, not merely at or above the
+					// watermark: anything larger would claim the window can
+					// hold an element it cannot.
+					start := subFloor(r.EventTime, tt.size-1)
+					if got, want := r.EventTime, addCeil(start, tt.size-1); got != want {
+						t.Errorf("window [%d, %d) emitted event time %d, want its end-1 %d",
+							start, start+tt.size, got, want)
+					}
+				}
+			}
+			if want := int(tt.size / tt.slide); fired != want {
+				t.Fatalf("%d windows fired, want %d; the assertion above saw the wrong number of rows", fired, want)
+			}
+		})
 	}
 }
