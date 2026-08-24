@@ -165,6 +165,37 @@ func assertSameCounts(t *testing.T, got, want map[string]int64, label string) {
 	}
 }
 
+// stateBackend is one KeyedState implementation the checkpointing suites run
+// against.
+//
+// Every property these suites pin is a property of the RUNTIME, so it must hold
+// whichever backend holds the aggregates. The disk backend is the one whose
+// answers matter once state stops fitting in RAM, and it is also the one with
+// different iteration costs, batching and error surfaces -- so a suite that
+// only ever ran on the map would be checking checkpointing against the
+// implementation that cannot fail.
+type stateBackend struct {
+	name string
+	// newState is what Options.NewState is set to. nil is the in-memory
+	// backend, which is also the runtime's default.
+	newState func() (state.KeyedState, error)
+}
+
+func stateBackends() []stateBackend {
+	return []stateBackend{
+		{name: "memory", newState: nil},
+		{name: "pebble", newState: func() (state.KeyedState, error) { return state.NewTempPebble() }},
+	}
+}
+
+// forEachStateBackend runs fn as a subtest against each backend.
+func forEachStateBackend(t *testing.T, fn func(t *testing.T, b stateBackend)) {
+	t.Helper()
+	for _, b := range stateBackends() {
+		t.Run(b.name, func(t *testing.T) { fn(t, b) })
+	}
+}
+
 // restoreConfig is a generator whose keys spread across subtasks and whose
 // event times are dense enough that watermarks advance during a run.
 func restoreConfig(seed uint64, count int64) sources.GeneratorConfig {
@@ -226,6 +257,10 @@ func countingGraph(t *testing.T, sink core.Sink, p int, sourceVertices ...graph.
 // too high, but a source that restarted one element early would not, and that
 // is the interesting failure.
 func TestRestoreResumesFromTheRecordedOffsets(t *testing.T) {
+	forEachStateBackend(t, testRestoreResumesFromTheRecordedOffsets)
+}
+
+func testRestoreResumesFromTheRecordedOffsets(t *testing.T, backend stateBackend) {
 	// The interval does NOT divide the per-subtask range. That is deliberate: at
 	// an exact multiple the last barrier lands on the final element of the
 	// range, so restoring from it resumes at the end and replays nothing, and
@@ -244,7 +279,7 @@ func TestRestoreResumesFromTheRecordedOffsets(t *testing.T) {
 	clean := sinks.NewCollect()
 	if err := RunWithOptions(context.Background(),
 		countingGraph(t, clean, parallelism, countingSourceVertex("src", cfg, parallelism, barrierInterval, nil)),
-		Options{CheckpointRoot: root, Seed: cfg.Seed}); err != nil {
+		Options{CheckpointRoot: root, Seed: cfg.Seed, NewState: backend.newState}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -285,7 +320,7 @@ func TestRestoreResumesFromTheRecordedOffsets(t *testing.T) {
 	}
 	if err := RunWithOptions(context.Background(),
 		countingGraph(t, restored, parallelism, countingSourceVertex("src", cfg, parallelism, barrierInterval, wrap)),
-		Options{RestoreFrom: root, Seed: cfg.Seed}); err != nil {
+		Options{RestoreFrom: root, Seed: cfg.Seed, NewState: backend.newState}); err != nil {
 		t.Fatalf("restored Run: %v", err)
 	}
 
@@ -445,6 +480,10 @@ func TestRestoreFromARootWithNothingCompleteIsAnError(t *testing.T) {
 // about two different cuts under one name -- and a checkpoint root written by
 // both runs would hold two chk-1 directories describing different states.
 func TestRestoredRunContinuesCheckpointNumbering(t *testing.T) {
+	forEachStateBackend(t, testRestoredRunContinuesCheckpointNumbering)
+}
+
+func testRestoredRunContinuesCheckpointNumbering(t *testing.T, backend stateBackend) {
 	const (
 		count           = 2000
 		barrierInterval = 250
@@ -462,7 +501,7 @@ func TestRestoredRunContinuesCheckpointNumbering(t *testing.T) {
 	}
 
 	if err := RunWithOptions(context.Background(), build(sinks.NewCollect()),
-		Options{CheckpointRoot: root, Seed: cfg.Seed}); err != nil {
+		Options{CheckpointRoot: root, Seed: cfg.Seed, NewState: backend.newState}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -484,7 +523,7 @@ func TestRestoredRunContinuesCheckpointNumbering(t *testing.T) {
 	second := t.TempDir()
 	restored := sinks.NewCollect()
 	if err := RunWithOptions(context.Background(), build(restored),
-		Options{CheckpointRoot: second, RestoreFrom: root, Seed: cfg.Seed}); err != nil {
+		Options{CheckpointRoot: second, RestoreFrom: root, Seed: cfg.Seed, NewState: backend.newState}); err != nil {
 		t.Fatalf("restored Run: %v", err)
 	}
 

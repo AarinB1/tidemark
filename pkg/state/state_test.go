@@ -29,11 +29,67 @@ func keysOf(ps []pair) []string {
 	return out
 }
 
+// backend is one KeyedState implementation under test.
+//
+// Every property below runs against BOTH. The interface exists because there
+// are two implementations, so a suite that only exercised the map would be
+// testing the thing that cannot fail; and the disk backend is the one whose
+// answers a job's correctness depends on once state stops fitting in RAM.
+type backend struct {
+	name string
+	// make returns an empty state, registering whatever cleanup it needs.
+	make func(t *testing.T) KeyedState
+}
+
+func backends() []backend {
+	return []backend{
+		{name: "memory", make: func(t *testing.T) KeyedState { return NewMemory() }},
+		{name: "pebble", make: func(t *testing.T) KeyedState {
+			t.Helper()
+			p, err := OpenPebble(t.TempDir())
+			if err != nil {
+				t.Fatalf("OpenPebble: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := p.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			})
+			return p
+		}},
+	}
+}
+
+// forEachBackend runs fn as a subtest against each implementation.
+func forEachBackend(t *testing.T, fn func(t *testing.T, s KeyedState)) {
+	t.Helper()
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s := b.make(t)
+			fn(t, s)
+			if err := s.Err(); err != nil {
+				t.Errorf("the backend recorded an error during the test: %v", err)
+			}
+		})
+	}
+}
+
+// count returns how many entries s holds. It stands in for Memory.Len, which is
+// not on the interface: a disk backend has no cheap answer, and adding one for
+// tests would put a method on KeyedState that the data path never calls.
+func count(s KeyedState) int {
+	n := 0
+	s.Iterate(func(k, v []byte) bool { n++; return true })
+	return n
+}
+
 // TestMemoryGetPutDelete covers the three single-key operations against an
 // empty state, an occupied one, and a replaced one.
-func TestMemoryGetPutDelete(t *testing.T) {
-	m := NewMemory()
+func TestGetPutDelete(t *testing.T) {
+	forEachBackend(t, testGetPutDelete)
+}
 
+func testGetPutDelete(t *testing.T, m KeyedState) {
 	if v, ok := m.Get([]byte("absent")); ok || v != nil {
 		t.Errorf("Get on empty state = (%q, %t), want (nil, false)", v, ok)
 	}
@@ -51,16 +107,16 @@ func TestMemoryGetPutDelete(t *testing.T) {
 	if v, ok := m.Get([]byte("k")); !ok || string(v) != "two" {
 		t.Errorf("Get after a replacing Put = (%q, %t), want (\"two\", true)", v, ok)
 	}
-	if got := m.Len(); got != 1 {
-		t.Errorf("Len after replacing one key = %d, want 1", got)
+	if got := count(m); got != 1 {
+		t.Errorf("%d entries after replacing one key, want 1", got)
 	}
 
 	m.Delete([]byte("k"))
 	if _, ok := m.Get([]byte("k")); ok {
 		t.Error("Get returned a deleted key")
 	}
-	if got := m.Len(); got != 0 {
-		t.Errorf("Len after deleting the only key = %d, want 0", got)
+	if got := count(m); got != 0 {
+		t.Errorf("%d entries after deleting the only key, want 0", got)
 	}
 
 	// An empty key and an empty value are keys and values like any other. The
@@ -79,8 +135,11 @@ func TestMemoryGetPutDelete(t *testing.T) {
 // the whole of state would read back as whatever the last record wrote. Nothing
 // errors when that happens: the counts are simply all the same, which looks
 // like an aggregation bug rather than an aliasing one.
-func TestMemoryCopiesKeyAndValue(t *testing.T) {
-	m := NewMemory()
+func TestCopiesKeyAndValue(t *testing.T) {
+	forEachBackend(t, testCopiesKeyAndValue)
+}
+
+func testCopiesKeyAndValue(t *testing.T, m KeyedState) {
 	scratch := []byte("key-a")
 	value := []byte("value-a")
 
@@ -98,8 +157,8 @@ func TestMemoryCopiesKeyAndValue(t *testing.T) {
 	if v, ok := m.Get([]byte("key-b")); !ok || string(v) != "value-b" {
 		t.Errorf("key-b = (%q, %t), want (\"value-b\", true)", v, ok)
 	}
-	if got := m.Len(); got != 2 {
-		t.Fatalf("Len = %d, want 2: one buffer reused twice produced one entry", got)
+	if got := count(m); got != 2 {
+		t.Fatalf("%d entries, want 2: one buffer reused twice produced one entry", got)
 	}
 }
 
@@ -118,7 +177,13 @@ func TestMemoryCopiesKeyAndValue(t *testing.T) {
 //
 // Byte order, not text order: the keys below include bytes above 0x7f and an
 // empty key, which a collation-aware comparison would place differently.
-func TestMemoryIterateIsSortedByByteOrder(t *testing.T) {
+func TestIterateIsSortedByByteOrder(t *testing.T) {
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) { testIterateIsSortedByByteOrder(t, b) })
+	}
+}
+
+func testIterateIsSortedByByteOrder(t *testing.T, b backend) {
 	keys := []string{
 		"", "\x00", "\x00\x00", "\x01", "A", "AA", "Ab", "a", "ab", "b",
 		"\x7f", "\x80", "\xff", "\xff\x00", "\xff\xff",
@@ -147,7 +212,7 @@ func TestMemoryIterateIsSortedByByteOrder(t *testing.T) {
 
 	for name, order := range orders {
 		t.Run(name, func(t *testing.T) {
-			m := NewMemory()
+			m := b.make(t)
 			for i, k := range order {
 				m.Put([]byte(k), []byte(fmt.Sprintf("v%d", i)))
 			}
@@ -169,7 +234,7 @@ func TestMemoryIterateIsSortedByByteOrder(t *testing.T) {
 	// Every insertion order produced the same sequence. Stated once more as a
 	// direct comparison between two states filled differently, since that is
 	// the claim Phase 3b makes about two snapshots.
-	forward, backward := NewMemory(), NewMemory()
+	forward, backward := b.make(t), b.make(t)
 	for _, k := range want {
 		forward.Put([]byte(k), []byte("v"))
 	}
@@ -184,8 +249,11 @@ func TestMemoryIterateIsSortedByByteOrder(t *testing.T) {
 // TestMemoryIterateRepeatsItsOrder pins that the order does not vary between
 // two iterations of the SAME state, which is the form the randomised map order
 // would show up in first.
-func TestMemoryIterateRepeatsItsOrder(t *testing.T) {
-	m := NewMemory()
+func TestIterateRepeatsItsOrder(t *testing.T) {
+	forEachBackend(t, testIterateRepeatsItsOrder)
+}
+
+func testIterateRepeatsItsOrder(t *testing.T, m KeyedState) {
 	for i := range 64 {
 		m.Put([]byte{byte(i * 3), byte(i)}, []byte{byte(i)})
 	}
@@ -201,8 +269,11 @@ func TestMemoryIterateRepeatsItsOrder(t *testing.T) {
 }
 
 // TestMemoryIterateStopsWhenFnReturnsFalse covers the early exit.
-func TestMemoryIterateStopsWhenFnReturnsFalse(t *testing.T) {
-	m := NewMemory()
+func TestIterateStopsWhenFnReturnsFalse(t *testing.T) {
+	forEachBackend(t, testIterateStopsWhenFnReturnsFalse)
+}
+
+func testIterateStopsWhenFnReturnsFalse(t *testing.T, m KeyedState) {
 	for _, k := range []string{"a", "b", "c", "d"} {
 		m.Put([]byte(k), []byte(k))
 	}
@@ -217,47 +288,70 @@ func TestMemoryIterateStopsWhenFnReturnsFalse(t *testing.T) {
 	}
 }
 
-// TestMemoryIterateToleratesDeletionByTheCallback is what the window operator's
+// TestIterateToleratesDeletionOfTheEntryItIsGiven is what the window operator's
 // purge does: one scan of the open windows that removes the ones the watermark
 // has moved past.
 //
-// A key removed by an earlier call must be skipped rather than handed back with
-// a stale value, and the scan must reach every key that is still there.
-func TestMemoryIterateToleratesDeletionByTheCallback(t *testing.T) {
-	m := NewMemory()
+// It deletes ONLY the entry the callback is handed, which is the whole of what
+// KeyedState.Iterate promises and the whole of what the operator does. An
+// earlier version of this test also deleted the NEXT key and asserted it was
+// skipped; that passes against Memory, which looks each key up again as it
+// reaches it, and fails against Pebble, whose iterator reads a view fixed when
+// the scan began. Neither backend is wrong. The contract was narrowed to what
+// both can honour rather than the iterator being made to emulate the map, which
+// would cost a Get per entry on the scan that runs on every watermark.
+func TestIterateToleratesDeletionOfTheEntryItIsGiven(t *testing.T) {
+	forEachBackend(t, testIterateToleratesDeletionOfTheEntryItIsGiven)
+}
+
+func testIterateToleratesDeletionOfTheEntryItIsGiven(t *testing.T, m KeyedState) {
 	for i := range 32 {
 		m.Put([]byte{byte(i)}, []byte{byte(i)})
 	}
 
-	// Delete the entry being visited, and the one after it.
 	var visited []byte
 	m.Iterate(func(k, v []byte) bool {
 		visited = append(visited, k[0])
+		// Every even key is removed as it is reached, which is the purge's
+		// shape: a scan that deletes what it has just decided is finished.
 		if k[0]%2 == 0 {
 			m.Delete(k)
-			m.Delete([]byte{k[0] + 1})
 		}
 		return true
 	})
 
-	// Only the evens are visited: each one removes the odd that would follow.
+	// Every key is still visited: the deletions are of entries the scan has
+	// already passed.
 	var wantVisited []byte
-	for i := 0; i < 32; i += 2 {
+	for i := range 32 {
 		wantVisited = append(wantVisited, byte(i))
 	}
 	if !bytes.Equal(visited, wantVisited) {
-		t.Errorf("Iterate visited %v, want %v: a key deleted during the scan was still handed back", visited, wantVisited)
+		t.Errorf("Iterate visited %v, want %v", visited, wantVisited)
 	}
-	if got := m.Len(); got != 0 {
-		t.Errorf("Len = %d after deleting every entry during one scan, want 0", got)
+
+	// And they are gone afterwards, which is what makes the purge free state
+	// rather than only forget about it.
+	if got, want := count(m), 16; got != want {
+		t.Errorf("%d entries after a scan that deleted every even key, want %d", got, want)
+	}
+	for i := range 32 {
+		_, ok := m.Get([]byte{byte(i)})
+		if wantOK := i%2 == 1; ok != wantOK {
+			t.Errorf("after the scan, key %d present = %t, want %t", i, ok, wantOK)
+		}
 	}
 }
 
 // TestMemoryIterateOverEmptyStateDoesNothing covers the case the window
 // operator hits on every watermark before the first record.
-func TestMemoryIterateOverEmptyStateDoesNothing(t *testing.T) {
+func TestIterateOverEmptyStateDoesNothing(t *testing.T) {
+	forEachBackend(t, testIterateOverEmptyStateDoesNothing)
+}
+
+func testIterateOverEmptyStateDoesNothing(t *testing.T, m KeyedState) {
 	calls := 0
-	NewMemory().Iterate(func(k, v []byte) bool {
+	m.Iterate(func(k, v []byte) bool {
 		calls++
 		return true
 	})
@@ -301,7 +395,10 @@ func TestReservedPrefixesAreTheDocumentedBytes(t *testing.T) {
 // timer key on every byte except the discriminator: with the byte on the front
 // the partitions still separate, and with it anywhere else they interleave.
 func TestPrefixOrdersPartitionsIntoContiguousRuns(t *testing.T) {
-	m := NewMemory()
+	forEachBackend(t, testPrefixOrdersPartitionsIntoContiguousRuns)
+}
+
+func testPrefixOrdersPartitionsIntoContiguousRuns(t *testing.T, m KeyedState) {
 	m.Put([]byte{PrefixTimer, 0x00}, []byte("t0"))
 	m.Put([]byte{PrefixUserState, 0xff}, []byte("u1"))
 	m.Put([]byte{PrefixTimer, 0xff}, []byte("t1"))

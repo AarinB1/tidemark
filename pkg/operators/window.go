@@ -419,8 +419,9 @@ func (w *WindowCount) isPurged(start int64) bool {
 // second timer per window, which would collide with the firing timer in a
 // service that deduplicates on (key, windowStart).
 //
-// KeyedState.Iterate permits the callback to delete the entry it is handed,
-// which is what this does. Nothing here depends on the order the scan runs in;
+// KeyedState.Iterate permits the callback to delete the entry it is handed, and
+// only that entry, which is what this does. Deleting a different one is
+// undefined across backends; see the note on the interface. Nothing here depends on the order the scan runs in;
 // the order is sorted anyway, because Phase 3b's snapshots need it to be.
 func (w *WindowCount) purge() error {
 	var err error

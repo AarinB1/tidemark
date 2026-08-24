@@ -48,6 +48,16 @@ type subtaskConfig struct {
 	// stand for "not restoring".
 	restore  []byte
 	restored bool
+	// newState makes the keyed state for an operator subtask. nil means the
+	// in-memory backend.
+	//
+	// Only OPERATOR subtasks take their state from here. Sources and sinks get
+	// a Memory they never touch: a source's recovery state is its offset and a
+	// sink stages nothing until Phase 5, so opening a database per source
+	// subtask would be a file handle and a directory bought for nothing. If
+	// either ever grows real state, this is the line that has to change with
+	// it.
+	newState func() (state.KeyedState, error)
 	// restoredCheckpoint is the ID of the checkpoint being resumed from, and
 	// zero when the job is starting fresh.
 	//
@@ -59,6 +69,25 @@ type subtaskConfig struct {
 	// coordinator counting acknowledgements would be told about two different
 	// cuts under one name.
 	restoredCheckpoint int64
+}
+
+// makeState returns the keyed state for one operator subtask.
+func (c subtaskConfig) makeState() (state.KeyedState, error) {
+	if c.newState == nil {
+		return state.NewMemory(), nil
+	}
+	return c.newState()
+}
+
+// closableState is a state backend holding resources the runtime must release.
+//
+// An optional interface, asserted for, rather than a Close on KeyedState: a map
+// has nothing to close, and putting the method on the interface would make
+// every fake in every test implement a no-op to satisfy it. This is the same
+// shape as splittableSource, which the source runner asserts for the same
+// reason.
+type closableState interface {
+	Close() error
 }
 
 // checkpointer is a subtask's half of the checkpoint protocol.
@@ -217,8 +246,20 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 }
 
 func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, cfg subtaskConfig) (err error) {
+	st, err := cfg.makeState()
+	if err != nil {
+		return fmt.Errorf("operator %s: state: %w", id, err)
+	}
+	if closable, ok := st.(closableState); ok {
+		defer func() {
+			if cerr := closable.Close(); cerr != nil && err == nil {
+				err = fmt.Errorf("operator %s: state: close: %w", id, cerr)
+			}
+		}()
+	}
+
 	op := v.NewOperator()
-	oc := newOpContext(ctx, w)
+	oc := newOpContextWithState(ctx, w, st)
 	if err := op.Open(oc); err != nil {
 		return fmt.Errorf("operator %s: open: %w", id, err)
 	}
@@ -422,10 +463,16 @@ type opContext struct {
 var _ core.Context = (*opContext)(nil)
 
 func newOpContext(ctx context.Context, w *transport.Writer) *opContext {
+	return newOpContextWithState(ctx, w, state.NewMemory())
+}
+
+// newOpContextWithState is newOpContext over a chosen backend. Operator
+// subtasks use it; sources and sinks take the memory one above.
+func newOpContextWithState(ctx context.Context, w *transport.Writer, st state.KeyedState) *opContext {
 	return &opContext{
 		ctx:    ctx,
 		writer: w,
-		state:  state.NewMemory(),
+		state:  st,
 		// No watermark has been delivered, so nothing is complete yet. Starting
 		// at zero would claim that every event before 1970 had arrived.
 		watermark: math.MinInt64,

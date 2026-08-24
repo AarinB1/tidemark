@@ -51,7 +51,16 @@ type KeyedState interface {
 	// run to run looks like a checkpointing bug in whichever component reads it
 	// next.
 	//
-	// fn may Delete the entry it is given, or any other. It must not Put.
+	// fn may Delete the entry it is GIVEN, and must not Put.
+	//
+	// Deleting any OTHER entry during a scan is undefined: whether the scan
+	// still visits it depends on the backend, and the two here disagree.
+	// Memory looks each key up again as it reaches it, so an entry deleted by
+	// an earlier call is skipped; Pebble's iterator reads a view fixed when the
+	// scan began and hands it back. The interface promises what both can do,
+	// because a contract only one backend honours is a trap for whoever writes
+	// the next operator against it -- and the only caller in this engine, the
+	// window operator's purge, deletes exactly the entry it is handed.
 	Iterate(fn func(key, value []byte) bool)
 	// Err returns the FIRST error the implementation encountered, or nil.
 	//

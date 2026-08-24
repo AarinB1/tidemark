@@ -75,6 +75,8 @@ type recoveryCase struct {
 	failAfterB int64
 	// parallelism of every vertex.
 	parallelism int
+	// backend is the keyed-state implementation the operator subtasks run on.
+	backend stateBackend
 }
 
 // crash runs the case up to its injected fault and returns the checkpoint root
@@ -106,7 +108,8 @@ func crash(t *testing.T, c recoveryCase) (root string, collect *sinks.Collect, b
 		return countingGraph(t, collect, c.parallelism, srcA, srcB)
 	}
 
-	err := RunWithOptions(context.Background(), build(true), Options{CheckpointRoot: root, Seed: c.a.Seed})
+	err := RunWithOptions(context.Background(), build(true),
+		Options{CheckpointRoot: root, Seed: c.a.Seed, NewState: c.backend.newState})
 	if !errors.Is(err, errInjectedFailure) {
 		t.Fatalf("the crashed run returned %v, want the injected failure: the fault did not land", err)
 	}
@@ -153,7 +156,8 @@ func crashAndRestore(t *testing.T, c recoveryCase) *sinks.Collect {
 	}
 	t.Logf("crashed after %d elements of srcB per subtask; resuming from checkpoint %d", c.failAfterB, id)
 
-	if err := RunWithOptions(context.Background(), build(false), Options{RestoreFrom: root, Seed: c.a.Seed}); err != nil {
+	if err := RunWithOptions(context.Background(), build(false),
+		Options{RestoreFrom: root, Seed: c.a.Seed, NewState: c.backend.newState}); err != nil {
 		t.Fatalf("the resumed run returned %v", err)
 	}
 	return collect
@@ -177,6 +181,10 @@ func crashAndRestore(t *testing.T, c recoveryCase) *sinks.Collect {
 // window between one input's barrier and another's. That window is what
 // alignment exists for, and hitting it is the next test's job.
 func TestRecoveryAcrossAMultiInputTopology(t *testing.T) {
+	forEachStateBackend(t, testRecoveryAcrossAMultiInputTopology)
+}
+
+func testRecoveryAcrossAMultiInputTopology(t *testing.T, backend stateBackend) {
 	const count = 40000
 	a := restoreConfig(11, count)
 	b := restoreConfig(12, count)
@@ -189,6 +197,7 @@ func TestRecoveryAcrossAMultiInputTopology(t *testing.T) {
 		// of margin behind the first for the pipeline to drain.
 		failAfterB:  12000,
 		parallelism: 2,
+		backend:     backend,
 	})
 
 	assertSameCounts(t, countsOf(t, collect.Records()), oracleCounts(t, a, b), "recovered run")
@@ -226,6 +235,10 @@ func TestRecoveryAcrossAMultiInputTopology(t *testing.T) {
 // state that already counted it, and every key source A touched comes out too
 // high.
 func TestRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers(t *testing.T) {
+	forEachStateBackend(t, testRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers)
+}
+
+func testRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers(t *testing.T, backend stateBackend) {
 	a := restoreConfig(21, 400)
 	b := restoreConfig(22, 40000)
 
@@ -234,6 +247,7 @@ func TestRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers(t *testing.T) {
 		barrierA: 50, barrierB: 5000,
 		failAfterB:  15000,
 		parallelism: 2,
+		backend:     backend,
 	})
 
 	assertSameCounts(t, countsOf(t, collect.Records()), oracleCounts(t, a, b), "recovered run")
@@ -252,6 +266,10 @@ func TestRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers(t *testing.T) {
 // It is fully deterministic. Nothing waits on a drain, because the barrier that
 // would start a checkpoint is never emitted.
 func TestCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom(t *testing.T) {
+	forEachStateBackend(t, testCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom)
+}
+
+func testCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom(t *testing.T, backend stateBackend) {
 	a := restoreConfig(31, 40000)
 	b := restoreConfig(32, 40000)
 
@@ -260,12 +278,14 @@ func TestCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom(t *testing.T) 
 		barrierA: 5000, barrierB: 5000,
 		failAfterB:  1000,
 		parallelism: 2,
+		backend:     backend,
 	})
 
 	if _, ok, err := checkpoint.NewStorage(root).Latest(); err != nil || ok {
 		t.Fatalf("Latest = (ok %t, err %v), want no complete checkpoint", ok, err)
 	}
-	err := RunWithOptions(context.Background(), build(false), Options{RestoreFrom: root, Seed: a.Seed})
+	err := RunWithOptions(context.Background(), build(false),
+		Options{RestoreFrom: root, Seed: a.Seed, NewState: backend.newState})
 	if !errors.Is(err, errNoRestorePoint) {
 		t.Errorf("resuming from a root with nothing complete = %v, want %v", err, errNoRestorePoint)
 	}
@@ -283,6 +303,10 @@ func TestCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom(t *testing.T) 
 // barrier before it, which is the pipeline depth several times over; see the
 // note on crashAndRestore.
 func TestRecoveryIsIndependentOfWhereTheFaultLands(t *testing.T) {
+	forEachStateBackend(t, testRecoveryIsIndependentOfWhereTheFaultLands)
+}
+
+func testRecoveryIsIndependentOfWhereTheFaultLands(t *testing.T, backend stateBackend) {
 	a := restoreConfig(41, 400)
 	b := restoreConfig(42, 40000)
 
@@ -295,6 +319,7 @@ func TestRecoveryIsIndependentOfWhereTheFaultLands(t *testing.T) {
 				barrierA: 50, barrierB: 5000,
 				failAfterB:  failAfter,
 				parallelism: 2,
+				backend:     backend,
 			})
 			assertSameCounts(t, countsOf(t, collect.Records()), oracleCounts(t, a, b), "recovered run")
 		})

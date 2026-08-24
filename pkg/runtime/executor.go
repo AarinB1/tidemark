@@ -11,6 +11,7 @@ import (
 
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
 	"github.com/AarinB1/tidemark/pkg/graph"
+	"github.com/AarinB1/tidemark/pkg/state"
 	"github.com/AarinB1/tidemark/pkg/transport"
 )
 
@@ -41,6 +42,16 @@ type Options struct {
 	// Seed is recorded in the checkpoint metadata. It is not validated on
 	// restore; see checkpoint.Metadata for why the graph cannot report one.
 	Seed uint64
+	// NewState makes the keyed state for one operator subtask. nil is the
+	// in-memory backend, which is the default because it is the one a job that
+	// fits in RAM should use and the one every test that is not about the
+	// backend should run on.
+	//
+	// It is called once per operator subtask, so a backend that owns files
+	// gives each subtask its own: a subtask is the unit of state, and two
+	// sharing one store would put two key spaces in one file with nothing
+	// between them. The runtime closes what it makes, if it has a Close.
+	NewState func() (state.KeyedState, error)
 }
 
 // Run executes g to completion with no checkpointing and no restore.
@@ -118,7 +129,11 @@ func RunWithOptions(ctx context.Context, g *graph.Graph, opts Options) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				cfg := subtaskConfig{coordinator: coordinator, restoredCheckpoint: restoredID}
+				cfg := subtaskConfig{
+					coordinator:        coordinator,
+					newState:           opts.NewState,
+					restoredCheckpoint: restoredID,
+				}
 				if payload, ok := restored[id.checkpointKey()]; ok {
 					cfg.restore, cfg.restored = payload, true
 				}
