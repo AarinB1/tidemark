@@ -53,6 +53,26 @@ type KeyedState interface {
 	//
 	// fn may Delete the entry it is given, or any other. It must not Put.
 	Iterate(fn func(key, value []byte) bool)
+	// Err returns the FIRST error the implementation encountered, or nil.
+	//
+	// Get, Put, Delete and Iterate cannot fail, which is honest for a map and
+	// a lie for a disk backend: the Pebble implementation later in this phase
+	// can fail on a read. Widening those four signatures would put an error
+	// return on every call site in every operator for a case that is rare and
+	// terminal, and an operator that has to check an error per record will
+	// eventually drop one.
+	//
+	// So a failing implementation stashes its first error and keeps going,
+	// returning zero values, and the RUNTIME collects the stash after each
+	// operator call and fails the subtask. That is the same shape opContext
+	// already uses for a failed Emit, which is why it is this shape and not a
+	// new one.
+	//
+	// FIRST rather than last, and sticky rather than cleared: once a backend
+	// has failed, every value it hands back afterwards is suspect, and the
+	// error worth reporting is the one that explains why. A later error is a
+	// consequence.
+	Err() error
 }
 
 // Memory is the in-process KeyedState: a map, plus a sort on iteration.
@@ -128,6 +148,12 @@ func (m *Memory) Iterate(fn func(key, value []byte) bool) {
 		}
 	}
 }
+
+// Err returns nil, always. A map cannot fail: there is no read to go wrong and
+// no allocation this type recovers from. Memory exists partly so that a test
+// separates a bug in an operator from a bug in a backend, and a Memory that
+// could fail would blur that.
+func (m *Memory) Err() error { return nil }
 
 // Len returns the number of entries held. It is for tests and for the state
 // size Phase 6 is measured on; nothing on the data path calls it.

@@ -99,6 +99,13 @@ func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate 
 		}
 	}()
 
+	return runOperatorLoop(ctx, op, oc, id, gate, w)
+}
+
+// runOperatorLoop is the element loop of an operator subtask, split from the
+// open and close around it so that a test can drive it with a context whose
+// state backend is one that fails on demand. Nothing else calls it.
+func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id subtaskID, gate *Gate, w *transport.Writer) error {
 	for {
 		e, ok := gate.Recv()
 		if !ok {
@@ -247,9 +254,29 @@ func (c *opContext) CurrentWatermark() int64 { return c.watermark }
 // State returns this subtask's keyed state.
 func (c *opContext) State() state.KeyedState { return c.state }
 
-// takeErr returns and clears any error stashed by Emit.
+// takeErr returns the first error stashed since the last call: one from a
+// failed Emit, or one the state backend recorded.
+//
+// The two are collected together because they are the same kind of thing. Emit
+// has no error return and KeyedState's four operations have none either, so
+// both stash and both need somebody to look. The runtime looks after every call
+// it makes into the operator, which is the granularity at which a failure is
+// still attributable to a record.
+//
+// The Emit stash is CLEARED and the state's is not. Emit's is per call by
+// construction: a send that failed because a downstream channel was momentarily
+// gone is the operator call's error and nothing later. A state error is sticky
+// on the backend, because every value read after a backend fails is suspect;
+// the subtask returns on the first one it sees, so it is read once either way.
+//
+// Emit's error wins when both are set. It is the one with a cause the reader
+// can act on; a state error surfacing in the same call is more likely a
+// consequence of the same cancellation.
 func (c *opContext) takeErr() error {
 	err := c.err
 	c.err = nil
-	return err
+	if err != nil {
+		return err
+	}
+	return c.state.Err()
 }
