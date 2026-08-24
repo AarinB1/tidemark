@@ -42,6 +42,23 @@ type subtaskConfig struct {
 	// anybody is recording snapshots -- and every subtask simply has nothing to
 	// acknowledge.
 	coordinator *checkpoint.Coordinator
+	// restore is the payload this subtask snapshotted at the checkpoint being
+	// resumed from, and restored says whether there is one. They are separate
+	// because a sink's payload is legitimately empty, so a nil slice cannot
+	// stand for "not restoring".
+	restore  []byte
+	restored bool
+	// restoredCheckpoint is the ID of the checkpoint being resumed from, and
+	// zero when the job is starting fresh.
+	//
+	// A source subtask needs it as well as its offset. Checkpoint IDs are
+	// contiguous from 1 within a subtask and a subtask injects barrier k as its
+	// k-th barrier, so restoring from checkpoint k means exactly k barriers
+	// have been injected. Restarting the count at zero would make the resumed
+	// run emit a second barrier 1 at a different logical position, and a
+	// coordinator counting acknowledgements would be told about two different
+	// cuts under one name.
+	restoredCheckpoint int64
 }
 
 // checkpointer is a subtask's half of the checkpoint protocol.
@@ -118,10 +135,14 @@ func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, grou
 	cp := checkpointer{co: cfg.coordinator, key: id.checkpointKey()}
 	switch v.Kind {
 	case graph.VertexSource:
-		return runSourceSubtask(ctx, v, id, w, cp)
+		return runSourceSubtask(ctx, v, id, w, cp, cfg)
 	case graph.VertexOperator:
-		return runOperatorSubtask(ctx, v, id, gate, w, cp)
+		return runOperatorSubtask(ctx, v, id, gate, w, cp, cfg)
 	case graph.VertexSink:
+		// A sink restores nothing. Its payload is empty by construction, and it
+		// will be until the transactional sink in Phase 5 has a staging area to
+		// record. Ignored rather than checked, because a sink that found
+		// something there could not do anything with it either.
 		return runSinkSubtask(ctx, v, id, gate, w, cp)
 	default:
 		return fmt.Errorf("subtask %s: unknown kind %d", id, uint8(v.Kind))
@@ -129,7 +150,7 @@ func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, grou
 }
 
 // runSourceSubtask reads this subtask's slice of the offset space and emits it.
-func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *transport.Writer, cp checkpointer) (err error) {
+func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *transport.Writer, cp checkpointer, cfg subtaskConfig) (err error) {
 	src := v.NewSource()
 	oc := newOpContext(ctx, w)
 	if err := src.Open(oc); err != nil {
@@ -171,7 +192,21 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 		return w.Broadcast(ctx, core.NewBarrierElement(b))
 	}
 	wm := newWatermarkGenerator(v.WatermarkIntervalElements, v.MaxOutOfOrderness)
-	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, v.BarrierIntervalElements, emitRecord, emitWatermark, emitBarrier); err != nil {
+
+	// A restored source resumes at the offset it recorded and continues its
+	// barrier numbering. The watermark generator is NOT restored and does not
+	// need to be: it derives its value from the records it sees, and the
+	// records it sees from here are the ones it would have seen anyway.
+	var resume *sourceResume
+	if cfg.restored {
+		position, err := decodePosition(cfg.restore)
+		if err != nil {
+			return fmt.Errorf("source %s: %w", id, err)
+		}
+		resume = &sourceResume{position: position, barriersInjected: cfg.restoredCheckpoint}
+	}
+
+	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, v.BarrierIntervalElements, resume, emitRecord, emitWatermark, emitBarrier); err != nil {
 		return fmt.Errorf("source %s: %w", id, err)
 	}
 
@@ -181,7 +216,7 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 	return w.Broadcast(ctx, core.NewEndOfStreamElement())
 }
 
-func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer) (err error) {
+func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, cfg subtaskConfig) (err error) {
 	op := v.NewOperator()
 	oc := newOpContext(ctx, w)
 	if err := op.Open(oc); err != nil {
@@ -192,6 +227,18 @@ func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate 
 			err = fmt.Errorf("operator %s: close: %w", id, cerr)
 		}
 	}()
+
+	// AFTER Open and BEFORE any element, which is the window
+	// core.Operator.Restore already documents. Open is where an operator takes
+	// the state handle, so restoring earlier would fill a state the operator
+	// has not asked for yet; restoring later would fold a checkpointed
+	// aggregate into one that has already started accumulating, and
+	// state.ReadFrom refuses exactly that.
+	if cfg.restored {
+		if err := state.ReadFrom(oc.state, bytes.NewReader(cfg.restore)); err != nil {
+			return fmt.Errorf("operator %s: restore: %w", id, err)
+		}
+	}
 
 	return runOperatorLoop(ctx, op, oc, id, gate, w, cp)
 }

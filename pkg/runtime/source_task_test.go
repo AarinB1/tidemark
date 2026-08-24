@@ -175,7 +175,7 @@ func TestSourceLoopRangesDoNotOverlap(t *testing.T) {
 // duplicate every record P times and report nothing, so the request is refused.
 func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// countlessSource has no Count method, so it is not splittable.
-	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, noWatermarks(), noBarriers(),
+	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, noWatermarks(), noBarriers(), nil,
 		func(*core.Record) error { return nil }, unexpectedWatermark(t), unexpectedBarrier(t))
 	if err == nil {
 		t.Fatal("sourceLoop split a source that does not report a Count")
@@ -184,7 +184,7 @@ func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// At parallelism 1 there is nothing to divide, so the same source is read
 	// to exhaustion.
 	var seen int
-	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
+	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, noWatermarks(), noBarriers(), nil, func(*core.Record) error {
 		seen++
 		return nil
 	}, unexpectedWatermark(t), unexpectedBarrier(t)); err != nil {
@@ -203,7 +203,7 @@ func TestSourceLoopStopsOnContextCancellation(t *testing.T) {
 	if err := src.Open(nil); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	err := sourceLoop(ctx, src, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
+	err := sourceLoop(ctx, src, 1, 0, noWatermarks(), noBarriers(), nil, func(*core.Record) error {
 		t.Error("sourceLoop emitted a record against a cancelled context")
 		return nil
 	}, unexpectedWatermark(t), unexpectedBarrier(t))
@@ -220,7 +220,7 @@ func TestSourceLoopReturnsTheEmitError(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	var seen int
-	err := sourceLoop(context.Background(), src, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
+	err := sourceLoop(context.Background(), src, 1, 0, noWatermarks(), noBarriers(), nil, func(*core.Record) error {
 		seen++
 		if seen == 3 {
 			return errEmit
@@ -270,7 +270,7 @@ func readSubtaskRange(t *testing.T, cfg sources.GeneratorConfig, parallelism, in
 	}()
 
 	var out []*core.Record
-	err := sourceLoop(context.Background(), src, parallelism, index, noWatermarks(), noBarriers(), func(rec *core.Record) error {
+	err := sourceLoop(context.Background(), src, parallelism, index, noWatermarks(), noBarriers(), nil, func(rec *core.Record) error {
 		out = append(out, rec)
 		return nil
 	}, unexpectedWatermark(t), unexpectedBarrier(t))
@@ -683,7 +683,7 @@ func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermar
 	}()
 
 	var out []element
-	err := sourceLoop(context.Background(), src, parallelism, index, wm, barrierInterval,
+	err := sourceLoop(context.Background(), src, parallelism, index, wm, barrierInterval, nil,
 		func(rec *core.Record) error {
 			out = append(out, element{kind: core.KindRecord, eventTime: rec.EventTime})
 			return nil
@@ -763,7 +763,7 @@ func TestSourceLoopReturnsTheWatermarkEmitError(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	var records int
-	err := sourceLoop(context.Background(), src, 1, 0, newWatermarkGenerator(10, 0), noBarriers(),
+	err := sourceLoop(context.Background(), src, 1, 0, newWatermarkGenerator(10, 0), noBarriers(), nil,
 		func(*core.Record) error {
 			records++
 			return nil
