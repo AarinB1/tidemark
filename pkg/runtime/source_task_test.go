@@ -636,8 +636,8 @@ func unexpectedWatermark(t *testing.T) func(int64) error {
 func noBarriers() int64 { return 0 }
 
 // unexpectedBarrier is the matching emitter.
-func unexpectedBarrier(t *testing.T) func(*core.Barrier) error {
-	return func(b *core.Barrier) error {
+func unexpectedBarrier(t *testing.T) func(*core.Barrier, int64) error {
+	return func(b *core.Barrier, position int64) error {
 		t.Helper()
 		t.Errorf("a source with barrier injection disabled injected checkpoint %d", b.CheckpointID)
 		return nil
@@ -659,6 +659,9 @@ type element struct {
 	// barrier fields, meaningful only when kind is KindBarrier.
 	checkpointID int64
 	timestamp    int64
+	// position is the source's offset at the moment the barrier was injected,
+	// which is the offset a recovery from this checkpoint resumes from.
+	position int64
 }
 
 func (e element) isRecord() bool    { return e.kind == core.KindRecord }
@@ -689,8 +692,8 @@ func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermar
 			out = append(out, element{kind: core.KindWatermark, eventTime: t})
 			return nil
 		},
-		func(b *core.Barrier) error {
-			out = append(out, element{kind: core.KindBarrier, checkpointID: b.CheckpointID, timestamp: b.Timestamp})
+		func(b *core.Barrier, position int64) error {
+			out = append(out, element{kind: core.KindBarrier, checkpointID: b.CheckpointID, timestamp: b.Timestamp, position: position})
 			return nil
 		})
 	if err != nil {
@@ -1223,7 +1226,7 @@ func TestSourceSubtaskBroadcastsBarriersToEveryChannel(t *testing.T) {
 		}
 	}
 
-	if err := runSubtask(context.Background(), v, 0, nil, groups); err != nil {
+	if err := runSubtask(context.Background(), v, 0, nil, groups, subtaskConfig{}); err != nil {
 		t.Fatalf("runSubtask: %v", err)
 	}
 	wg.Wait()

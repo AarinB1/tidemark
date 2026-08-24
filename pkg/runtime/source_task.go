@@ -73,6 +73,16 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 // when the source reports it has no more elements, or on the first error from
 // the source, from any emitter, or from ctx.
 //
+// emitBarrier is handed the source's POSITION at the moment of injection,
+// alongside the barrier. That position is the offset the next Next would
+// return, so it is the resume offset for this checkpoint: every element below
+// it belongs to the checkpoint being closed and every element from it onwards
+// belongs to the next one. It is read here, between the injection decision and
+// the emit, and not by the caller afterwards. A caller reading it later reads
+// it after whatever has happened in between, and "whatever has happened in
+// between" is nothing today and is a replayed or a skipped record the first
+// time it is not.
+//
 // The record goes out before the watermark derived from it. Either order is
 // safe, since a watermark of maxSeen-lag-1 does not bound the record that
 // produced it, but records-then-watermark is the one that reads as what it is:
@@ -92,7 +102,7 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 //
 // The source must already be open: Open validates configuration, and a source
 // that failed validation must not be seeked.
-func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, barrierIntervalElements int64, emitRecord func(*core.Record) error, emitWatermark func(int64) error, emitBarrier func(*core.Barrier) error) error {
+func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, barrierIntervalElements int64, emitRecord func(*core.Record) error, emitWatermark func(int64) error, emitBarrier func(b *core.Barrier, position int64) error) error {
 	end, bounded, count, err := seekToRange(src, parallelism, index)
 	if err != nil {
 		return err
@@ -129,7 +139,9 @@ func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm
 		// one. Nothing depends on the value, but "the last watermark this
 		// subtask emitted" has to mean one thing rather than two.
 		if id, ok := br.onRecord(); ok {
-			if err := emitBarrier(&core.Barrier{CheckpointID: id, Timestamp: wm.lastEmitted}); err != nil {
+			// Captured at the injection point. See the note on this function.
+			position := src.Position()
+			if err := emitBarrier(&core.Barrier{CheckpointID: id, Timestamp: wm.lastEmitted}, position); err != nil {
 				return err
 			}
 		}

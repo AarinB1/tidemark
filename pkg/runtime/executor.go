@@ -38,6 +38,12 @@ func Run(ctx context.Context, g *graph.Graph) error {
 
 	inputs, outputs := wire(g, order)
 
+	// Nothing is recording checkpoints. Barriers still flow: they are part of
+	// the element stream whether or not anybody snapshots on them, and the
+	// alignment they drive is what makes a snapshot a consistent cut when
+	// something does. Turning checkpointing on is the next step's job.
+	cfg := subtaskConfig{}
+
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -63,7 +69,7 @@ func Run(ctx context.Context, g *graph.Graph) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := runSubtask(runCtx, v, index, gates[id], outputs[id]); err != nil {
+				if err := runSubtask(runCtx, v, index, gates[id], outputs[id], cfg); err != nil {
 					errs <- err
 					cancel()
 				}

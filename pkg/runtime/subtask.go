@@ -1,10 +1,13 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 
+	"github.com/AarinB1/tidemark/pkg/checkpoint"
 	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/graph"
 	"github.com/AarinB1/tidemark/pkg/state"
@@ -20,6 +23,83 @@ type subtaskID struct {
 
 func (id subtaskID) String() string { return fmt.Sprintf("%s[%d]", id.vertexID, id.index) }
 
+// checkpointKey is this subtask's identity on disk. Two types for one identity
+// because pkg/checkpoint must not import the runtime: the on-disk half of a
+// subtask's name lives with the format that writes it.
+func (id subtaskID) checkpointKey() checkpoint.SubtaskKey {
+	return checkpoint.SubtaskKey{VertexID: id.vertexID, Index: id.index}
+}
+
+// subtaskConfig is what a subtask needs from the job beyond its own vertex and
+// its channels.
+//
+// A struct rather than another parameter on runSubtask because the restore
+// half arrives in the next step and a function with eight positional arguments
+// is one where a caller eventually passes them in the wrong order.
+type subtaskConfig struct {
+	// coordinator is nil when the job is not checkpointing. Barriers still flow
+	// in that case -- they are part of the element stream whether or not
+	// anybody is recording snapshots -- and every subtask simply has nothing to
+	// acknowledge.
+	coordinator *checkpoint.Coordinator
+}
+
+// checkpointer is a subtask's half of the checkpoint protocol.
+//
+// It exists so that "the job is not checkpointing" is handled in ONE place. The
+// alternative is a nil check at each of the four sites that snapshot, and the
+// site that forgot one would panic only in a job with checkpointing switched
+// off, which is most of the existing test suite.
+type checkpointer struct {
+	co  *checkpoint.Coordinator
+	key checkpoint.SubtaskKey
+}
+
+// enabled reports whether anything is recording checkpoints.
+func (c checkpointer) enabled() bool { return c.co != nil }
+
+// snapshot records payload as this subtask's state for checkpoint id.
+func (c checkpointer) snapshot(id int64, payload []byte) error {
+	if c.co == nil {
+		return nil
+	}
+	return c.co.Acknowledge(id, c.key, payload)
+}
+
+// fail abandons checkpoint id because this subtask could not snapshot.
+//
+// Called when the snapshot itself fails, before anything was handed to the
+// coordinator. A failure INSIDE Acknowledge abandons the checkpoint on its own,
+// because the coordinator is the one that knows the write did not land.
+func (c checkpointer) fail(id int64, cause error) {
+	if c.co == nil {
+		return
+	}
+	c.co.Fail(id, c.key, cause)
+}
+
+// positionBytes is the width of a source subtask's snapshot payload.
+const positionBytes = 8
+
+// encodePosition renders a source subtask's resume offset.
+//
+// The whole of a source subtask's checkpoint is one integer, and that is what
+// contiguous ranges buy: a strided split would have to record a stride and a
+// phase beside it. Big-endian, like every other encoding here.
+func encodePosition(offset int64) []byte {
+	var buf [positionBytes]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(offset))
+	return buf[:]
+}
+
+// decodePosition reads a resume offset written by encodePosition.
+func decodePosition(payload []byte) (int64, error) {
+	if len(payload) != positionBytes {
+		return 0, fmt.Errorf("source position payload is %d bytes, want %d", len(payload), positionBytes)
+	}
+	return int64(binary.BigEndian.Uint64(payload)), nil
+}
+
 // runSubtask runs one parallel instance of v to completion.
 //
 // It closes the subtask's outputs on every exit path, including a failure, so a
@@ -30,25 +110,26 @@ func (id subtaskID) String() string { return fmt.Sprintf("%s[%d]", id.vertexID, 
 // gate is nil for a source, which has no inputs, and groups is empty for a
 // sink, which has no outputs. groups holds one group of outputs per downstream
 // vertex; see transport.NewWriter for what the grouping buys.
-func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, groups [][]transport.Output) error {
+func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, groups [][]transport.Output, cfg subtaskConfig) error {
 	id := subtaskID{vertexID: v.ID, index: index}
 	w := transport.NewWriter(groups)
 	defer w.CloseAll()
 
+	cp := checkpointer{co: cfg.coordinator, key: id.checkpointKey()}
 	switch v.Kind {
 	case graph.VertexSource:
-		return runSourceSubtask(ctx, v, id, w)
+		return runSourceSubtask(ctx, v, id, w, cp)
 	case graph.VertexOperator:
-		return runOperatorSubtask(ctx, v, id, gate, w)
+		return runOperatorSubtask(ctx, v, id, gate, w, cp)
 	case graph.VertexSink:
-		return runSinkSubtask(ctx, v, id, gate, w)
+		return runSinkSubtask(ctx, v, id, gate, w, cp)
 	default:
 		return fmt.Errorf("subtask %s: unknown kind %d", id, uint8(v.Kind))
 	}
 }
 
 // runSourceSubtask reads this subtask's slice of the offset space and emits it.
-func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *transport.Writer) (err error) {
+func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *transport.Writer, cp checkpointer) (err error) {
 	src := v.NewSource()
 	oc := newOpContext(ctx, w)
 	if err := src.Open(oc); err != nil {
@@ -73,7 +154,20 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 	// downstream vertex's subtasks leaves the others aligning on a checkpoint
 	// they will never see completed, and alignment has no timeout: the job stops
 	// producing output with no error anywhere (invariants 2 and 3).
-	emitBarrier := func(b *core.Barrier) error {
+	//
+	// The SNAPSHOT COMES FIRST. A source is the initiator of a checkpoint, and
+	// what it records is the offset it will resume from, which is the position
+	// immediately after the last element belonging to this checkpoint. That
+	// position is handed in by the loop, captured at the injection point rather
+	// than read here: reading it after the broadcast would be reading it after
+	// nothing has moved, which is right today and would stop being right the
+	// moment anything else touches the source between the two.
+	emitBarrier := func(b *core.Barrier, position int64) error {
+		if cp.enabled() {
+			if err := cp.snapshot(b.CheckpointID, encodePosition(position)); err != nil {
+				return fmt.Errorf("checkpoint %d: %w", b.CheckpointID, err)
+			}
+		}
 		return w.Broadcast(ctx, core.NewBarrierElement(b))
 	}
 	wm := newWatermarkGenerator(v.WatermarkIntervalElements, v.MaxOutOfOrderness)
@@ -87,7 +181,7 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 	return w.Broadcast(ctx, core.NewEndOfStreamElement())
 }
 
-func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer) (err error) {
+func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer) (err error) {
 	op := v.NewOperator()
 	oc := newOpContext(ctx, w)
 	if err := op.Open(oc); err != nil {
@@ -99,13 +193,13 @@ func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate 
 		}
 	}()
 
-	return runOperatorLoop(ctx, op, oc, id, gate, w)
+	return runOperatorLoop(ctx, op, oc, id, gate, w, cp)
 }
 
 // runOperatorLoop is the element loop of an operator subtask, split from the
 // open and close around it so that a test can drive it with a context whose
 // state backend is one that fails on demand. Nothing else calls it.
-func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id subtaskID, gate *Gate, w *transport.Writer) error {
+func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer) error {
 	for {
 		e, ok := gate.Recv()
 		if !ok {
@@ -148,11 +242,33 @@ func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id su
 			}
 			return w.Broadcast(ctx, e)
 		case core.KindBarrier:
-			// Forwarded and broadcast, like a watermark, and NOT handed to the
-			// operator. Phase 3a aligns barriers at the gate and forwards them;
-			// taking a snapshot when one arrives is Phase 3b, and core.Operator
-			// has no method for it precisely so that this line cannot quietly
-			// grow one.
+			// The gate has completed alignment: every live input has delivered
+			// this barrier, and everything they sent afterwards is held in the
+			// gate's buffers. So the operator's state right now is exactly the
+			// records BELOW the barrier on every input, which is the cut this
+			// checkpoint records.
+			//
+			// Snapshot, then acknowledge, THEN forward. That order is
+			// Chandy-Lamport and it is not interchangeable. Forwarding first
+			// would let a downstream operator record a state that includes
+			// effects of elements this operator has not recorded yet: this
+			// subtask could process more elements and emit from them while the
+			// barrier was already ahead of them downstream, so the downstream
+			// snapshot would contain records that the upstream snapshot's
+			// resume point will replay. Those records arrive twice on recovery.
+			//
+			// Draining the gate's buffers stays after all of it, and it does so
+			// without this loop arranging anything: the gate queues the barrier
+			// for delivery before the elements it releases, so the next Recv is
+			// what starts epoch k+1.
+			//
+			// The state is the RUNTIME's, read straight out of the subtask's
+			// context, and core.Operator.Snapshot is not called. An operator's
+			// state IS its KeyedState; an operator that kept a second copy
+			// somewhere else would checkpoint half of itself.
+			if err := snapshotOperatorState(cp, e.Barrier.CheckpointID, oc.state); err != nil {
+				return fmt.Errorf("operator %s: %w", id, err)
+			}
 			if err := w.Broadcast(ctx, e); err != nil {
 				return err
 			}
@@ -162,7 +278,7 @@ func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id su
 	}
 }
 
-func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer) (err error) {
+func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer) (err error) {
 	snk := v.NewSink()
 	oc := newOpContext(ctx, w)
 	if err := snk.Open(oc); err != nil {
@@ -187,18 +303,54 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 		case core.KindWatermark:
 			oc.watermark = e.Watermark
 		case core.KindBarrier:
-			// Ignored, deliberately. A sink commits on NotifyCheckpointComplete
-			// and never at snapshot time, because data committed at snapshot
-			// time belongs to a checkpoint that may never complete and comes
-			// back as duplicates on recovery (invariant 4). Neither the
-			// notification nor the transactional sink exists yet, so there is
-			// nothing here to do but let the barrier pass.
+			// Acknowledged with an EMPTY payload, and nothing is committed. A
+			// sink commits on NotifyCheckpointComplete and never at snapshot
+			// time, because data committed at snapshot time belongs to a
+			// checkpoint that may never complete and comes back as duplicates
+			// on recovery (invariant 4). Neither the notification nor the
+			// transactional sink exists yet, so there is nothing to record.
+			//
+			// It still acknowledges. A sink that stayed out of the count would
+			// let a checkpoint complete while the sink was arbitrarily far
+			// behind the cut, and Phase 5 would have to add a participant to
+			// the protocol rather than content to a payload.
+			if err := cp.snapshot(e.Barrier.CheckpointID, nil); err != nil {
+				return fmt.Errorf("sink %s: checkpoint %d: %w", id, e.Barrier.CheckpointID, err)
+			}
 		case core.KindEndOfStream:
 			return nil
 		default:
 			return fmt.Errorf("sink %s: unexpected %s element", id, e.Kind)
 		}
 	}
+}
+
+// snapshotOperatorState serialises st and hands it to the coordinator as this
+// subtask's state for checkpoint id.
+//
+// A snapshot that cannot be taken abandons the checkpoint before the error goes
+// back to the subtask, because the subtask is about to stop and will never
+// acknowledge: a checkpoint still waiting for it would sit outstanding forever
+// while later ones completed on top of it. A failure inside Acknowledge
+// abandons it too, from the coordinator, which is the side that knows the write
+// did not land.
+func snapshotOperatorState(cp checkpointer, id int64, st state.KeyedState) error {
+	if !cp.enabled() {
+		return nil
+	}
+	// Buffered rather than streamed to the file, because the coordinator is
+	// what owns the on-disk layout and a subtask handing it a reader would be a
+	// subtask that decides when the write happens. The cost is one copy of a
+	// subtask's state per checkpoint; see the note on state.WriteTo.
+	var buf bytes.Buffer
+	if err := state.WriteTo(st, &buf); err != nil {
+		cp.fail(id, err)
+		return fmt.Errorf("checkpoint %d: snapshot: %w", id, err)
+	}
+	if err := cp.snapshot(id, buf.Bytes()); err != nil {
+		return fmt.Errorf("checkpoint %d: %w", id, err)
+	}
+	return nil
 }
 
 // opContext is the runtime's implementation of core.Context.
