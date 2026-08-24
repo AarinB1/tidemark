@@ -265,3 +265,55 @@ func TestMemoryIterateOverEmptyStateDoesNothing(t *testing.T) {
 		t.Errorf("Iterate over empty state made %d calls", calls)
 	}
 }
+
+// TestReservedPrefixesAreTheDocumentedBytes pins the discriminator values.
+//
+// These are not internal constants. From this phase on they are part of the
+// snapshot format: a checkpoint holds composite keys byte for byte, so changing
+// what 0x00 means reinterprets every checkpoint already on disk, and nothing in
+// the restore path can tell that it happened. A test that reads like a
+// tautology is the point — it makes the change loud.
+func TestReservedPrefixesAreTheDocumentedBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		got  byte
+		want byte
+	}{
+		{name: "user state", got: PrefixUserState, want: 0x00},
+		{name: "timer", got: PrefixTimer, want: 0x01},
+	}
+	for _, tt := range tests {
+		if tt.got != tt.want {
+			t.Errorf("%s prefix is %#x, want %#x", tt.name, tt.got, tt.want)
+		}
+	}
+	if PrefixUserState == PrefixTimer {
+		t.Fatal("the two prefixes are the same byte, so the partitions are not partitioned")
+	}
+}
+
+// TestPrefixOrdersPartitionsIntoContiguousRuns is why the discriminator leads a
+// key rather than trailing it.
+//
+// Sorted iteration is part of the KeyedState contract, so a leading byte makes
+// each partition one contiguous run and a scan for the timers is a scan of that
+// run. The entries below are chosen so that the user-state key sorts ABOVE the
+// timer key on every byte except the discriminator: with the byte on the front
+// the partitions still separate, and with it anywhere else they interleave.
+func TestPrefixOrdersPartitionsIntoContiguousRuns(t *testing.T) {
+	m := NewMemory()
+	m.Put([]byte{PrefixTimer, 0x00}, []byte("t0"))
+	m.Put([]byte{PrefixUserState, 0xff}, []byte("u1"))
+	m.Put([]byte{PrefixTimer, 0xff}, []byte("t1"))
+	m.Put([]byte{PrefixUserState, 0x00}, []byte("u0"))
+
+	var order []string
+	m.Iterate(func(k, v []byte) bool {
+		order = append(order, string(v))
+		return true
+	})
+	want := []string{"u0", "u1", "t0", "t1"}
+	if !slices.Equal(order, want) {
+		t.Errorf("sorted iteration visited %v, want %v: the partitions are not contiguous runs", order, want)
+	}
+}

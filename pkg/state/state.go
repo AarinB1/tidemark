@@ -132,3 +132,34 @@ func (m *Memory) Iterate(fn func(key, value []byte) bool) {
 // Len returns the number of entries held. It is for tests and for the state
 // size Phase 6 is measured on; nothing on the data path calls it.
 func (m *Memory) Len() int { return len(m.entries) }
+
+// Reserved key prefixes. Every composite key a subtask stores begins with one
+// of these bytes, so the one key space a subtask owns is partitioned by what is
+// stored in it rather than by convention.
+//
+//	0x00        operator user state (window aggregates)
+//	0x01        event-time timers (RESERVED, unused in this phase)
+//	0x02..0xFF  reserved
+//
+// Nothing writes 0x01 yet, and nothing in this phase should: the timer service
+// in pkg/operators holds its timers in RAM. The byte is claimed now because the
+// snapshot format in pkg/checkpoint is written in this phase, and partitioning
+// a key space AFTER a format exists is a format change: every checkpoint
+// already on disk decodes into the wrong partition, and the restore path has to
+// learn to tell an old layout from a new one. Claiming it costs one byte per
+// entry today and makes Phase 6's move of timers onto disk a change to one
+// operator rather than to the on-disk format.
+//
+// The discriminator is FIRST rather than last so that a scan can be confined to
+// one partition by prefix. Sorted iteration is part of the KeyedState contract,
+// so a leading byte groups a partition into one contiguous run; a trailing byte
+// would interleave the partitions and leave a timer scan reading every
+// aggregate.
+const (
+	// PrefixUserState is the discriminator on operator state: the aggregates a
+	// user-defined operator accumulates.
+	PrefixUserState byte = 0x00
+	// PrefixTimer is the discriminator reserved for event-time timers. Nothing
+	// writes it in this phase.
+	PrefixTimer byte = 0x01
+)
