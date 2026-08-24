@@ -551,6 +551,83 @@ func testRestoredRunContinuesCheckpointNumbering(t *testing.T, backend stateBack
 	assertSameCounts(t, countsOf(t, restored.Records()), oracleCounts(t, cfg), "resumed run")
 }
 
+// TestCheckpointsKeepCompletingAfterAShorterSourceFinishes is the job-level
+// form of the coordinator's exhausted-source rule.
+//
+// Two source vertices, different barrier budgets. srcA injects two barriers
+// and exits; srcB injects ten. The gate already drops an exhausted input from
+// alignment, so barriers 3-10 still flow. The coordinator has to drop the
+// finished source from its count the same way, or those checkpoints never
+// reach _COMPLETE and a job that ran to the end has no recovery point past
+// srcA's last barrier.
+func TestCheckpointsKeepCompletingAfterAShorterSourceFinishes(t *testing.T) {
+	const (
+		barrierInterval = 100
+		shortCount      = 250
+		longCount       = 1000
+	)
+	// srcA: 250 elements, a barrier every 100 -> two barriers, then 50 leftover.
+	// srcB: 1000 elements at the same interval -> ten barriers.
+	wantLatest := int64(longCount / barrierInterval)
+
+	root := t.TempDir()
+	a := restoreConfig(5, shortCount)
+	b := restoreConfig(6, longCount)
+	collect := sinks.NewCollect()
+	g := countingGraph(t, collect, 1,
+		countingSourceVertex("srcA", a, 1, barrierInterval, nil),
+		countingSourceVertex("srcB", b, 1, barrierInterval, nil),
+	)
+	if err := RunWithOptions(context.Background(), g, Options{CheckpointRoot: root, Seed: a.Seed}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	storage := checkpoint.NewStorage(root)
+	id, ok, err := storage.Latest()
+	if err != nil || !ok {
+		t.Fatalf("Latest = (%d, ok %t, err %v), want a complete checkpoint", id, ok, err)
+	}
+	if id != wantLatest {
+		t.Fatalf("Latest = %d, want %d: checkpoints stopped completing when the shorter source finished", id, wantLatest)
+	}
+
+	_, payloads, err := storage.Load(id)
+	if err != nil {
+		t.Fatalf("Load(%d): %v", id, err)
+	}
+	gotA, err := decodePosition(payloads[checkpoint.SubtaskKey{VertexID: "srcA", Index: 0}])
+	if err != nil {
+		t.Fatalf("decodePosition srcA: %v", err)
+	}
+	if gotA != shortCount {
+		t.Errorf("srcA resumes at %d from checkpoint %d, want %d (end of range)", gotA, id, shortCount)
+	}
+	gotB, err := decodePosition(payloads[checkpoint.SubtaskKey{VertexID: "srcB", Index: 0}])
+	if err != nil {
+		t.Fatalf("decodePosition srcB: %v", err)
+	}
+	if gotB != longCount {
+		t.Errorf("srcB resumes at %d from checkpoint %d, want %d", gotB, id, longCount)
+	}
+
+	// srcA's last injected barrier still holds the injection offset, not the
+	// end of the range. The leftover 50 elements belong to later checkpoints.
+	const lastInjected = shortCount / barrierInterval
+	_, payloads, err = storage.Load(lastInjected)
+	if err != nil {
+		t.Fatalf("Load(%d): %v", lastInjected, err)
+	}
+	gotA, err = decodePosition(payloads[checkpoint.SubtaskKey{VertexID: "srcA", Index: 0}])
+	if err != nil {
+		t.Fatalf("decodePosition srcA at checkpoint %d: %v", lastInjected, err)
+	}
+	if want := int64(lastInjected) * barrierInterval; gotA != want {
+		t.Errorf("checkpoint %d recorded srcA offset %d, want %d (the injection point)", lastInjected, gotA, want)
+	}
+
+	assertSameCounts(t, countsOf(t, collect.Records()), oracleCounts(t, a, b), "run")
+}
+
 // TestRestoreDoesNotRecoverInRamOperatorState records a real limit of this
 // phase rather than a property of it.
 //

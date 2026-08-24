@@ -314,15 +314,16 @@ func TestConcurrentAcknowledgement(t *testing.T) {
 	}
 }
 
-// TestAcknowledgementProtocolFailures covers the two things that cannot happen
+// TestAcknowledgementProtocolFailures covers the things that cannot happen
 // in a correct run.
 //
-// Both are rejected rather than absorbed. A subtask the job does not have means
-// the coordinator and the graph disagree about the job's shape, and a duplicate
-// acknowledgement means one subtask saw the same checkpoint ID twice, which is
-// a barrier-injection bug. Neither would stop a checkpoint completing if it
-// were tolerated -- the count is over distinct subtasks -- so tolerating them
-// would leave the symptom invisible.
+// They are rejected rather than absorbed. A subtask the job does not have means
+// the coordinator and the graph disagree about the job's shape, a duplicate
+// acknowledgement means one subtask saw the same checkpoint ID twice, and a
+// duplicate finish means a source reported end-of-stream twice. None of those
+// would stop a checkpoint completing if they were tolerated -- the count is
+// over distinct live subtasks -- so tolerating them would leave the symptom
+// invisible.
 func TestAcknowledgementProtocolFailures(t *testing.T) {
 	c, _ := newTestCoordinator(t)
 	known := SubtaskKey{VertexID: "op", Index: 0}
@@ -345,6 +346,111 @@ func TestAcknowledgementProtocolFailures(t *testing.T) {
 	ackAll(t, c, 2)
 	if err := c.Acknowledge(2, known, nil); !errors.Is(err, errDuplicateAck) {
 		t.Errorf("Acknowledge on a completed checkpoint = %v, want %v", err, errDuplicateAck)
+	}
+
+	if err := c.Finished(SubtaskKey{VertexID: "nope", Index: 0}, nil); !errors.Is(err, errUnknownSubtask) {
+		t.Errorf("Finished from an unknown vertex = %v, want %v", err, errUnknownSubtask)
+	}
+	if err := c.Finished(known, nil); err != nil {
+		t.Fatalf("Finished: %v", err)
+	}
+	if err := c.Finished(known, nil); !errors.Is(err, errDuplicateFinish) {
+		t.Errorf("a second Finished from the same subtask = %v, want %v", err, errDuplicateFinish)
+	}
+}
+
+// TestFinishedSourceDoesNotBlockLaterCheckpoints is the coordinator's half of
+// the gate's exhausted-input rule.
+//
+// Two source vertices, different barrier budgets. srcA acknowledges checkpoint
+// 1 and then finishes; srcB keeps going. A coordinator that still expected
+// srcA on checkpoint 2 would never write _COMPLETE: srcA will not speak again,
+// and a job that kept running would have no recovery point past srcA's last
+// barrier and nothing saying so.
+//
+// The payload written for srcA on that later checkpoint is the one Finished
+// handed over -- the end of its range -- and not the offset it recorded at
+// its last barrier. Reusing the last barrier's offset would replay the tail
+// into a state that already counted it.
+func TestFinishedSourceDoesNotBlockLaterCheckpoints(t *testing.T) {
+	meta := Metadata{
+		Seed: 3,
+		Vertices: []VertexMeta{
+			{ID: "op", Parallelism: 1},
+			{ID: "out", Parallelism: 1},
+			{ID: "srcA", Parallelism: 1, Count: 250},
+			{ID: "srcB", Parallelism: 1, Count: 1000},
+		},
+	}
+	s := NewStorage(t.TempDir())
+	c := NewCoordinator(s, meta)
+
+	srcA := SubtaskKey{VertexID: "srcA", Index: 0}
+	srcB := SubtaskKey{VertexID: "srcB", Index: 0}
+	op := SubtaskKey{VertexID: "op", Index: 0}
+	out := SubtaskKey{VertexID: "out", Index: 0}
+
+	ack := func(id int64, key SubtaskKey, payload string) {
+		t.Helper()
+		if err := c.Acknowledge(id, key, []byte(payload)); err != nil {
+			t.Fatalf("Acknowledge(%d, %s): %v", id, key, err)
+		}
+	}
+
+	// Checkpoint 1 is the last one srcA participates in.
+	ack(1, srcA, "srcA@100")
+	ack(1, srcB, "srcB@100")
+	ack(1, op, "op@1")
+	ack(1, out, "out@1")
+	if !c.Completed(1) {
+		t.Fatal("checkpoint 1 did not complete with every subtask still live")
+	}
+
+	// Checkpoint 2 is already waiting when srcA stops: everyone but srcA has
+	// acknowledged, which is the shape the job actually hits -- srcB injects
+	// the next barrier, the operator and sink align, and only then does srcA's
+	// end-of-stream reach the coordinator.
+	ack(2, srcB, "srcB@200")
+	ack(2, op, "op@2")
+	ack(2, out, "out@2")
+	if c.Completed(2) {
+		t.Fatal("checkpoint 2 completed without srcA and without srcA having finished")
+	}
+	if err := c.Finished(srcA, []byte("srcA@250")); err != nil {
+		t.Fatalf("Finished: %v", err)
+	}
+	if !c.Completed(2) {
+		t.Fatal("checkpoint 2 did not complete after the shorter source finished")
+	}
+
+	_, payloads, err := s.Load(1)
+	if err != nil {
+		t.Fatalf("Load(1): %v", err)
+	}
+	if got := string(payloads[srcA]); got != "srcA@100" {
+		t.Errorf("checkpoint 1 recorded %q for srcA, want the acknowledgement, not the final payload", got)
+	}
+
+	_, payloads, err = s.Load(2)
+	if err != nil {
+		t.Fatalf("Load(2): %v", err)
+	}
+	if got := string(payloads[srcA]); got != "srcA@250" {
+		t.Errorf("checkpoint 2 recorded %q for srcA, want the final payload", got)
+	}
+	if got := string(payloads[srcB]); got != "srcB@200" {
+		t.Errorf("checkpoint 2 recorded %q for srcB, want its acknowledgement", got)
+	}
+
+	// A finished source does not stand in for a live one.
+	ack(3, op, "op@3")
+	ack(3, out, "out@3")
+	if c.Completed(3) {
+		t.Fatal("checkpoint 3 completed with srcB still live and silent")
+	}
+	ack(3, srcB, "srcB@300")
+	if !c.Completed(3) {
+		t.Fatal("checkpoint 3 did not complete after the remaining live source acknowledged")
 	}
 }
 

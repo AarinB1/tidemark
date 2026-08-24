@@ -124,6 +124,14 @@ func (c checkpointer) fail(id int64, cause error) {
 	c.co.Fail(id, c.key, cause)
 }
 
+// finished tells the coordinator this subtask will not acknowledge again.
+func (c checkpointer) finished(payload []byte) error {
+	if c.co == nil {
+		return nil
+	}
+	return c.co.Finished(c.key, payload)
+}
+
 // positionBytes is the width of a source subtask's snapshot payload.
 const positionBytes = 8
 
@@ -237,6 +245,18 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 
 	if err := sourceLoop(ctx, src, v.Parallelism, id.index, wm, v.BarrierIntervalElements, resume, emitRecord, emitWatermark, emitBarrier); err != nil {
 		return fmt.Errorf("source %s: %w", id, err)
+	}
+
+	// The source is done and will not inject another barrier. Tell the
+	// coordinator before broadcasting end-of-stream, so a later barrier from a
+	// longer source can complete without waiting for an acknowledgement that
+	// will never come. The position is the end of the range: elements past the
+	// last barrier already went downstream and belong to whatever checkpoint
+	// the remaining sources close next.
+	if cp.enabled() {
+		if err := cp.finished(encodePosition(src.Position())); err != nil {
+			return fmt.Errorf("source %s: %w", id, err)
+		}
 	}
 
 	// End-of-stream broadcasts. Each downstream subtask needs to know this
