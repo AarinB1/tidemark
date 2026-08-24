@@ -28,6 +28,15 @@ type Context interface {
 	// This is a method on an interface that already exists, not a new
 	// interface, and the import runs one way: pkg/core depends on pkg/state and
 	// pkg/state depends on nothing in this repository.
+	//
+	// An operator does NOT check state.KeyedState.Err. Get, Put, Delete and
+	// Iterate cannot fail in their signatures, so a backend that failed stashes
+	// the error and hands back zero values, and the runtime collects that stash
+	// after every call it makes into this operator and fails the subtask. An
+	// operator that checked it per record would be duplicating a check the
+	// runtime already makes at exactly the granularity that matters, and one
+	// that checked it in some methods and not others would swallow the error in
+	// the rest.
 	State() state.KeyedState
 }
 

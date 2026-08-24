@@ -3,11 +3,61 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
 	"sync"
 
+	"github.com/AarinB1/tidemark/pkg/checkpoint"
 	"github.com/AarinB1/tidemark/pkg/graph"
+	"github.com/AarinB1/tidemark/pkg/state"
 	"github.com/AarinB1/tidemark/pkg/transport"
 )
+
+// errNoRestorePoint is returned when a run was told to resume from a checkpoint
+// root that holds no complete checkpoint.
+var errNoRestorePoint = errors.New("no complete checkpoint to restore from")
+
+// Options configures one run of a job.
+//
+// The zero value is the Phase 3a behaviour: barriers flow through the stream
+// and drive alignment, and nothing records a snapshot on them. That is what
+// every test written before this step runs on, and it is why Run keeps its
+// signature.
+type Options struct {
+	// CheckpointRoot, when non-empty, is the directory checkpoints are written
+	// under. Empty means the job takes none.
+	CheckpointRoot string
+	// RestoreFrom, when non-empty, is a checkpoint root to resume from. The
+	// highest checkpoint there with a _COMPLETE marker is the one used, and a
+	// root with none is an error rather than a fresh start: a caller that asked
+	// to resume and got a run from offset zero would get correct-looking output
+	// from a job that silently did not recover.
+	//
+	// It may be the same directory as CheckpointRoot. Checkpoint IDs continue
+	// from the one restored, so a resumed run does not write over the
+	// checkpoint it came from.
+	RestoreFrom string
+	// Seed is recorded in the checkpoint metadata. It is not validated on
+	// restore; see checkpoint.Metadata for why the graph cannot report one.
+	Seed uint64
+	// NewState makes the keyed state for one operator subtask. nil is the
+	// in-memory backend, which is the default because it is the one a job that
+	// fits in RAM should use and the one every test that is not about the
+	// backend should run on.
+	//
+	// It is called once per operator subtask, so a backend that owns files
+	// gives each subtask its own: a subtask is the unit of state, and two
+	// sharing one store would put two key spaces in one file with nothing
+	// between them. The runtime closes what it makes, if it has a Close.
+	NewState func() (state.KeyedState, error)
+}
+
+// Run executes g to completion with no checkpointing and no restore.
+func Run(ctx context.Context, g *graph.Graph) error {
+	return RunWithOptions(ctx, g, Options{})
+}
 
 // Run executes g to completion and returns the first error any subtask
 // reported.
@@ -30,10 +80,26 @@ import (
 // buffer those elements per input and keep consuming, rather than pausing a
 // forwarder. Whoever reads this then needs to know property 2 was load-bearing
 // here, not incidental.
-func Run(ctx context.Context, g *graph.Graph) error {
+func RunWithOptions(ctx context.Context, g *graph.Graph, opts Options) error {
 	order, err := g.TopoOrder()
 	if err != nil {
 		return err
+	}
+
+	meta := buildMetadata(order, opts.Seed)
+
+	// Restore first, and before a single goroutine is started. A validation
+	// failure here has to stop the job rather than fail it part way through:
+	// half a job that ran on a checkpoint it should have rejected has already
+	// written to the sink.
+	restored, restoredID, err := loadRestorePoint(opts.RestoreFrom, meta)
+	if err != nil {
+		return err
+	}
+
+	var coordinator *checkpoint.Coordinator
+	if opts.CheckpointRoot != "" {
+		coordinator = checkpoint.NewCoordinator(checkpoint.NewStorage(opts.CheckpointRoot), meta)
 	}
 
 	inputs, outputs := wire(g, order)
@@ -63,7 +129,15 @@ func Run(ctx context.Context, g *graph.Graph) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := runSubtask(runCtx, v, index, gates[id], outputs[id]); err != nil {
+				cfg := subtaskConfig{
+					coordinator:        coordinator,
+					newState:           opts.NewState,
+					restoredCheckpoint: restoredID,
+				}
+				if payload, ok := restored[id.checkpointKey()]; ok {
+					cfg.restore, cfg.restored = payload, true
+				}
+				if err := runSubtask(runCtx, v, index, gates[id], outputs[id], cfg); err != nil {
 					errs <- err
 					cancel()
 				}
@@ -149,4 +223,67 @@ func wire(g *graph.Graph, order []graph.Vertex) (map[subtaskID][]transport.Input
 		}
 	}
 	return inputs, outputs
+}
+
+// buildMetadata describes the job in order for the checkpoint format.
+//
+// Vertices are sorted by ID rather than left in topological order. Both are
+// functions of the graph alone, so either would compare stably, but ID order is
+// the one a reader can check against a graph definition without running Kahn's
+// algorithm in their head -- and this slice is what a mismatch error is
+// reported against.
+//
+// Count comes from the source itself, through the same splittableSource
+// assertion the source runner makes, so the number recorded is the number the
+// range arithmetic will use. A vertex that is not a countable source records
+// zero.
+func buildMetadata(order []graph.Vertex, seed uint64) checkpoint.Metadata {
+	meta := checkpoint.Metadata{Seed: seed}
+	for _, v := range order {
+		vm := checkpoint.VertexMeta{ID: v.ID, Parallelism: v.Parallelism}
+		if v.Kind == graph.VertexSource && v.NewSource != nil {
+			// One instance, made and discarded, purely to ask its length. It is
+			// never opened, so it holds nothing to release.
+			if s, ok := v.NewSource().(splittableSource); ok {
+				vm.Count = s.Count()
+			}
+		}
+		meta.Vertices = append(meta.Vertices, vm)
+	}
+	slices.SortFunc(meta.Vertices, func(a, b checkpoint.VertexMeta) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return meta
+}
+
+// loadRestorePoint reads the checkpoint a run is resuming from, if it is
+// resuming from one.
+//
+// It validates the recorded shape of the job against the shape about to run,
+// and refuses a mismatch. That refusal is the Phase 1 constraint coming due: a
+// source subtask's range is derived from (Count, parallelism, index) and only
+// its resume OFFSET is checkpointed, so at a different shape subtask 1 resumes
+// from an offset inside somebody else's range. The job reads a perfectly valid
+// stream that is not the one it was checkpointed on, and produces a wrong
+// answer with nothing to point at. It is never adapted to.
+func loadRestorePoint(root string, meta checkpoint.Metadata) (map[checkpoint.SubtaskKey][]byte, int64, error) {
+	if root == "" {
+		return nil, 0, nil
+	}
+	storage := checkpoint.NewStorage(root)
+	id, ok, err := storage.Latest()
+	if err != nil {
+		return nil, 0, err
+	}
+	if !ok {
+		return nil, 0, fmt.Errorf("%w under %s", errNoRestorePoint, root)
+	}
+	recorded, payloads, err := storage.Load(id)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := recorded.CheckAgainst(meta); err != nil {
+		return nil, 0, fmt.Errorf("restoring checkpoint %d from %s: %w", id, root, err)
+	}
+	return payloads, id, nil
 }

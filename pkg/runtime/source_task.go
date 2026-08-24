@@ -73,6 +73,16 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 // when the source reports it has no more elements, or on the first error from
 // the source, from any emitter, or from ctx.
 //
+// emitBarrier is handed the source's POSITION at the moment of injection,
+// alongside the barrier. That position is the offset the next Next would
+// return, so it is the resume offset for this checkpoint: every element below
+// it belongs to the checkpoint being closed and every element from it onwards
+// belongs to the next one. It is read here, between the injection decision and
+// the emit, and not by the caller afterwards. A caller reading it later reads
+// it after whatever has happened in between, and "whatever has happened in
+// between" is nothing today and is a replayed or a skipped record the first
+// time it is not.
+//
 // The record goes out before the watermark derived from it. Either order is
 // safe, since a watermark of maxSeen-lag-1 does not bound the record that
 // produced it, but records-then-watermark is the one that reads as what it is:
@@ -92,12 +102,17 @@ func sourceRange(count int64, parallelism, index int) (start, end int64) {
 //
 // The source must already be open: Open validates configuration, and a source
 // that failed validation must not be seeked.
-func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, barrierIntervalElements int64, emitRecord func(*core.Record) error, emitWatermark func(int64) error, emitBarrier func(*core.Barrier) error) error {
-	end, bounded, count, err := seekToRange(src, parallelism, index)
+func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm watermarkGenerator, barrierIntervalElements int64, resume *sourceResume, emitRecord func(*core.Record) error, emitWatermark func(int64) error, emitBarrier func(b *core.Barrier, position int64) error) error {
+	start, end, bounded, count, err := seekToRange(src, parallelism, index)
 	if err != nil {
 		return err
 	}
 	br := newBarrierGenerator(barrierIntervalElements, maxBarriers(count, parallelism, barrierIntervalElements, bounded))
+	if resume != nil {
+		if err := resume.apply(src, &br, start, end, bounded); err != nil {
+			return err
+		}
+	}
 
 	for {
 		// Checked every element so that a subtask whose consumer is keeping up,
@@ -129,7 +144,9 @@ func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm
 		// one. Nothing depends on the value, but "the last watermark this
 		// subtask emitted" has to mean one thing rather than two.
 		if id, ok := br.onRecord(); ok {
-			if err := emitBarrier(&core.Barrier{CheckpointID: id, Timestamp: wm.lastEmitted}); err != nil {
+			// Captured at the injection point. See the note on this function.
+			position := src.Position()
+			if err := emitBarrier(&core.Barrier{CheckpointID: id, Timestamp: wm.lastEmitted}, position); err != nil {
 				return err
 			}
 		}
@@ -144,20 +161,61 @@ func sourceLoop(ctx context.Context, src core.Source, parallelism, index int, wm
 // above parallelism 1 there is no safe reading of the request and it is an
 // error rather than a silent read of the whole input by every subtask, which
 // would duplicate every record P times.
-func seekToRange(src core.Source, parallelism, index int) (end int64, bounded bool, count int64, err error) {
+func seekToRange(src core.Source, parallelism, index int) (start, end int64, bounded bool, count int64, err error) {
 	s, ok := src.(splittableSource)
 	if !ok {
 		if parallelism > 1 {
-			return 0, false, 0, fmt.Errorf("source does not report a Count and cannot be split across %d subtasks", parallelism)
+			return 0, 0, false, 0, fmt.Errorf("source does not report a Count and cannot be split across %d subtasks", parallelism)
 		}
-		return 0, false, 0, nil
+		return 0, 0, false, 0, nil
 	}
 	count = s.Count()
-	start, end := sourceRange(count, parallelism, index)
+	start, end = sourceRange(count, parallelism, index)
 	if err := src.SeekTo(start); err != nil {
-		return 0, false, 0, err
+		return 0, 0, false, 0, err
 	}
-	return end, true, count, nil
+	return start, end, true, count, nil
+}
+
+// sourceResume is where a restored source subtask picks up.
+//
+// The whole of a source subtask's recovery state is one offset, which is what
+// contiguous ranges bought in Phase 1; barriersInjected is not stored anywhere
+// on disk but derived from the checkpoint ID, because a subtask injects
+// barrier k as its k-th barrier and IDs are contiguous from 1 within a subtask.
+// That identity is invariant 3 read from the other end: injection at a fixed
+// element interval is what makes the k-th barrier and checkpoint k the same
+// thing.
+type sourceResume struct {
+	position         int64
+	barriersInjected int64
+}
+
+// apply seeks src to the resume offset and restores the barrier count.
+//
+// The offset is checked against the subtask's own range. It must be inside it:
+// an offset from another subtask's range would have this subtask read records
+// that belong to a sibling, so the two would duplicate each other's work and
+// leave a hole where this one should have been. The metadata check on restore
+// is what normally prevents that, and this is the assertion that the two
+// mechanisms agree rather than an alternative to it. The end of the range is
+// allowed, and means the subtask had finished when the checkpoint was taken.
+func (r *sourceResume) apply(src core.Source, br *barrierGenerator, start, end int64, bounded bool) error {
+	if bounded && (r.position < start || r.position > end) {
+		return fmt.Errorf("restored position %d is outside this subtask's range [%d, %d)", r.position, start, end)
+	}
+	if r.position < 0 {
+		return fmt.Errorf("restored position %d is negative", r.position)
+	}
+	if err := src.SeekTo(r.position); err != nil {
+		return err
+	}
+	// Continue the numbering rather than restarting it. A resumed run emitting
+	// a second barrier 1 at a different logical position would hand the
+	// coordinator two different cuts under one name.
+	br.injected = r.barriersInjected
+	br.sinceLast = 0
+	return nil
 }
 
 // unboundedBarriers is the barrier budget of a source that reports no Count.

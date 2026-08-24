@@ -175,7 +175,7 @@ func TestSourceLoopRangesDoNotOverlap(t *testing.T) {
 // duplicate every record P times and report nothing, so the request is refused.
 func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// countlessSource has no Count method, so it is not splittable.
-	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, noWatermarks(), noBarriers(),
+	err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 2, 0, noWatermarks(), noBarriers(), nil,
 		func(*core.Record) error { return nil }, unexpectedWatermark(t), unexpectedBarrier(t))
 	if err == nil {
 		t.Fatal("sourceLoop split a source that does not report a Count")
@@ -184,7 +184,7 @@ func TestSourceLoopRejectsAnUnsplittableSourceAtParallelism(t *testing.T) {
 	// At parallelism 1 there is nothing to divide, so the same source is read
 	// to exhaustion.
 	var seen int
-	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
+	if err := sourceLoop(context.Background(), &countlessSource{limit: 10}, 1, 0, noWatermarks(), noBarriers(), nil, func(*core.Record) error {
 		seen++
 		return nil
 	}, unexpectedWatermark(t), unexpectedBarrier(t)); err != nil {
@@ -203,7 +203,7 @@ func TestSourceLoopStopsOnContextCancellation(t *testing.T) {
 	if err := src.Open(nil); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	err := sourceLoop(ctx, src, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
+	err := sourceLoop(ctx, src, 1, 0, noWatermarks(), noBarriers(), nil, func(*core.Record) error {
 		t.Error("sourceLoop emitted a record against a cancelled context")
 		return nil
 	}, unexpectedWatermark(t), unexpectedBarrier(t))
@@ -220,7 +220,7 @@ func TestSourceLoopReturnsTheEmitError(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	var seen int
-	err := sourceLoop(context.Background(), src, 1, 0, noWatermarks(), noBarriers(), func(*core.Record) error {
+	err := sourceLoop(context.Background(), src, 1, 0, noWatermarks(), noBarriers(), nil, func(*core.Record) error {
 		seen++
 		if seen == 3 {
 			return errEmit
@@ -270,7 +270,7 @@ func readSubtaskRange(t *testing.T, cfg sources.GeneratorConfig, parallelism, in
 	}()
 
 	var out []*core.Record
-	err := sourceLoop(context.Background(), src, parallelism, index, noWatermarks(), noBarriers(), func(rec *core.Record) error {
+	err := sourceLoop(context.Background(), src, parallelism, index, noWatermarks(), noBarriers(), nil, func(rec *core.Record) error {
 		out = append(out, rec)
 		return nil
 	}, unexpectedWatermark(t), unexpectedBarrier(t))
@@ -636,8 +636,8 @@ func unexpectedWatermark(t *testing.T) func(int64) error {
 func noBarriers() int64 { return 0 }
 
 // unexpectedBarrier is the matching emitter.
-func unexpectedBarrier(t *testing.T) func(*core.Barrier) error {
-	return func(b *core.Barrier) error {
+func unexpectedBarrier(t *testing.T) func(*core.Barrier, int64) error {
+	return func(b *core.Barrier, position int64) error {
 		t.Helper()
 		t.Errorf("a source with barrier injection disabled injected checkpoint %d", b.CheckpointID)
 		return nil
@@ -659,6 +659,9 @@ type element struct {
 	// barrier fields, meaningful only when kind is KindBarrier.
 	checkpointID int64
 	timestamp    int64
+	// position is the source's offset at the moment the barrier was injected,
+	// which is the offset a recovery from this checkpoint resumes from.
+	position int64
 }
 
 func (e element) isRecord() bool    { return e.kind == core.KindRecord }
@@ -680,7 +683,7 @@ func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermar
 	}()
 
 	var out []element
-	err := sourceLoop(context.Background(), src, parallelism, index, wm, barrierInterval,
+	err := sourceLoop(context.Background(), src, parallelism, index, wm, barrierInterval, nil,
 		func(rec *core.Record) error {
 			out = append(out, element{kind: core.KindRecord, eventTime: rec.EventTime})
 			return nil
@@ -689,8 +692,8 @@ func runSourceSubtaskLoop(t *testing.T, cfg sources.GeneratorConfig, wm watermar
 			out = append(out, element{kind: core.KindWatermark, eventTime: t})
 			return nil
 		},
-		func(b *core.Barrier) error {
-			out = append(out, element{kind: core.KindBarrier, checkpointID: b.CheckpointID, timestamp: b.Timestamp})
+		func(b *core.Barrier, position int64) error {
+			out = append(out, element{kind: core.KindBarrier, checkpointID: b.CheckpointID, timestamp: b.Timestamp, position: position})
 			return nil
 		})
 	if err != nil {
@@ -760,7 +763,7 @@ func TestSourceLoopReturnsTheWatermarkEmitError(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	var records int
-	err := sourceLoop(context.Background(), src, 1, 0, newWatermarkGenerator(10, 0), noBarriers(),
+	err := sourceLoop(context.Background(), src, 1, 0, newWatermarkGenerator(10, 0), noBarriers(), nil,
 		func(*core.Record) error {
 			records++
 			return nil
@@ -1223,7 +1226,7 @@ func TestSourceSubtaskBroadcastsBarriersToEveryChannel(t *testing.T) {
 		}
 	}
 
-	if err := runSubtask(context.Background(), v, 0, nil, groups); err != nil {
+	if err := runSubtask(context.Background(), v, 0, nil, groups, subtaskConfig{}); err != nil {
 		t.Fatalf("runSubtask: %v", err)
 	}
 	wg.Wait()

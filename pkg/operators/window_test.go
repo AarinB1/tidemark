@@ -842,7 +842,10 @@ func TestWindowStateLayout(t *testing.T) {
 
 	st := h.ctx.State()
 	for _, w := range want {
-		var stateKey []byte
+		// Built here from the layout rather than by calling appendStateKey, so
+		// that the test states what the bytes are instead of agreeing with the
+		// code that writes them. The discriminator leads.
+		stateKey := []byte{state.PrefixUserState}
 		stateKey = append(stateKey, w.key...)
 		var startBytes [8]byte
 		binary.BigEndian.PutUint64(startBytes[:], uint64(w.start))
@@ -888,7 +891,7 @@ func TestWindowStateGroupsAKeysWindowsTogether(t *testing.T) {
 
 	var order []string
 	h.ctx.State().Iterate(func(k, v []byte) bool {
-		order = append(order, string(k[:len(k)-8]))
+		order = append(order, string(k[1:len(k)-8]))
 		return true
 	})
 	if len(order) != 12 {
@@ -950,8 +953,11 @@ func TestWindowStartOfRoundTripsThroughTheCompositeKey(t *testing.T) {
 	for _, key := range keys {
 		for _, start := range starts {
 			composite := appendStateKey(nil, key, start)
-			if got, want := len(composite), len(key)+8; got != want {
+			if got, want := len(composite), 1+len(key)+8; got != want {
 				t.Fatalf("composite key for (%q, %d) is %d bytes, want %d", key, start, got, want)
+			}
+			if composite[0] != state.PrefixUserState {
+				t.Fatalf("composite key for (%q, %d) leads with %#x, want the user-state prefix %#x", key, start, composite[0], state.PrefixUserState)
 			}
 			got, err := windowStartOf(composite)
 			if err != nil {
@@ -960,17 +966,86 @@ func TestWindowStartOfRoundTripsThroughTheCompositeKey(t *testing.T) {
 			if got != start {
 				t.Errorf("windowStartOf for (%q, %d) = %d", key, start, got)
 			}
-			if k := string(composite[:len(composite)-8]); k != key {
+			if k := string(composite[1 : len(composite)-8]); k != key {
 				t.Errorf("the key half of the composite for (%q, %d) is %q", key, start, k)
 			}
 		}
 	}
 
-	// Anything shorter than the window start is reported rather than read past
-	// the front of the slice.
-	for _, short := range [][]byte{nil, {1}, make([]byte, 7)} {
+	// Anything too short to carry both the discriminator and the window start
+	// is reported rather than read past the front of the slice. Eight bytes is
+	// in the list because it was long enough before the prefix existed: a
+	// length check left at the old width would read the discriminator as part
+	// of the start and return a number that looks like a window.
+	for _, short := range [][]byte{nil, {1}, make([]byte, 7), make([]byte, 8)} {
 		if _, err := windowStartOf(short); !errors.Is(err, errStateKeyTooShort) {
 			t.Errorf("windowStartOf(%d bytes) = %v, want %v", len(short), err, errStateKeyTooShort)
 		}
+	}
+}
+
+// TestWindowStateKeysAreConfinedToTheUserStatePartition pins the property the
+// discriminator exists for: every key this operator writes is in the user-state
+// partition, and a partition is one contiguous run under sorted iteration.
+//
+// The second half is what makes the byte worth its cost. Phase 6 moves event-
+// time timers into the same key space behind state.PrefixTimer, and a scan
+// confined to one partition is only possible if that partition's keys sort
+// together. The foreign entry below stands in for that future timer: it is
+// written directly, never by this operator, and the assertion is that sorted
+// iteration reaches every aggregate before it and never interleaves the two.
+//
+// A trailing discriminator would pass the first half of this test and fail the
+// second, which is exactly the mistake it is written against.
+func TestWindowStateKeysAreConfinedToTheUserStatePartition(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	for _, eventTime := range []int64{0, 100, 200, -50} {
+		for _, key := range []string{"kb", "ka"} {
+			h.record(key, eventTime)
+		}
+	}
+
+	// Not written by the operator. It stands in for a Phase 6 timer sharing the
+	// subtask's one key space, and its key is chosen to sort BELOW every
+	// aggregate key on everything but the discriminator, so a layout that put
+	// the discriminator anywhere but first would sort it into the middle of
+	// them.
+	st := h.ctx.State()
+	st.Put([]byte{state.PrefixTimer, 0x00}, []byte("timer"))
+
+	var prefixes []byte
+	userStateEntries := 0
+	st.Iterate(func(k, v []byte) bool {
+		if len(k) == 0 {
+			t.Fatal("state holds a zero-length key, which carries no discriminator at all")
+		}
+		prefixes = append(prefixes, k[0])
+		if k[0] == state.PrefixUserState {
+			userStateEntries++
+		}
+		return true
+	})
+
+	// Eight aggregates, two keys over four windows, plus the foreign entry.
+	if userStateEntries != 8 {
+		t.Errorf("the operator wrote %d entries into the user-state partition, want 8", userStateEntries)
+	}
+	if len(prefixes) != 9 {
+		t.Fatalf("state holds %d entries, want 9", len(prefixes))
+	}
+
+	// One run of 0x00 then one run of 0x01, with no interleaving. Written as a
+	// scan for a descent rather than as a sort comparison, because a sorted
+	// check would pass on a state that alternated between two prefixes that
+	// happened to be in order within each pair.
+	for i := 1; i < len(prefixes); i++ {
+		if prefixes[i] < prefixes[i-1] {
+			t.Fatalf("sorted iteration visited prefix %#x after %#x at entry %d: the partitions interleave, so a scan cannot be confined to one",
+				prefixes[i], prefixes[i-1], i)
+		}
+	}
+	if prefixes[len(prefixes)-1] != state.PrefixTimer {
+		t.Errorf("the last entry visited carries prefix %#x, want the timer prefix %#x: the aggregates do not all sort before it",
+			prefixes[len(prefixes)-1], state.PrefixTimer)
 	}
 }

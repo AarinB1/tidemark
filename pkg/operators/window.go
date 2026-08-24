@@ -14,8 +14,19 @@ import (
 // State layout. Both halves are documented here because Phase 3b serialises
 // this state and the restore path has to read back exactly what was written.
 //
-//	key    the record's key bytes, then the window start as a big-endian int64
+//	key    state.PrefixUserState, then the record's key bytes, then the window
+//	       start as a big-endian int64
 //	value  the aggregate as a big-endian int64, eight bytes
+//
+// The leading byte is the key-space discriminator declared in pkg/state. This
+// operator's aggregates are user state, so every key it writes begins with
+// state.PrefixUserState. It is not decoration: a subtask has ONE key space, and
+// Phase 6 moves event-time timers into it behind state.PrefixTimer. Without a
+// discriminator a timer key and an aggregate key would be distinguishable only
+// by length and by luck, and the scan this operator already runs on every
+// watermark would read timers as aggregates. The byte is claimed now because
+// the snapshot format is written in this phase and repartitioning a key space
+// afterwards invalidates every checkpoint on disk.
 //
 // The window start goes AFTER the record key so that sorted iteration groups
 // one key's windows together: a scan for a key is a scan of a contiguous run,
@@ -45,6 +56,11 @@ import (
 // holding a Go string, so registering a timer still needs a string; that is
 // timers.go's to fix and not this file's.
 const windowStartBytes = 8
+
+// prefixBytes is the width of the key-space discriminator that leads every
+// composite key. Named rather than written as 1 at each use so that the length
+// check below and the split back out of a key cannot disagree about it.
+const prefixBytes = 1
 
 // errCountTooShort is returned by DecodeCount for a value that is not an
 // encoded count.
@@ -313,11 +329,14 @@ func (w *WindowCount) currentCount(stateKey []byte, start int64) (int64, error) 
 }
 
 // appendStateKey appends the composite state key for (key, windowStart) to dst
-// and returns it. See the layout at the top of this file.
+// and returns it. See the layout at the top of this file:
+//
+//	state.PrefixUserState || key || windowStart, big-endian int64
 //
 // It takes dst so the caller can reuse one buffer across records: KeyedState
 // copies what Put is given, so nothing retains the slice.
 func appendStateKey(dst []byte, key string, windowStart int64) []byte {
+	dst = append(dst, state.PrefixUserState)
 	dst = append(dst, key...)
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(windowStart))
@@ -325,8 +344,13 @@ func appendStateKey(dst []byte, key string, windowStart int64) []byte {
 }
 
 // windowStartOf reads the window start back out of a composite state key.
+//
+// The start is the last eight bytes whatever the discriminator is, so the read
+// itself does not change. The length check does: a key must now carry the
+// discriminator as well as the start, and a key one byte short would otherwise
+// be read as a start overlapping the prefix.
 func windowStartOf(stateKey []byte) (int64, error) {
-	if len(stateKey) < windowStartBytes {
+	if len(stateKey) < prefixBytes+windowStartBytes {
 		return 0, fmt.Errorf("%d bytes: %w", len(stateKey), errStateKeyTooShort)
 	}
 	return int64(binary.BigEndian.Uint64(stateKey[len(stateKey)-windowStartBytes:])), nil
@@ -395,8 +419,9 @@ func (w *WindowCount) isPurged(start int64) bool {
 // second timer per window, which would collide with the firing timer in a
 // service that deduplicates on (key, windowStart).
 //
-// KeyedState.Iterate permits the callback to delete the entry it is handed,
-// which is what this does. Nothing here depends on the order the scan runs in;
+// KeyedState.Iterate permits the callback to delete the entry it is handed, and
+// only that entry, which is what this does. Deleting a different one is
+// undefined across backends; see the note on the interface. Nothing here depends on the order the scan runs in;
 // the order is sorted anyway, because Phase 3b's snapshots need it to be.
 func (w *WindowCount) purge() error {
 	var err error
