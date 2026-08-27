@@ -6,61 +6,119 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 
 	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/state"
 )
 
-// State layout. Both halves are documented here because Phase 3b serialises
-// this state and the restore path has to read back exactly what was written.
+// State layout. Both partitions are documented here because pkg/checkpoint
+// serialises this state and the restore path has to read back exactly what was
+// written.
+//
+// Aggregates, under state.PrefixUserState:
 //
 //	key    state.PrefixUserState, then the record's key bytes, then the window
 //	       start as a big-endian int64
 //	value  the aggregate as a big-endian int64, eight bytes
 //
-// The leading byte is the key-space discriminator declared in pkg/state. This
-// operator's aggregates are user state, so every key it writes begins with
-// state.PrefixUserState. It is not decoration: a subtask has ONE key space, and
-// Phase 6 moves event-time timers into it behind state.PrefixTimer. Without a
-// discriminator a timer key and an aggregate key would be distinguishable only
-// by length and by luck, and the scan this operator already runs on every
-// watermark would read timers as aggregates. The byte is claimed now because
-// the snapshot format is written in this phase and repartitioning a key space
-// afterwards invalidates every checkpoint on disk.
+// Timers, under state.PrefixTimer:
+//
+//	key    state.PrefixTimer, then the fire time as state.EncodeOrderedInt64,
+//	       then the record's key bytes, then the window start as a big-endian
+//	       int64
+//	value  empty
+//
+// The leading byte is the key-space discriminator declared in pkg/state. A
+// subtask has ONE key space and this operator now writes both partitions of it,
+// so without a discriminator a timer key and an aggregate key would be
+// distinguishable only by length and by luck, and the purge scan would read
+// timers as aggregates.
+//
+// # Why the timers are here at all
+//
+// They are state. An operator whose timers live in a Go field gets its
+// aggregates back on restore with no timer to fire them, so a (key, window)
+// whose records all arrived before the checkpoint is silently never emitted --
+// no error, no missing key, just a window that is not in the sink. Putting them
+// in KeyedState makes the existing snapshot of the key space a snapshot of them
+// too, and costs nothing else: nothing in pkg/checkpoint or pkg/runtime changes.
+//
+// # Why fireTime leads
+//
+// Sorted iteration is part of the KeyedState contract, so ordering the key by
+// fire time makes sorted iteration of the timer partition FIRE-TIME ORDER.
+// Firing is then a scan that stops at the first fire time greater than the
+// watermark, which costs what the timers that fire cost rather than what the
+// timers that are pending cost. That is the whole reason for this ordering, and
+// it is the reason a heap is no longer needed.
+//
+// The fire time is written with state.EncodeOrderedInt64 and not big-endian,
+// because a negative fire time in two's complement has its top bit set and
+// plain big-endian would sort it above every positive one: the window would
+// fire only at the MaxInt64 flush at end of input, with the right count and at
+// the wrong time. Negative event times are supported input; floorMod exists for
+// them.
+//
+// # Deterministic tie-breaking
+//
+// Timers with equal fire times are ordered by the bytes that follow the fire
+// time, which is the record key and then the window start. That used to be an
+// explicit three-field comparator on a heap and is now an emergent property of
+// the layout, which is worth stating because it is no longer visible as code:
+// nothing sorts, and the order comes out of KeyedState.Iterate.
+//
+// It is a TOTAL order either way, which is what firing determinism needs.
+// Records reach an operator in whatever order the shuffle produced, so a
+// firing order that depended on arrival would make every downstream comparison
+// flaky for a reason that reads like a concurrency bug.
+//
+// # Parsing, which is the part someone later gets wrong
+//
+// A timer key is a variable-length field between two fixed ones, so the split
+// is stated once and used everywhere: the FIRST nine bytes are the
+// discriminator and the fire time, the LAST eight are the window start, and
+// everything between them is the record key. There is no separator and none is
+// needed -- the two fixed fields are read from the ends, so the middle is
+// whatever is left. See appendTimerKey and parseTimerKey, which are next to
+// each other for that reason.
+//
+// The mapping is injective: two timer keys of the same length split at the same
+// places, so equal bytes mean an equal (fireTime, key, windowStart). That is
+// what makes Put idempotent and is why there is no longer a dedupe map --
+// registering a window's timer on every record writes the same key every time,
+// and the fire time is a function of the window start and the size, so the
+// triple is one-to-one with the (key, windowStart) pair the map used to hold.
+//
+// # Aggregate layout notes, unchanged
 //
 // The window start goes AFTER the record key so that sorted iteration groups
-// one key's windows together: a scan for a key is a scan of a contiguous run,
-// which is what the Pebble backend in Phase 3b wants and what Memory's sorted
-// Iterate already gives. It is fixed-width, so the split back into (key, start)
-// is the last eight bytes and everything before them, with no separator and no
-// ambiguity: two composite keys can only be equal if they are the same length,
-// hence the same key length, hence the same key and the same start.
+// one key's windows together: a scan for a key is a scan of a contiguous run.
+// It is fixed-width, so the split back into (key, start) is the last eight
+// bytes and everything before them, with no separator and no ambiguity.
 //
-// Big-endian for the same reason the generator's keys are: byte order and
-// numeric order agree over non-negative values, so a window start sorts where
-// it compares. They part company below zero, since a negative int64 has its top
-// bit set and sorts above every positive one. That costs nothing here, because
-// the grouping this layout is for is by KEY and the run for one key stays
-// contiguous whatever order its window starts fall in.
+// Big-endian there rather than the ordered encoding, and that is not an
+// inconsistency: the aggregate partition is grouped BY KEY and only needs one
+// key's run to be contiguous, which any total order on the start gives. The
+// timer partition is ordered BY the number, which is the stronger requirement
+// that state.EncodeOrderedInt64 exists for.
 //
-// One caveat, recorded because it is invisible until it bites: the grouping
-// holds only while no record key is a prefix of another. Every key in this
-// engine is the generator's fixed eight bytes, so it holds. A variable-length
-// key would interleave two keys' runs and would need a length prefix.
-//
-// The windowKey struct that used to key an in-memory map is gone with it, and
-// so is the per-record string conversion its Phase 2 comment flagged as this
-// operator's hottest allocation: KeyedState takes bytes, so the composite key
-// is appended into one reused buffer and never converted. One conversion per
-// record remains and it is NOT this one. timerService deduplicates on a struct
-// holding a Go string, so registering a timer still needs a string; that is
-// timers.go's to fix and not this file's.
+// One caveat for both partitions, recorded because it is invisible until it
+// bites: the grouping holds only while no record key is a prefix of another.
+// Every key in this engine is the generator's fixed eight bytes, so it holds. A
+// variable-length key would interleave two keys' runs -- the split above stays
+// unambiguous, but the ORDER would no longer be (key, windowStart) -- and would
+// need a length prefix.
 const windowStartBytes = 8
 
 // prefixBytes is the width of the key-space discriminator that leads every
 // composite key. Named rather than written as 1 at each use so that the length
-// check below and the split back out of a key cannot disagree about it.
+// checks and the splits back out of a key cannot disagree about it.
 const prefixBytes = 1
+
+// timerKeyMinBytes is the width of a timer key carrying an EMPTY record key: a
+// discriminator, a fire time and a window start. Anything shorter cannot be one.
+const timerKeyMinBytes = prefixBytes + state.OrderedInt64Bytes + windowStartBytes
 
 // errCountTooShort is returned by DecodeCount for a value that is not an
 // encoded count.
@@ -70,6 +128,11 @@ var errCountTooShort = errors.New("value is shorter than an encoded count")
 // window start. Only this operator writes to its own state, so it means the
 // layout above and the code below have come apart.
 var errStateKeyTooShort = errors.New("state key is shorter than an encoded window start")
+
+// errTimerKeyTooShort is returned when the timer partition holds a key too
+// short to carry a fire time and a window start. Same reasoning: only this
+// operator writes there.
+var errTimerKeyTooShort = errors.New("timer key is shorter than a fire time and a window start")
 
 // WindowCount counts the records in each (key, window).
 //
@@ -111,15 +174,15 @@ type WindowCount struct {
 	slide           int64
 	allowedLateness int64
 
-	// state holds one entry per open (key, window); see the layout above. It is
-	// handed over by Open rather than made here, so the runtime decides which
-	// backend the job runs on.
+	// state holds one entry per open (key, window) and one per pending timer;
+	// see the layout above. It is handed over by Open rather than made here, so
+	// the runtime decides which backend the job runs on, and it is the ONLY
+	// place this operator keeps anything a restore would need.
 	state   state.KeyedState
-	timers  *timerService
 	scratch []int64
-	// keyBuf is the composite key under construction, reused across records so
-	// that assignment does not allocate. KeyedState.Put copies what it is
-	// given, which is what makes reusing it safe.
+	// keyBuf is the composite key under construction, reused across records and
+	// across both partitions so that assignment does not allocate. KeyedState
+	// copies what Put is given, which is what makes reusing it safe.
 	keyBuf []byte
 
 	// watermark is the last one delivered. It decides what has been purged and
@@ -164,7 +227,6 @@ func NewSlidingCount(size, slide, allowedLateness int64) *WindowCount {
 		size:            size,
 		slide:           slide,
 		allowedLateness: allowedLateness,
-		timers:          newTimerService(),
 		// No watermark has been delivered, so nothing is complete and nothing
 		// has been purged. Starting at zero would claim every window before
 		// 1970 was already gone.
@@ -253,8 +315,9 @@ func addCeil(a, b int64) int64 {
 //
 // The largest window start at or below eventTime is the one aligned to slide;
 // the rest are that one stepped back by slide, size/slide times in total. The
-// order is descending and does not matter: the map decides where a count
-// accumulates and the timer heap decides the order windows fire in.
+// order is descending and does not matter: the composite key decides where a
+// count accumulates and the timer partition's sort order decides the order
+// windows fire in.
 //
 // Starts that would fall below MinInt64 are clamped rather than wrapped; the
 // loop stops when a further step cannot go lower, so a sliding assignment
@@ -276,24 +339,27 @@ func (w *WindowCount) windowsFor(dst []int64, eventTime int64) []int64 {
 	return dst
 }
 
+// fireTimeOf returns the watermark at which the window starting at start is
+// complete, which is its end-1, saturating.
+func (w *WindowCount) fireTimeOf(start int64) int64 { return addCeil(start, w.size-1) }
+
 // ProcessElement adds rec to every window it belongs to and arms each of them.
 //
 // A window whose state has been purged is past saving, so the assignment is
 // dropped and counted. The condition is the same expression purge uses, which
 // is what keeps a dropped record from silently resurrecting a window that has
 // already been reported and forgotten.
+//
+// No allocation per record and no string conversion: both composite keys are
+// appended into one reused buffer, and rec.Key is handed straight to it.
 func (w *WindowCount) ProcessElement(rec *core.Record, ctx core.Context) error {
-	// One conversion per record, and it is the timer service's: timerKey holds
-	// a Go string. Reused for the composite state key below, which takes a
-	// string only so that this is the sole conversion rather than a second one.
-	key := string(rec.Key)
 	w.scratch = w.windowsFor(w.scratch, rec.EventTime)
 	for _, start := range w.scratch {
 		if w.isPurged(start) {
 			w.dropped++
 			continue
 		}
-		w.keyBuf = appendStateKey(w.keyBuf[:0], key, start)
+		w.keyBuf = appendStateKey(w.keyBuf[:0], rec.Key, start)
 		count, err := w.currentCount(w.keyBuf, start)
 		if err != nil {
 			return err
@@ -301,10 +367,15 @@ func (w *WindowCount) ProcessElement(rec *core.Record, ctx core.Context) error {
 		var value [8]byte
 		binary.BigEndian.PutUint64(value[:], uint64(count+1))
 		w.state.Put(w.keyBuf, value[:])
-		// Registered on every record, deduplicated by the timer service. A
-		// window that has already fired was deregistered when it did, so this
-		// re-arms it and the updated count goes out on the next watermark.
-		w.timers.Register(addCeil(start, w.size-1), key, start)
+
+		// Armed on every record. Writing the same composite key again is
+		// idempotent, which is what replaced the dedupe map: the key is a
+		// function of (fireTime, rec.Key, start) and the fire time is itself a
+		// function of start and the size. A window that has already fired had
+		// its timer deleted when it did, so this re-arms it and the updated
+		// count goes out on the next watermark.
+		w.keyBuf = appendTimerKey(w.keyBuf[:0], w.fireTimeOf(start), rec.Key, start)
+		w.state.Put(w.keyBuf, nil)
 	}
 	return nil
 }
@@ -328,32 +399,82 @@ func (w *WindowCount) currentCount(stateKey []byte, start int64) (int64, error) 
 	return count, nil
 }
 
-// appendStateKey appends the composite state key for (key, windowStart) to dst
-// and returns it. See the layout at the top of this file:
+// appendStateKey appends the composite AGGREGATE key for (key, windowStart) to
+// dst and returns it. See the layout at the top of this file:
 //
 //	state.PrefixUserState || key || windowStart, big-endian int64
 //
 // It takes dst so the caller can reuse one buffer across records: KeyedState
 // copies what Put is given, so nothing retains the slice.
-func appendStateKey(dst []byte, key string, windowStart int64) []byte {
+func appendStateKey(dst []byte, key []byte, windowStart int64) []byte {
 	dst = append(dst, state.PrefixUserState)
 	dst = append(dst, key...)
-	var buf [8]byte
+	var buf [windowStartBytes]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(windowStart))
 	return append(dst, buf[:]...)
 }
 
-// windowStartOf reads the window start back out of a composite state key.
+// windowStartOf reads the window start back out of a composite AGGREGATE key.
 //
-// The start is the last eight bytes whatever the discriminator is, so the read
-// itself does not change. The length check does: a key must now carry the
-// discriminator as well as the start, and a key one byte short would otherwise
-// be read as a start overlapping the prefix.
+// The start is the last eight bytes whatever the discriminator is, so a timer
+// key would also give up its window start here; every caller is inside the
+// user-state partition and the timer path uses parseTimerKey, which returns the
+// record key as well.
 func windowStartOf(stateKey []byte) (int64, error) {
 	if len(stateKey) < prefixBytes+windowStartBytes {
 		return 0, fmt.Errorf("%d bytes: %w", len(stateKey), errStateKeyTooShort)
 	}
 	return int64(binary.BigEndian.Uint64(stateKey[len(stateKey)-windowStartBytes:])), nil
+}
+
+// appendTimerKey appends the composite TIMER key to dst and returns it. See the
+// layout at the top of this file:
+//
+//	state.PrefixTimer || fireTime, state.EncodeOrderedInt64 || key ||
+//	windowStart, big-endian int64
+//
+// The record key sits BETWEEN two fixed-width fields and carries no length of
+// its own; parseTimerKey is directly below and reads the fixed fields off both
+// ends. Change one and the other stops being its inverse, which is why they are
+// adjacent.
+func appendTimerKey(dst []byte, fireTime int64, key []byte, windowStart int64) []byte {
+	dst = append(dst, state.PrefixTimer)
+	fire := state.EncodeOrderedInt64(fireTime)
+	dst = append(dst, fire[:]...)
+	dst = append(dst, key...)
+	var buf [windowStartBytes]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(windowStart))
+	return append(dst, buf[:]...)
+}
+
+// parseTimerKey splits a timer key back into its three fields. It is the
+// inverse of appendTimerKey directly above.
+//
+// The returned record key ALIASES timerKey; a caller that keeps it past the
+// life of the key it came from has to copy it. See collectDueTimers, which
+// copies the whole key once and then aliases into that copy.
+func parseTimerKey(timerKey []byte) (fireTime int64, key []byte, windowStart int64, err error) {
+	if len(timerKey) < timerKeyMinBytes {
+		return 0, nil, 0, fmt.Errorf("%d bytes: %w", len(timerKey), errTimerKeyTooShort)
+	}
+	// The first nine bytes are the discriminator and the fire time; the last
+	// eight are the window start; the record key is whatever is between them,
+	// which for an empty key is nothing at all.
+	fireTime = state.DecodeOrderedInt64(timerKey[prefixBytes:])
+	key = timerKey[prefixBytes+state.OrderedInt64Bytes : len(timerKey)-windowStartBytes]
+	windowStart = int64(binary.BigEndian.Uint64(timerKey[len(timerKey)-windowStartBytes:]))
+	return fireTime, key, windowStart, nil
+}
+
+// dueTimer is one timer the scan found, held until the scan has ended.
+type dueTimer struct {
+	// stateKey is a COPY of the key the scan was handed. KeyedState hands out a
+	// key that is valid only for the duration of the callback, and this one
+	// outlives it: it is what Delete is called with after the scan.
+	stateKey []byte
+	// key aliases stateKey, so it lives exactly as long.
+	key         []byte
+	windowStart int64
 }
 
 // ProcessWatermark fires every window the watermark completes, then purges the
@@ -370,25 +491,97 @@ func windowStartOf(stateKey []byte) (int64, error) {
 // the records closing it arrived. They are all in-band, which is invariant 5,
 // but in-band only guarantees ORDER is preserved, not that the order was right
 // to begin with.
+//
+// # Collect, then fire
+//
+// The due timers are collected by a scan that then ENDS, and only after it has
+// ended are they fired and deleted. Firing must not happen inside the scan, and
+// this is not tidiness: fire reads and the re-arm in ProcessElement writes keys
+// OTHER than the one the callback was handed, and KeyedState.Iterate leaves
+// that undefined precisely because the two backends disagree. Memory looks each
+// key up again as it reaches it, so a key written mid-scan may or may not be
+// visited; Pebble's iterator reads a view fixed when the scan began and would
+// not see it at all. The divergence would appear only on a re-fire, which is
+// the rarest path in this operator and the one nothing would think to check.
 func (w *WindowCount) ProcessWatermark(wm int64, ctx core.Context) error {
 	w.watermark = wm
-	if err := w.timers.Advance(wm, func(key string, start int64) error {
-		return w.fire(key, start, ctx)
-	}); err != nil {
+	due, err := w.collectDueTimers(wm)
+	if err != nil {
 		return err
+	}
+	for _, t := range due {
+		// Deleted BEFORE firing, so that a fire which re-arms the same window
+		// leaves a timer behind rather than having it removed underneath. That
+		// is the same order the heap had: pop, then fire.
+		w.state.Delete(t.stateKey)
+		if err := w.fire(t.key, t.windowStart, ctx); err != nil {
+			return err
+		}
 	}
 	return w.purge()
 }
 
+// collectDueTimers returns every timer whose fire time is at or before wm, in
+// fire-time order.
+//
+// The scan walks the key space in ascending byte order, which puts the whole
+// user-state partition first and then the timer partition in fire-time order.
+// It skips the aggregates, and STOPS at the first timer that is not due: every
+// timer after that one has a fire time at least as large, so the cost is what
+// the firing timers cost and not what the pending ones cost. That is what the
+// fire time leading the key buys, and it is what replaced the heap.
+func (w *WindowCount) collectDueTimers(wm int64) ([]dueTimer, error) {
+	var due []dueTimer
+	var scanErr error
+	w.state.Iterate(func(stateKey, value []byte) bool {
+		if len(stateKey) == 0 {
+			scanErr = errors.New("operators: WindowCount: state holds a zero-length key, which carries no discriminator")
+			return false
+		}
+		switch {
+		case stateKey[0] < state.PrefixTimer:
+			// An aggregate. The timer partition sorts after it.
+			return true
+		case stateKey[0] > state.PrefixTimer:
+			// Past the timer partition; nothing this operator writes lives here.
+			return false
+		}
+		// The key handed to a callback is valid only for that call, and this
+		// one outlives the scan -- Delete is called with it after the scan has
+		// ended -- so it is copied and then parsed, and the record key aliases
+		// the copy. Parsing the copy rather than the original is what keeps the
+		// offsets in parseTimerKey and nowhere else.
+		cloned := slices.Clone(stateKey)
+		fireTime, key, windowStart, err := parseTimerKey(cloned)
+		if err != nil {
+			scanErr = err
+			return false
+		}
+		if fireTime > wm {
+			return false
+		}
+		due = append(due, dueTimer{stateKey: cloned, key: key, windowStart: windowStart})
+		return true
+	})
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	return due, nil
+}
+
 // fire emits the current aggregate for one window.
-func (w *WindowCount) fire(key string, start int64, ctx core.Context) error {
+//
+// key aliases a copy made by collectDueTimers, which nothing reuses, so the
+// emitted record can hold it without a second copy: the copy is per firing
+// timer rather than per record.
+func (w *WindowCount) fire(key []byte, start int64, ctx core.Context) error {
 	w.keyBuf = appendStateKey(w.keyBuf[:0], key, start)
 	value, ok := w.state.Get(w.keyBuf)
 	if !ok {
-		// Unreachable: purge runs after Advance and only removes windows whose
-		// timers that same Advance has already fired. Reported rather than
-		// emitted as a zero, because a window count of zero is indistinguishable
-		// from a real answer once it reaches the sink.
+		// Unreachable: purge runs after the firing loop and only removes
+		// windows whose timers that same call has already fired. Reported
+		// rather than emitted as a zero, because a window count of zero is
+		// indistinguishable from a real answer once it reaches the sink.
 		return fmt.Errorf("window [%d, %d) for key %x fired with no state", start, start+w.size, key)
 	}
 	count, err := DecodeCount(value)
@@ -399,9 +592,9 @@ func (w *WindowCount) fire(key string, start int64, ctx core.Context) error {
 	// exactly the watermark that fired it. See the type comment for why the
 	// window start would make the whole output late downstream.
 	ctx.Emit(&core.Record{
-		Key:       []byte(key),
+		Key:       key,
 		Value:     encodeCount(count),
-		EventTime: addCeil(start, w.size-1),
+		EventTime: w.fireTimeOf(start),
 	})
 	return nil
 }
@@ -416,16 +609,33 @@ func (w *WindowCount) isPurged(start int64) bool {
 //
 // A scan of the open windows on every watermark. That is O(open windows) rather
 // than O(purged), and it is the obvious implementation: the alternative is a
-// second timer per window, which would collide with the firing timer in a
-// service that deduplicates on (key, windowStart).
+// second timer per window, which would double the timer partition to save a
+// scan the firing path is already paying for.
+//
+// It is confined to the user-state partition and STOPS at the first key outside
+// it, which the layout puts contiguously at the end. That confinement is not
+// decoration: a timer key also carries its window start in its last eight
+// bytes, so windowStartOf would happily read one and this scan would delete
+// timers it was never asked about. Nothing would error; windows would just stop
+// firing.
 //
 // KeyedState.Iterate permits the callback to delete the entry it is handed, and
 // only that entry, which is what this does. Deleting a different one is
-// undefined across backends; see the note on the interface. Nothing here depends on the order the scan runs in;
-// the order is sorted anyway, because Phase 3b's snapshots need it to be.
+// undefined across backends; see the note on the interface. Nothing here
+// depends on the order the scan runs in beyond the partitions being contiguous.
 func (w *WindowCount) purge() error {
 	var err error
 	w.state.Iterate(func(stateKey, value []byte) bool {
+		if len(stateKey) == 0 {
+			err = errors.New("operators: WindowCount: state holds a zero-length key, which carries no discriminator")
+			return false
+		}
+		if stateKey[0] != state.PrefixUserState {
+			// Past the aggregates. Timers are not purged here: a window that is
+			// purgeable fired earlier in this same call, and firing deleted its
+			// timer.
+			return false
+		}
 		start, decodeErr := windowStartOf(stateKey)
 		if decodeErr != nil {
 			err = decodeErr
@@ -453,16 +663,20 @@ func (w *WindowCount) OnEndOfStream(ctx core.Context) error { return nil }
 // Unlike Map and Filter this operator holds state that a recovery would need,
 // so a zero-byte snapshot is not a correct snapshot of nothing: it is a claim
 // that there is nothing to keep, and a run recovered from it would lose every
-// open window without any error to point at. Serialising window state and
-// pending timers is the state backend's job in Phase 3, and nothing calls
-// Snapshot before then.
+// open window without any error to point at.
+//
+// Nothing calls it. A subtask's checkpoint payload is what state.WriteTo wrote,
+// and every one of this operator's aggregates and timers is in the KeyedState
+// that writes, so there is nothing left for this method to serialise. It stays
+// a refusal rather than becoming a no-op so that a later phase which starts
+// routing snapshots through core.Operator.Snapshot has to come back here.
 func (w *WindowCount) Snapshot(out io.Writer) error {
-	return errors.New("operators: WindowCount cannot be snapshotted: window state arrives with the state backend in Phase 3")
+	return errors.New("operators: WindowCount cannot be snapshotted through core.Operator: its state is the subtask's KeyedState, which pkg/checkpoint serialises directly")
 }
 
 // Restore refuses for the same reason Snapshot does.
 func (w *WindowCount) Restore(r io.Reader) error {
-	return errors.New("operators: WindowCount cannot be restored: window state arrives with the state backend in Phase 3")
+	return errors.New("operators: WindowCount cannot be restored through core.Operator: its state is the subtask's KeyedState, which the runtime restores directly")
 }
 
 func (w *WindowCount) Close() error { return nil }
