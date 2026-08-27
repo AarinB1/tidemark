@@ -29,13 +29,21 @@ import (
 //	       int64
 //	value  empty
 //
+// The current watermark, under state.PrefixOperatorState:
+//
+//	key    state.PrefixOperatorState, then the name "watermark"
+//	value  the watermark as state.EncodeOrderedInt64
+//
+// One entry per subtask, not one per key. It is written where the watermark is
+// updated and read where it is used; see currentWatermark.
+//
 // The leading byte is the key-space discriminator declared in pkg/state. A
 // subtask has ONE key space and this operator now writes both partitions of it,
 // so without a discriminator a timer key and an aggregate key would be
 // distinguishable only by length and by luck, and the purge scan would read
 // timers as aggregates.
 //
-// # Why the timers are here at all
+// # Why the timers and the watermark are here at all
 //
 // They are state. An operator whose timers live in a Go field gets its
 // aggregates back on restore with no timer to fire them, so a (key, window)
@@ -43,6 +51,13 @@ import (
 // no error, no missing key, just a window that is not in the sink. Putting them
 // in KeyedState makes the existing snapshot of the key space a snapshot of them
 // too, and costs nothing else: nothing in pkg/checkpoint or pkg/runtime changes.
+//
+// The watermark is the same argument at one entry instead of many. In a Go
+// field it comes back as minWatermark, and until the restored sources produce a
+// watermark of their own the operator's idea of what has been purged is
+// "nothing", so it accepts records it should be dropping as late. At allowed
+// lateness 0 -- which is what the equivalence suite runs -- that is a real
+// divergence over a narrow window rather than a theoretical one.
 //
 // # Why fireTime leads
 //
@@ -181,14 +196,16 @@ type WindowCount struct {
 	state   state.KeyedState
 	scratch []int64
 	// keyBuf is the composite key under construction, reused across records and
-	// across both partitions so that assignment does not allocate. KeyedState
-	// copies what Put is given, which is what makes reusing it safe.
+	// across all three partitions so that assignment does not allocate.
+	// KeyedState copies what Put is given, which is what makes reusing it safe.
 	keyBuf []byte
 
-	// watermark is the last one delivered. It decides what has been purged and
-	// therefore what is late enough to drop.
-	watermark int64
-	dropped   int64
+	// dropped counts assignments discarded as late. It is a metric and the one
+	// thing on this struct derived from records rather than from configuration:
+	// it is deliberately NOT in state, because a Put per dropped assignment
+	// would put a write on the drop path to keep a number nothing downstream
+	// reads. A recovered run under-reports it; the sink contents are unaffected.
+	dropped int64
 }
 
 var _ core.Operator = (*WindowCount)(nil)
@@ -227,16 +244,59 @@ func NewSlidingCount(size, slide, allowedLateness int64) *WindowCount {
 		size:            size,
 		slide:           slide,
 		allowedLateness: allowedLateness,
-		// No watermark has been delivered, so nothing is complete and nothing
-		// has been purged. Starting at zero would claim every window before
-		// 1970 was already gone.
-		watermark: minWatermark,
 	}
 }
 
-// minWatermark is the value before any watermark has arrived. It matches the
+// minWatermark is the value before any watermark has arrived, and is what
+// currentWatermark reports when state holds no watermark yet. It matches the
 // runtime's initial CurrentWatermark.
+//
+// Nothing is complete and nothing has been purged at that point. Defaulting to
+// zero instead would claim every window before 1970 was already gone.
 const minWatermark = -1 << 63
+
+// watermarkStateKey is the one name under state.PrefixOperatorState.
+//
+// A package-level slice rather than a value rebuilt per call, because it is
+// read on the record path. Nothing mutates it: KeyedState.Get does not, and Put
+// copies what it is given.
+var watermarkStateKey = append([]byte{state.PrefixOperatorState}, "watermark"...)
+
+// currentWatermark reads the last watermark this subtask processed.
+//
+// Read from state on every use rather than cached in a Go field, and that is
+// the whole point of this: a field would be correct until a restore and then
+// silently wrong, which is the failure this phase exists to close. The runtime
+// fills a subtask's KeyedState AFTER Open returns, so there is no point at
+// which the operator could load such a field anyway without a second mechanism
+// to say when it had become valid.
+//
+// It costs one Get per record -- hoisted out of the per-window loop in
+// ProcessElement, so it is per record and not per assignment. On Memory that is
+// a map lookup; on Pebble it is a point read of a key rewritten on every
+// watermark, so it is in the memtable. Correctness is the deliverable here and
+// a cache with a validity flag is the clever version of this.
+func (w *WindowCount) currentWatermark() (int64, error) {
+	v, ok := w.state.Get(watermarkStateKey)
+	if !ok {
+		return minWatermark, nil
+	}
+	if len(v) < state.OrderedInt64Bytes {
+		return 0, fmt.Errorf("operators: WindowCount: the stored watermark is %d bytes, want %d", len(v), state.OrderedInt64Bytes)
+	}
+	return state.DecodeOrderedInt64(v), nil
+}
+
+// setWatermark records the watermark this subtask has processed up to.
+//
+// state.EncodeOrderedInt64 and not big-endian, for consistency with the fire
+// times rather than because anything sorts on it: there is one such entry per
+// subtask and nothing scans it. Two encodings of a signed time in one key space
+// would be a trap for whoever adds the second scalar.
+func (w *WindowCount) setWatermark(wm int64) {
+	encoded := state.EncodeOrderedInt64(wm)
+	w.state.Put(watermarkStateKey, encoded[:])
+}
 
 // Open takes the subtask's keyed state.
 //
@@ -353,9 +413,16 @@ func (w *WindowCount) fireTimeOf(start int64) int64 { return addCeil(start, w.si
 // No allocation per record and no string conversion: both composite keys are
 // appended into one reused buffer, and rec.Key is handed straight to it.
 func (w *WindowCount) ProcessElement(rec *core.Record, ctx core.Context) error {
+	// Once per record, above the loop: the watermark cannot change while this
+	// call runs, so reading it per assignment would be the same answer at
+	// size/slide times the cost.
+	watermark, err := w.currentWatermark()
+	if err != nil {
+		return err
+	}
 	w.scratch = w.windowsFor(w.scratch, rec.EventTime)
 	for _, start := range w.scratch {
-		if w.isPurged(start) {
+		if w.isPurged(watermark, start) {
 			w.dropped++
 			continue
 		}
@@ -504,7 +571,7 @@ type dueTimer struct {
 // not see it at all. The divergence would appear only on a re-fire, which is
 // the rarest path in this operator and the one nothing would think to check.
 func (w *WindowCount) ProcessWatermark(wm int64, ctx core.Context) error {
-	w.watermark = wm
+	w.setWatermark(wm)
 	due, err := w.collectDueTimers(wm)
 	if err != nil {
 		return err
@@ -518,7 +585,7 @@ func (w *WindowCount) ProcessWatermark(wm int64, ctx core.Context) error {
 			return err
 		}
 	}
-	return w.purge()
+	return w.purge(wm)
 }
 
 // collectDueTimers returns every timer whose fire time is at or before wm, in
@@ -600,9 +667,13 @@ func (w *WindowCount) fire(key []byte, start int64, ctx core.Context) error {
 }
 
 // isPurged reports whether the window starting at start is past its allowed
-// lateness and so no longer held.
-func (w *WindowCount) isPurged(start int64) bool {
-	return w.watermark > addCeil(addCeil(start, w.size), w.allowedLateness)
+// lateness at watermark and so no longer held.
+//
+// The watermark is a parameter rather than a field because it lives in state;
+// each caller reads it once and passes it down, which also makes it obvious
+// that one call sees one watermark throughout.
+func (w *WindowCount) isPurged(watermark, start int64) bool {
+	return watermark > addCeil(addCeil(start, w.size), w.allowedLateness)
 }
 
 // purge drops the state of every window the watermark has moved past.
@@ -623,7 +694,7 @@ func (w *WindowCount) isPurged(start int64) bool {
 // only that entry, which is what this does. Deleting a different one is
 // undefined across backends; see the note on the interface. Nothing here
 // depends on the order the scan runs in beyond the partitions being contiguous.
-func (w *WindowCount) purge() error {
+func (w *WindowCount) purge(watermark int64) error {
 	var err error
 	w.state.Iterate(func(stateKey, value []byte) bool {
 		if len(stateKey) == 0 {
@@ -641,7 +712,7 @@ func (w *WindowCount) purge() error {
 			err = decodeErr
 			return false
 		}
-		if w.isPurged(start) {
+		if w.isPurged(watermark, start) {
 			w.state.Delete(stateKey)
 		}
 		return true

@@ -1507,3 +1507,144 @@ func TestTimerKeySortsLikeTheTripleItEncodes(t *testing.T) {
 		t.Error("sorting the shuffled timer keys did not reproduce the order above")
 	}
 }
+
+// restoreWindow puts the state behind h through the checkpoint serialisation
+// and opens op on the result, which is what the runtime does to an operator
+// subtask on recovery.
+//
+// It goes through state.WriteTo and state.ReadFrom rather than handing the same
+// KeyedState to a second operator, because that is the path a real restore
+// takes and it is the path that would silently drop an entry the format did not
+// carry. Handing over the live state would prove the operator reads its state
+// and nothing about whether the state survives a checkpoint.
+func restoreWindow(t *testing.T, h *windowHarness, op *WindowCount) *windowHarness {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := state.WriteTo(h.ctx.State(), &buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	restored := state.NewMemory()
+	if err := state.ReadFrom(restored, &buf); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	ctx := &emitContext{state: restored}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("Open on restored state: %v", err)
+	}
+	return &windowHarness{t: t, op: op, ctx: ctx}
+}
+
+// TestWindowStoresTheWatermarkUnderItsOwnPrefix pins the third partition:
+// one entry per SUBTASK, keyed by name, holding the last watermark processed.
+//
+// The bytes are built here by hand rather than by calling setWatermark, which
+// would be the operator agreeing with itself.
+func TestWindowStoresTheWatermarkUnderItsOwnPrefix(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	st := h.ctx.State()
+
+	// Nothing is stored before the first watermark, and the operator reads that
+	// absence as minWatermark rather than as zero: at zero it would treat every
+	// window before 1970 as already purged.
+	if got := len(partitionKeys(st, state.PrefixOperatorState)); got != 0 {
+		t.Errorf("%d scalars stored before any watermark, want none", got)
+	}
+	if got, err := h.op.currentWatermark(); err != nil || got != minWatermark {
+		t.Errorf("currentWatermark with nothing stored = (%d, %v), want (%d, nil)", got, err, int64(minWatermark))
+	}
+
+	wantKey := append([]byte{state.PrefixOperatorState}, "watermark"...)
+	for _, wm := range []int64{-500, -1, 0, 99, math.MaxInt64} {
+		h.watermark(wm)
+
+		value, ok := st.Get(wantKey)
+		if !ok {
+			t.Fatalf("nothing stored under %#x || \"watermark\" after watermark %d", state.PrefixOperatorState, wm)
+		}
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], uint64(wm)^(1<<63))
+		if !bytes.Equal(value, encoded[:]) {
+			t.Errorf("watermark %d stored as %x, want %x", wm, value, encoded)
+		}
+		if got, err := h.op.currentWatermark(); err != nil || got != wm {
+			t.Errorf("currentWatermark after %d = (%d, %v)", wm, got, err)
+		}
+		// One entry, replaced rather than appended to. A watermark arrives
+		// hundreds of times a run and an entry per arrival would grow the
+		// checkpoint without bound.
+		if got := len(partitionKeys(st, state.PrefixOperatorState)); got != 1 {
+			t.Errorf("the operator-scalar partition holds %d entries after watermark %d, want 1", got, wm)
+		}
+	}
+}
+
+// TestWindowRejectsAWatermarkStoredWrong. Only this operator writes to its own
+// state, so a short value means the layout and the code have come apart.
+// Reading it as some other number would move what counts as late by an
+// arbitrary amount and produce plausible counts.
+func TestWindowRejectsAWatermarkStoredWrong(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.ctx.State().Put(append([]byte{state.PrefixOperatorState}, "watermark"...), []byte{0, 0})
+
+	if _, err := h.op.currentWatermark(); err == nil {
+		t.Error("currentWatermark accepted a two-byte watermark")
+	}
+	if err := h.op.ProcessElement(rec("a", 10), h.ctx); err == nil {
+		t.Error("ProcessElement ran against a watermark it could not read")
+	}
+}
+
+// TestRestoredWindowRecoversItsWatermark is the divergence this step closes,
+// asserted against the run that does not recover it.
+//
+// The script purges a window, then restores. A record for that window arriving
+// after the restore is LATE and must be dropped -- the window has already been
+// fired and reported, and counting it again resurrects a (key, window) the sink
+// already holds. An operator whose watermark came back as minWatermark thinks
+// nothing has been purged, so it accepts the record, opens the window a second
+// time and emits it again.
+//
+// The counterfactual is in the test rather than in a comment: the same records
+// are fed to an operator opened on EMPTY state, and the assertion is that the
+// two disagree. Without it this test would pass against an operator that
+// dropped the record for some unrelated reason.
+func TestRestoredWindowRecoversItsWatermark(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("a", 10)
+	// Fires [0, 100) and, at lateness 0, purges it too.
+	if got := h.watermark(250); !slices.Equal(got, []triple{{"a", 0, 1}}) {
+		t.Fatalf("the run before the checkpoint fired %v, want the one window", got)
+	}
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixUserState)); got != 0 {
+		t.Fatalf("%d aggregates left after the purge, want none", got)
+	}
+
+	restored := restoreWindow(t, h, NewTumblingCount(100, 0))
+	if got, err := restored.op.currentWatermark(); err != nil || got != 250 {
+		t.Fatalf("the restored operator's watermark is (%d, %v), want (250, nil)", got, err)
+	}
+
+	// The late record. Dropped, counted, and it leaves nothing behind.
+	restored.record("a", 10)
+	if got := restored.op.Dropped(); got != 1 {
+		t.Errorf("the restored operator dropped %d assignments, want 1", got)
+	}
+	if got := len(partitionKeys(restored.ctx.State(), state.PrefixUserState)); got != 0 {
+		t.Errorf("the late record opened %d windows on the restored operator, want none", got)
+	}
+	if got := restored.watermark(math.MaxInt64); len(got) != 0 {
+		t.Errorf("the restored operator emitted %v for a window the sink already holds", got)
+	}
+
+	// The same record against an operator that did not recover a watermark.
+	// This is what the Go field produced: the window comes back, and the sink
+	// ends up with two rows for one (key, window).
+	fresh := newWindowHarness(t, NewTumblingCount(100, 0))
+	fresh.record("a", 10)
+	if got := fresh.op.Dropped(); got != 0 {
+		t.Fatalf("an operator on empty state dropped %d, want 0: the counterfactual does not hold", got)
+	}
+	if got := fresh.watermark(math.MaxInt64); !slices.Equal(got, []triple{{"a", 0, 1}}) {
+		t.Fatalf("an operator on empty state emitted %v, want the duplicate window: the counterfactual does not hold", got)
+	}
+}
