@@ -173,28 +173,53 @@ func (m *Memory) Len() int { return len(m.entries) }
 // stored in it rather than by convention.
 //
 //	0x00        operator user state (window aggregates)
-//	0x01        event-time timers (RESERVED, unused in this phase)
-//	0x02..0xFF  reserved
+//	0x01        event-time timers
+//	0x02        operator scalar state, keyed 0x02 || name
+//	0x03..0xFF  reserved
 //
-// Nothing writes 0x01 yet, and nothing in this phase should: the timer service
-// in pkg/operators holds its timers in RAM. The byte is claimed now because the
-// snapshot format in pkg/checkpoint is written in this phase, and partitioning
-// a key space AFTER a format exists is a format change: every checkpoint
-// already on disk decodes into the wrong partition, and the restore path has to
-// learn to tell an old layout from a new one. Claiming it costs one byte per
-// entry today and makes Phase 6's move of timers onto disk a change to one
-// operator rather than to the on-disk format.
+// All three are written today, by the window operator in pkg/operators. That is
+// the point of the partitioning rather than an accident of it: a subtask has
+// ONE key space, and without a discriminator a timer key, an aggregate key and
+// a scalar would be distinguishable only by length and by luck, so the purge
+// scan that walks the aggregates on every watermark would read the other two as
+// aggregates and delete them.
 //
 // The discriminator is FIRST rather than last so that a scan can be confined to
 // one partition by prefix. Sorted iteration is part of the KeyedState contract,
 // so a leading byte groups a partition into one contiguous run; a trailing byte
 // would interleave the partitions and leave a timer scan reading every
-// aggregate.
+// aggregate. It also fixes the order the partitions are visited in, which is
+// what lets each scan STOP at the first key outside its own.
+//
+// 0x01 and 0x02 were claimed before anything wrote them, in the phase that
+// wrote the snapshot format in pkg/checkpoint. Partitioning a key space AFTER a
+// format exists is a format change: every checkpoint already on disk decodes
+// into the wrong partition, and the restore path has to learn to tell an old
+// layout from a new one. Claiming them cost one byte per entry and made moving
+// timers and the operator watermark into state a change to one operator rather
+// than to the on-disk format.
 const (
 	// PrefixUserState is the discriminator on operator state: the aggregates a
 	// user-defined operator accumulates.
 	PrefixUserState byte = 0x00
-	// PrefixTimer is the discriminator reserved for event-time timers. Nothing
-	// writes it in this phase.
+	// PrefixTimer is the discriminator on event-time timers.
+	//
+	// A timer is STATE, and that is why it is here rather than in a heap beside
+	// the operator: an operator whose timers live in a Go field is restored with
+	// its aggregates and no timer to fire them, so a (key, window) complete
+	// before the checkpoint is silently never emitted. Snapshotting the key
+	// space snapshots the timers with it and nothing in this package or in
+	// pkg/checkpoint has to know that is what it is doing.
 	PrefixTimer byte = 0x01
+	// PrefixOperatorState is the discriminator on an operator's named scalars,
+	// keyed PrefixOperatorState || name.
+	//
+	// One name exists: the window operator's current watermark. It is here for
+	// the same reason the timers are -- a watermark held in a Go field comes
+	// back as MinInt64 after a restore, so until the restored sources produce
+	// one the operator accepts records it should be treating as late.
+	//
+	// There is deliberately no scalar-state API over this. It is a byte and a
+	// name; a helper would be an abstraction layer over two calls.
+	PrefixOperatorState byte = 0x02
 )

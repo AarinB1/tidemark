@@ -1,6 +1,7 @@
 package operators
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -405,8 +406,8 @@ func TestWindowFiresAtEndMinusOneAndNotBefore(t *testing.T) {
 	}
 }
 
-// TestWindowFiresOncePerWindowNotOncePerRecord is what the timer service's
-// deduplication buys at the operator level.
+// TestWindowFiresOncePerWindowNotOncePerRecord is what the idempotent timer
+// key buys at the operator level.
 //
 // A thousand records in one window must produce one emission carrying a
 // thousand, not a thousand emissions each carrying a correct running count. The
@@ -422,8 +423,8 @@ func TestWindowFiresOncePerWindowNotOncePerRecord(t *testing.T) {
 	}
 }
 
-// TestWindowFiresEveryKeyInDeterministicOrder checks the firing order the timer
-// service documents, at the operator level.
+// TestWindowFiresEveryKeyInDeterministicOrder checks the tie-break the timer key
+// layout produces, at the operator level.
 //
 // Several keys complete at the same watermark, so the order is a pure tie-break
 // on key bytes. It must not depend on the order the records arrived in, which
@@ -811,6 +812,27 @@ func TestWindowOpenRefusesWithoutState(t *testing.T) {
 	}
 }
 
+// partitionKeys returns every key in one partition of the subtask key space,
+// in iteration order.
+//
+// Every count in this file is per PARTITION and never over the whole key space,
+// and that is a change this phase forces rather than a style choice: the
+// operator now writes a timer beside every open window, so a count of
+// everything counts both and moves whenever either does. A test that said
+// "state holds three entries" would be asserting the timer count as well,
+// without saying so, and would break for the right reason and the wrong
+// message the next time either side changes.
+func partitionKeys(st state.KeyedState, prefix byte) [][]byte {
+	var out [][]byte
+	st.Iterate(func(k, v []byte) bool {
+		if len(k) > 0 && k[0] == prefix {
+			out = append(out, slices.Clone(k))
+		}
+		return true
+	})
+	return out
+}
+
 // TestWindowStateLayout pins the two encodings Phase 3b has to serialise and
 // read back.
 //
@@ -863,12 +885,15 @@ func TestWindowStateLayout(t *testing.T) {
 		}
 	}
 
-	// Exactly those three entries, so a stray write under some other key would
-	// be caught rather than ignored.
-	entries := 0
-	st.Iterate(func(k, v []byte) bool { entries++; return true })
-	if entries != len(want) {
-		t.Errorf("state holds %d entries, want %d", entries, len(want))
+	// Exactly those three aggregates, so a stray write under some other key
+	// would be caught rather than ignored. Counted within the user-state
+	// partition: the timer beside each of them is the next test's subject.
+	if got := len(partitionKeys(st, state.PrefixUserState)); got != len(want) {
+		t.Errorf("the user-state partition holds %d entries, want %d", got, len(want))
+	}
+	// One timer per open window, and not one per record: four records went in.
+	if got := len(partitionKeys(st, state.PrefixTimer)); got != len(want) {
+		t.Errorf("the timer partition holds %d entries, want %d, one per open window", got, len(want))
 	}
 }
 
@@ -890,12 +915,11 @@ func TestWindowStateGroupsAKeysWindowsTogether(t *testing.T) {
 	}
 
 	var order []string
-	h.ctx.State().Iterate(func(k, v []byte) bool {
-		order = append(order, string(k[1:len(k)-8]))
-		return true
-	})
+	for _, k := range partitionKeys(h.ctx.State(), state.PrefixUserState) {
+		order = append(order, string(k[prefixBytes:len(k)-windowStartBytes]))
+	}
 	if len(order) != 12 {
-		t.Fatalf("state holds %d entries, want 12", len(order))
+		t.Fatalf("the user-state partition holds %d entries, want 12", len(order))
 	}
 
 	// One contiguous run per key, in key order, four windows each.
@@ -917,12 +941,10 @@ func TestWindowPurgeRemovesStateAndNotJustTimers(t *testing.T) {
 	h.record("a", 150)
 
 	entries := func() int {
-		n := 0
-		h.ctx.State().Iterate(func(k, v []byte) bool { n++; return true })
-		return n
+		return len(partitionKeys(h.ctx.State(), state.PrefixUserState))
 	}
 	if got := entries(); got != 2 {
-		t.Fatalf("state holds %d entries after two records in two windows, want 2", got)
+		t.Fatalf("the user-state partition holds %d entries after two records in two windows, want 2", got)
 	}
 
 	// 99 fires [0, 100) but does not purge it: with lateness 0 the window is
@@ -937,10 +959,10 @@ func TestWindowPurgeRemovesStateAndNotJustTimers(t *testing.T) {
 		t.Fatalf("state holds %d entries past the purge threshold, want 1", got)
 	}
 	// And it is the right one that survived.
-	if _, ok := h.ctx.State().Get(appendStateKey(nil, "a", 100)); !ok {
+	if _, ok := h.ctx.State().Get(appendStateKey(nil, []byte("a"), 100)); !ok {
 		t.Error("the purge removed the window that is still open")
 	}
-	if _, ok := h.ctx.State().Get(appendStateKey(nil, "a", 0)); ok {
+	if _, ok := h.ctx.State().Get(appendStateKey(nil, []byte("a"), 0)); ok {
 		t.Error("the purged window still holds state")
 	}
 }
@@ -952,7 +974,7 @@ func TestWindowStartOfRoundTripsThroughTheCompositeKey(t *testing.T) {
 	starts := []int64{0, 1, -1, 100, -100, math.MaxInt64, math.MinInt64}
 	for _, key := range keys {
 		for _, start := range starts {
-			composite := appendStateKey(nil, key, start)
+			composite := appendStateKey(nil, []byte(key), start)
 			if got, want := len(composite), 1+len(key)+8; got != want {
 				t.Fatalf("composite key for (%q, %d) is %d bytes, want %d", key, start, got, want)
 			}
@@ -984,20 +1006,20 @@ func TestWindowStartOfRoundTripsThroughTheCompositeKey(t *testing.T) {
 	}
 }
 
-// TestWindowStateKeysAreConfinedToTheUserStatePartition pins the property the
-// discriminator exists for: every key this operator writes is in the user-state
-// partition, and a partition is one contiguous run under sorted iteration.
+// TestWindowStateKeysAreConfinedToTheTwoPartitionsItOwns pins the property the
+// discriminator exists for, now that both partitions are written.
 //
-// The second half is what makes the byte worth its cost. Phase 6 moves event-
-// time timers into the same key space behind state.PrefixTimer, and a scan
-// confined to one partition is only possible if that partition's keys sort
-// together. The foreign entry below stands in for that future timer: it is
-// written directly, never by this operator, and the assertion is that sorted
-// iteration reaches every aggregate before it and never interleaves the two.
+// Every key this operator writes carries one of the two discriminators, and
+// each partition is one CONTIGUOUS run under sorted iteration with every
+// aggregate sorting before every timer. That second half is what makes the byte
+// worth its cost: the firing scan is confined to the timer partition and the
+// purge scan to the user-state partition, and neither confinement is possible
+// unless a partition's keys sort together.
 //
 // A trailing discriminator would pass the first half of this test and fail the
-// second, which is exactly the mistake it is written against.
-func TestWindowStateKeysAreConfinedToTheUserStatePartition(t *testing.T) {
+// second, which is exactly the mistake it is written against. So would a
+// timer key that led with the record key instead of the prefix.
+func TestWindowStateKeysAreConfinedToTheTwoPartitionsItOwns(t *testing.T) {
 	h := newWindowHarness(t, NewTumblingCount(100, 0))
 	for _, eventTime := range []int64{0, 100, 200, -50} {
 		for _, key := range []string{"kb", "ka"} {
@@ -1005,33 +1027,26 @@ func TestWindowStateKeysAreConfinedToTheUserStatePartition(t *testing.T) {
 		}
 	}
 
-	// Not written by the operator. It stands in for a Phase 6 timer sharing the
-	// subtask's one key space, and its key is chosen to sort BELOW every
-	// aggregate key on everything but the discriminator, so a layout that put
-	// the discriminator anywhere but first would sort it into the middle of
-	// them.
-	st := h.ctx.State()
-	st.Put([]byte{state.PrefixTimer, 0x00}, []byte("timer"))
-
 	var prefixes []byte
-	userStateEntries := 0
-	st.Iterate(func(k, v []byte) bool {
+	counts := map[byte]int{}
+	h.ctx.State().Iterate(func(k, v []byte) bool {
 		if len(k) == 0 {
 			t.Fatal("state holds a zero-length key, which carries no discriminator at all")
 		}
 		prefixes = append(prefixes, k[0])
-		if k[0] == state.PrefixUserState {
-			userStateEntries++
-		}
+		counts[k[0]]++
 		return true
 	})
 
-	// Eight aggregates, two keys over four windows, plus the foreign entry.
-	if userStateEntries != 8 {
-		t.Errorf("the operator wrote %d entries into the user-state partition, want 8", userStateEntries)
+	// Two keys over four windows: eight aggregates, and one timer for each.
+	if got := counts[state.PrefixUserState]; got != 8 {
+		t.Errorf("the operator wrote %d entries into the user-state partition, want 8", got)
 	}
-	if len(prefixes) != 9 {
-		t.Fatalf("state holds %d entries, want 9", len(prefixes))
+	if got := counts[state.PrefixTimer]; got != 8 {
+		t.Errorf("the operator wrote %d entries into the timer partition, want 8", got)
+	}
+	if len(prefixes) != 16 {
+		t.Fatalf("state holds %d entries, want 16", len(prefixes))
 	}
 
 	// One run of 0x00 then one run of 0x01, with no interleaving. Written as a
@@ -1044,8 +1059,592 @@ func TestWindowStateKeysAreConfinedToTheUserStatePartition(t *testing.T) {
 				prefixes[i], prefixes[i-1], i)
 		}
 	}
+	if prefixes[0] != state.PrefixUserState {
+		t.Errorf("the first entry visited carries prefix %#x, want the user-state prefix %#x", prefixes[0], state.PrefixUserState)
+	}
 	if prefixes[len(prefixes)-1] != state.PrefixTimer {
-		t.Errorf("the last entry visited carries prefix %#x, want the timer prefix %#x: the aggregates do not all sort before it",
+		t.Errorf("the last entry visited carries prefix %#x, want the timer prefix %#x: the aggregates do not all sort before the timers",
 			prefixes[len(prefixes)-1], state.PrefixTimer)
+	}
+}
+
+// The tests below carry over the properties pkg/operators/timers_test.go pinned
+// on the heap this phase deleted. They are stated at the operator level and at
+// the key-layout level rather than against a timer type, because there is no
+// longer a timer type: the ordering that used to be a three-field comparator is
+// now an emergent property of the bytes in the key.
+
+// TestWindowFiresInFireTimeOrderIndependentOfArrival is the determinism claim
+// the heap's Less used to carry.
+//
+// Firing order must be a function of the pending set alone and never of the
+// order the registrations arrived in. Upstream, records reach an operator in
+// whatever order the shuffle produced, so if the firing order followed arrival
+// every downstream comparison would be flaky for a reason that reads like a
+// concurrency bug. Each row therefore feeds the SAME records twice, the second
+// time back to front, and asserts both fire the same list in the same order.
+//
+// The old test could register a fire time directly. This one can only arm a
+// timer by feeding a record, so the fire time is always start+size-1: rows that
+// need two windows to share a fire time are not expressible here and are
+// covered structurally by TestTimerKeySortsLikeTheTripleItEncodes below.
+func TestWindowFiresInFireTimeOrderIndependentOfArrival(t *testing.T) {
+	type input struct {
+		key       string
+		eventTime int64
+	}
+	tests := []struct {
+		name  string
+		size  int64
+		input []input
+		w     int64
+		want  []triple
+	}{
+		{
+			name:  "by fire time",
+			size:  100,
+			input: []input{{"a", 300}, {"a", 100}, {"a", 200}},
+			w:     1000,
+			want:  []triple{{"a", 100, 1}, {"a", 200, 1}, {"a", 300, 1}},
+		},
+		{
+			// One window start, so the fire times are equal and the bytes that
+			// follow decide. Those bytes are the record key.
+			name:  "a tie goes to the lower key",
+			size:  100,
+			input: []input{{"c", 50}, {"a", 50}, {"b", 50}},
+			w:     99,
+			want:  []triple{{"a", 0, 1}, {"b", 0, 1}, {"c", 0, 1}},
+		},
+		{
+			// Keys are byte slices, so the order is bytewise and not any text
+			// collation: NUL first, uppercase before lowercase, 0xff last.
+			name:  "keys order by bytes",
+			size:  100,
+			input: []input{{"b", 10}, {"B", 10}, {"\x00", 10}, {"\xff", 10}},
+			w:     99,
+			want: []triple{
+				{"\x00", 0, 1}, {"B", 0, 1}, {"b", 0, 1}, {"\xff", 0, 1},
+			},
+		},
+		{
+			name:  "fire time beats key",
+			size:  100,
+			input: []input{{"a", 250}, {"z", 50}},
+			w:     1000,
+			want:  []triple{{"z", 0, 1}, {"a", 200, 1}},
+		},
+		{
+			// The row plain big-endian gets wrong. A negative fire time has its
+			// top bit set, so big-endian sorts it ABOVE every positive one and
+			// the scan -- which stops at the first fire time past the watermark
+			// -- would reach the positive window first, stop, and fire nothing.
+			name:  "negative fire times sort below positive ones",
+			size:  100,
+			input: []input{{"b", 50}, {"a", -50}, {"c", 150}},
+			w:     1000,
+			want:  []triple{{"a", -100, 1}, {"b", 0, 1}, {"c", 100, 1}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			feed := func(in []input) []triple {
+				h := newWindowHarness(t, NewTumblingCount(tt.size, 0))
+				for _, r := range in {
+					h.record(r.key, r.eventTime)
+				}
+				return h.watermark(tt.w)
+			}
+			if got := feed(tt.input); !slices.Equal(got, tt.want) {
+				t.Errorf("fired %v, want %v", got, tt.want)
+			}
+			reversed := slices.Clone(tt.input)
+			slices.Reverse(reversed)
+			if got := feed(reversed); !slices.Equal(got, tt.want) {
+				t.Errorf("with the records reversed, fired %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWindowFiringBoundaries covers the two ends of the watermark range and the
+// inclusive comparison between them, which the heap's `<= w` used to carry.
+//
+// The MaxInt64 row is the end-of-input flush the gate emits. It is the only
+// thing that fires windows still open when the input runs out, so a scan that
+// treated it as just another large number would leave the tail of every run in
+// the operator instead of in the sink.
+func TestWindowFiringBoundaries(t *testing.T) {
+	// One window per key, spread across the range: at the floor, negative,
+	// at zero, positive, and at the ceiling.
+	inputs := []struct {
+		key       string
+		eventTime int64
+		start     int64
+	}{
+		{key: "floor", eventTime: math.MinInt64, start: math.MinInt64},
+		{key: "neg", eventTime: -150, start: -200},
+		{key: "zero", eventTime: 50, start: 0},
+		{key: "pos", eventTime: 150, start: 100},
+		{key: "ceil", eventTime: math.MaxInt64 - 1, start: math.MaxInt64 - 99},
+	}
+
+	tests := []struct {
+		name string
+		w    int64
+		want []triple
+	}{
+		{
+			// The floor window's fire time is MinInt64+99, so a watermark of
+			// MinInt64 is below every timer.
+			name: "below every timer",
+			w:    math.MinInt64,
+			want: nil,
+		},
+		{
+			// Inclusive at the boundary: a window fires when the watermark
+			// reaches exactly end-1, not one past it.
+			name: "exactly on a fire time",
+			w:    -101,
+			want: []triple{{"floor", math.MinInt64, 1}, {"neg", -200, 1}},
+		},
+		{
+			name: "one below a fire time",
+			w:    -102,
+			want: []triple{{"floor", math.MinInt64, 1}},
+		},
+		{
+			name: "negative event times",
+			w:    -1,
+			want: []triple{{"floor", math.MinInt64, 1}, {"neg", -200, 1}},
+		},
+		{
+			name: "MaxInt64 fires everything",
+			w:    math.MaxInt64,
+			want: []triple{
+				{"floor", math.MinInt64, 1}, {"neg", -200, 1}, {"zero", 0, 1},
+				{"pos", 100, 1}, {"ceil", math.MaxInt64 - 99, 1},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newWindowHarness(t, NewTumblingCount(100, 0))
+			for _, in := range inputs {
+				h.record(in.key, in.eventTime)
+			}
+			if got := len(partitionKeys(h.ctx.State(), state.PrefixTimer)); got != len(inputs) {
+				t.Fatalf("%d timers pending, want one per window (%d)", got, len(inputs))
+			}
+			got := h.watermark(tt.w)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("at watermark %d fired %v, want %v", tt.w, got, tt.want)
+			}
+			// Whatever fired is gone from the timer partition, and whatever
+			// did not is still there. A scan that fired without deleting would
+			// pass the assertion above and re-fire on the next watermark.
+			if want := len(inputs) - len(tt.want); len(partitionKeys(h.ctx.State(), state.PrefixTimer)) != want {
+				t.Errorf("%d timers left pending, want %d",
+					len(partitionKeys(h.ctx.State(), state.PrefixTimer)), want)
+			}
+		})
+	}
+}
+
+// TestWindowArmsOneTimerPerWindowHoweverManyRecords is the structural half of
+// what the dedupe map used to do.
+//
+// The map is gone: writing the same composite key again is idempotent, because
+// the key is a function of (fireTime, recordKey, windowStart) and the fire time
+// is itself a function of the window start and the size. If that were not
+// one-to-one with (recordKey, windowStart), a window holding a thousand records
+// would hold a thousand timers and emit a thousand times.
+func TestWindowArmsOneTimerPerWindowHoweverManyRecords(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(1000, 0))
+	for i := range int64(1000) {
+		h.record("k", i)
+	}
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixTimer)); got != 1 {
+		t.Errorf("1000 records in one window armed %d timers, want 1", got)
+	}
+
+	// Two windows and two keys are four distinct timers, so the key identifies
+	// a (record key, window) pair and not just one half of it.
+	h = newWindowHarness(t, NewTumblingCount(100, 0))
+	for _, key := range []string{"j", "k"} {
+		for _, eventTime := range []int64{10, 110} {
+			h.record(key, eventTime)
+			h.record(key, eventTime)
+		}
+	}
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixTimer)); got != 4 {
+		t.Errorf("two keys over two windows armed %d timers, want 4", got)
+	}
+}
+
+// TestWindowFiringDeletesTheTimerAndLeavesTheWindowOpen separates the two
+// deletions this operator does, which used to happen in two different places
+// and now happen in one key space.
+//
+// Firing removes the TIMER. Purging removes the AGGREGATE, later, once allowed
+// lateness has passed. A firing that also dropped the aggregate would lose the
+// late-record path; a firing that left the timer behind would re-fire the
+// window on every subsequent watermark.
+func TestWindowFiringDeletesTheTimerAndLeavesTheWindowOpen(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("a", 10)
+
+	st := h.ctx.State()
+	if got := len(partitionKeys(st, state.PrefixTimer)); got != 1 {
+		t.Fatalf("%d timers armed, want 1", got)
+	}
+
+	if got := h.watermark(99); !slices.Equal(got, []triple{{"a", 0, 1}}) {
+		t.Fatalf("fired %v, want the one window", got)
+	}
+	if got := len(partitionKeys(st, state.PrefixTimer)); got != 0 {
+		t.Errorf("%d timers left after firing, want none: the window will fire again", got)
+	}
+	if got := len(partitionKeys(st, state.PrefixUserState)); got != 1 {
+		t.Errorf("%d aggregates left after firing, want 1: the window is still open for late records", got)
+	}
+
+	// And it does not fire a second time on the next watermark.
+	if got := h.watermark(100); len(got) != 0 {
+		t.Errorf("the window fired again at watermark 100: %v", got)
+	}
+}
+
+// TestWindowStopsFiringOnAnError is what the heap's stop-on-error carried.
+//
+// A failing firing stops the drain rather than grinding through every remaining
+// timer. The old test made the emit fail; here the failure is planted in state,
+// which is the only way this operator's fire can fail. Either way the timers
+// behind it are left pending, which is what a checkpoint taken after the
+// failure would keep.
+func TestWindowStopsFiringOnAnError(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("a", 10)
+	h.record("b", 10)
+	h.record("c", 10)
+
+	// b's aggregate is truncated to something DecodeCount refuses. Only this
+	// operator writes here, so a short value means the layout and the code have
+	// come apart, and firing it as a zero would put a plausible count in the
+	// sink.
+	h.ctx.State().Put(appendStateKey(nil, []byte("b"), 0), []byte{0, 0})
+
+	err := h.op.ProcessWatermark(99, h.ctx)
+	if !errors.Is(err, errCountTooShort) {
+		t.Fatalf("ProcessWatermark = %v, want %v", err, errCountTooShort)
+	}
+	// a fired before b failed; c never did.
+	if got := h.take(); !slices.Equal(got, []triple{{"a", 0, 1}}) {
+		t.Errorf("emitted %v, want the drain to stop after a", got)
+	}
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixTimer)); got != 1 {
+		t.Errorf("%d timers left pending, want the one that never fired", got)
+	}
+}
+
+// TestTimerKeyLayout pins the bytes, against a key built by hand here rather
+// than by calling appendTimerKey, which would be the operator agreeing with
+// itself.
+//
+//	state.PrefixTimer || fireTime, sign-flipped big-endian || key ||
+//	windowStart, big-endian int64
+func TestTimerKeyLayout(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("ab", 150)
+	h.record("ab", -50)
+	h.record("z", 150)
+
+	want := []struct {
+		key      string
+		start    int64
+		fireTime int64
+	}{
+		{key: "ab", start: -100, fireTime: -1},
+		{key: "ab", start: 100, fireTime: 199},
+		{key: "z", start: 100, fireTime: 199},
+	}
+
+	st := h.ctx.State()
+	for _, w := range want {
+		timerKey := []byte{state.PrefixTimer}
+		var fire [8]byte
+		binary.BigEndian.PutUint64(fire[:], uint64(w.fireTime)^(1<<63))
+		timerKey = append(timerKey, fire[:]...)
+		timerKey = append(timerKey, w.key...)
+		var startBytes [8]byte
+		binary.BigEndian.PutUint64(startBytes[:], uint64(w.start))
+		timerKey = append(timerKey, startBytes[:]...)
+
+		value, ok := st.Get(timerKey)
+		if !ok {
+			t.Fatalf("no timer under (fire %d, key %q, start %d)", w.fireTime, w.key, w.start)
+		}
+		// The key carries everything, so the value carries nothing. A value
+		// here would be a second place for the same fact to live.
+		if len(value) != 0 {
+			t.Errorf("the timer for (%q, %d) holds a %d-byte value, want none", w.key, w.start, len(value))
+		}
+	}
+	if got := len(partitionKeys(st, state.PrefixTimer)); got != len(want) {
+		t.Errorf("the timer partition holds %d entries, want %d", got, len(want))
+	}
+}
+
+// TestTimerKeyRoundTrips covers the split back, at the ends of the range and
+// for record keys of different lengths.
+//
+// The empty key is in the list because it is the shortest a timer key can be
+// and is what timerKeyMinBytes is measured against: the two fixed fields are
+// read off the two ends, so the middle being nothing at all has to work rather
+// than underflow.
+func TestTimerKeyRoundTrips(t *testing.T) {
+	keys := []string{"", "a", "ab", "\x00\xff\x00", "aaaaaaaaaaaaaaaa"}
+	times := []int64{0, 1, -1, 100, -100, math.MaxInt64, math.MinInt64}
+	for _, key := range keys {
+		for _, fireTime := range times {
+			for _, start := range times {
+				composite := appendTimerKey(nil, fireTime, []byte(key), start)
+				if got, want := len(composite), prefixBytes+state.OrderedInt64Bytes+len(key)+windowStartBytes; got != want {
+					t.Fatalf("timer key for (%d, %q, %d) is %d bytes, want %d", fireTime, key, start, got, want)
+				}
+				if composite[0] != state.PrefixTimer {
+					t.Fatalf("timer key for (%d, %q, %d) leads with %#x, want %#x", fireTime, key, start, composite[0], state.PrefixTimer)
+				}
+				gotFire, gotKey, gotStart, err := parseTimerKey(composite)
+				if err != nil {
+					t.Fatalf("parseTimerKey(%d, %q, %d): %v", fireTime, key, start, err)
+				}
+				if gotFire != fireTime || string(gotKey) != key || gotStart != start {
+					t.Errorf("parseTimerKey round-tripped (%d, %q, %d) as (%d, %q, %d)",
+						fireTime, key, start, gotFire, gotKey, gotStart)
+				}
+			}
+		}
+	}
+
+	// Anything too short to carry both fixed fields is reported rather than
+	// read past the ends of the slice. Sixteen bytes is in the list because it
+	// is one short of the minimum: a length check off by the discriminator
+	// would split it into a fire time and a window start that overlap.
+	for _, short := range [][]byte{nil, {state.PrefixTimer}, make([]byte, 8), make([]byte, 16)} {
+		if _, _, _, err := parseTimerKey(short); !errors.Is(err, errTimerKeyTooShort) {
+			t.Errorf("parseTimerKey(%d bytes) = %v, want %v", len(short), err, errTimerKeyTooShort)
+		}
+	}
+}
+
+// TestTimerKeySortsLikeTheTripleItEncodes is the ordering claim, stated on the
+// bytes rather than on a firing.
+//
+// It used to be timerQueue.Less: fire time, then key, then window start, a
+// total order so that container/heap's instability could not leak the insertion
+// sequence into the firing order. It is now the byte order of the key, and this
+// is where that is pinned -- including the rows a single window specification
+// cannot produce, since a real fire time is a function of the window start and
+// two windows can never share one.
+func TestTimerKeySortsLikeTheTripleItEncodes(t *testing.T) {
+	type triplet struct {
+		fireTime int64
+		key      string
+		start    int64
+	}
+	// In the order they must come out in.
+	want := []triplet{
+		{fireTime: math.MinInt64, key: "a", start: 0},
+		{fireTime: -100, key: "a", start: -200},
+		{fireTime: -1, key: "z", start: -100},
+		{fireTime: 0, key: "a", start: 0},
+		// Equal fire times: the record key decides, bytewise.
+		{fireTime: 50, key: "\x00", start: 0},
+		{fireTime: 50, key: "a", start: 0},
+		{fireTime: 50, key: "b", start: 0},
+		{fireTime: 50, key: "\xff", start: 0},
+		// Equal fire time and equal key: the window start decides, BYTEWISE.
+		// The start is written plain big-endian, so a negative one has its top
+		// bit set and sorts above every non-negative one -- the opposite of the
+		// numeric order the heap's comparator used here.
+		//
+		// That difference is deliberate and unobservable. The old comparator
+		// needed a TOTAL order, not a numeric one, because container/heap is
+		// unstable and any two timers left equal would come out in whatever
+		// order the sift happened to leave them. Bytewise is total. And the
+		// case is unreachable from one window specification anyway: the fire
+		// time is start+size-1, so two windows sharing a fire time share a
+		// start. It is pinned so that a second specification in one operator
+		// could not introduce nondeterminism unnoticed.
+		{fireTime: 60, key: "k", start: 0},
+		{fireTime: 60, key: "k", start: 10},
+		{fireTime: 60, key: "k", start: -10},
+		{fireTime: math.MaxInt64, key: "a", start: 0},
+	}
+
+	encoded := make([][]byte, len(want))
+	for i, w := range want {
+		encoded[i] = appendTimerKey(nil, w.fireTime, []byte(w.key), w.start)
+	}
+	for i := 1; i < len(encoded); i++ {
+		if bytes.Compare(encoded[i-1], encoded[i]) >= 0 {
+			t.Errorf("timer key for %+v does not sort below %+v", want[i-1], want[i])
+		}
+	}
+
+	// And the order is a function of the set rather than of insertion: shuffled
+	// deterministically, a byte sort puts them back.
+	shuffled := slices.Clone(encoded)
+	for i := range shuffled {
+		j := (i*7 + 3) % len(shuffled)
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	}
+	slices.SortFunc(shuffled, bytes.Compare)
+	if !slices.EqualFunc(shuffled, encoded, func(a, b []byte) bool { return bytes.Equal(a, b) }) {
+		t.Error("sorting the shuffled timer keys did not reproduce the order above")
+	}
+}
+
+// restoreWindow puts the state behind h through the checkpoint serialisation
+// and opens op on the result, which is what the runtime does to an operator
+// subtask on recovery.
+//
+// It goes through state.WriteTo and state.ReadFrom rather than handing the same
+// KeyedState to a second operator, because that is the path a real restore
+// takes and it is the path that would silently drop an entry the format did not
+// carry. Handing over the live state would prove the operator reads its state
+// and nothing about whether the state survives a checkpoint.
+func restoreWindow(t *testing.T, h *windowHarness, op *WindowCount) *windowHarness {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := state.WriteTo(h.ctx.State(), &buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	restored := state.NewMemory()
+	if err := state.ReadFrom(restored, &buf); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	ctx := &emitContext{state: restored}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("Open on restored state: %v", err)
+	}
+	return &windowHarness{t: t, op: op, ctx: ctx}
+}
+
+// TestWindowStoresTheWatermarkUnderItsOwnPrefix pins the third partition:
+// one entry per SUBTASK, keyed by name, holding the last watermark processed.
+//
+// The bytes are built here by hand rather than by calling setWatermark, which
+// would be the operator agreeing with itself.
+func TestWindowStoresTheWatermarkUnderItsOwnPrefix(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	st := h.ctx.State()
+
+	// Nothing is stored before the first watermark, and the operator reads that
+	// absence as minWatermark rather than as zero: at zero it would treat every
+	// window before 1970 as already purged.
+	if got := len(partitionKeys(st, state.PrefixOperatorState)); got != 0 {
+		t.Errorf("%d scalars stored before any watermark, want none", got)
+	}
+	if got, err := h.op.currentWatermark(); err != nil || got != minWatermark {
+		t.Errorf("currentWatermark with nothing stored = (%d, %v), want (%d, nil)", got, err, int64(minWatermark))
+	}
+
+	wantKey := append([]byte{state.PrefixOperatorState}, "watermark"...)
+	for _, wm := range []int64{-500, -1, 0, 99, math.MaxInt64} {
+		h.watermark(wm)
+
+		value, ok := st.Get(wantKey)
+		if !ok {
+			t.Fatalf("nothing stored under %#x || \"watermark\" after watermark %d", state.PrefixOperatorState, wm)
+		}
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], uint64(wm)^(1<<63))
+		if !bytes.Equal(value, encoded[:]) {
+			t.Errorf("watermark %d stored as %x, want %x", wm, value, encoded)
+		}
+		if got, err := h.op.currentWatermark(); err != nil || got != wm {
+			t.Errorf("currentWatermark after %d = (%d, %v)", wm, got, err)
+		}
+		// One entry, replaced rather than appended to. A watermark arrives
+		// hundreds of times a run and an entry per arrival would grow the
+		// checkpoint without bound.
+		if got := len(partitionKeys(st, state.PrefixOperatorState)); got != 1 {
+			t.Errorf("the operator-scalar partition holds %d entries after watermark %d, want 1", got, wm)
+		}
+	}
+}
+
+// TestWindowRejectsAWatermarkStoredWrong. Only this operator writes to its own
+// state, so a short value means the layout and the code have come apart.
+// Reading it as some other number would move what counts as late by an
+// arbitrary amount and produce plausible counts.
+func TestWindowRejectsAWatermarkStoredWrong(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.ctx.State().Put(append([]byte{state.PrefixOperatorState}, "watermark"...), []byte{0, 0})
+
+	if _, err := h.op.currentWatermark(); err == nil {
+		t.Error("currentWatermark accepted a two-byte watermark")
+	}
+	if err := h.op.ProcessElement(rec("a", 10), h.ctx); err == nil {
+		t.Error("ProcessElement ran against a watermark it could not read")
+	}
+}
+
+// TestRestoredWindowRecoversItsWatermark is the divergence this step closes,
+// asserted against the run that does not recover it.
+//
+// The script purges a window, then restores. A record for that window arriving
+// after the restore is LATE and must be dropped -- the window has already been
+// fired and reported, and counting it again resurrects a (key, window) the sink
+// already holds. An operator whose watermark came back as minWatermark thinks
+// nothing has been purged, so it accepts the record, opens the window a second
+// time and emits it again.
+//
+// The counterfactual is in the test rather than in a comment: the same records
+// are fed to an operator opened on EMPTY state, and the assertion is that the
+// two disagree. Without it this test would pass against an operator that
+// dropped the record for some unrelated reason.
+func TestRestoredWindowRecoversItsWatermark(t *testing.T) {
+	h := newWindowHarness(t, NewTumblingCount(100, 0))
+	h.record("a", 10)
+	// Fires [0, 100) and, at lateness 0, purges it too.
+	if got := h.watermark(250); !slices.Equal(got, []triple{{"a", 0, 1}}) {
+		t.Fatalf("the run before the checkpoint fired %v, want the one window", got)
+	}
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixUserState)); got != 0 {
+		t.Fatalf("%d aggregates left after the purge, want none", got)
+	}
+
+	restored := restoreWindow(t, h, NewTumblingCount(100, 0))
+	if got, err := restored.op.currentWatermark(); err != nil || got != 250 {
+		t.Fatalf("the restored operator's watermark is (%d, %v), want (250, nil)", got, err)
+	}
+
+	// The late record. Dropped, counted, and it leaves nothing behind.
+	restored.record("a", 10)
+	if got := restored.op.Dropped(); got != 1 {
+		t.Errorf("the restored operator dropped %d assignments, want 1", got)
+	}
+	if got := len(partitionKeys(restored.ctx.State(), state.PrefixUserState)); got != 0 {
+		t.Errorf("the late record opened %d windows on the restored operator, want none", got)
+	}
+	if got := restored.watermark(math.MaxInt64); len(got) != 0 {
+		t.Errorf("the restored operator emitted %v for a window the sink already holds", got)
+	}
+
+	// The same record against an operator that did not recover a watermark.
+	// This is what the Go field produced: the window comes back, and the sink
+	// ends up with two rows for one (key, window).
+	fresh := newWindowHarness(t, NewTumblingCount(100, 0))
+	fresh.record("a", 10)
+	if got := fresh.op.Dropped(); got != 0 {
+		t.Fatalf("an operator on empty state dropped %d, want 0: the counterfactual does not hold", got)
+	}
+	if got := fresh.watermark(math.MaxInt64); !slices.Equal(got, []triple{{"a", 0, 1}}) {
+		t.Fatalf("an operator on empty state emitted %v, want the duplicate window: the counterfactual does not hold", got)
 	}
 }
