@@ -1,11 +1,13 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,26 +18,30 @@ import (
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
 	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/graph"
+	"github.com/AarinB1/tidemark/pkg/operators"
 	"github.com/AarinB1/tidemark/pkg/sinks"
 	"github.com/AarinB1/tidemark/pkg/sources"
 	"github.com/AarinB1/tidemark/pkg/state"
+	"github.com/AarinB1/tidemark/test/oracle"
 )
 
 // keyedCount counts the records it is given, per key, in the subtask's keyed
 // state, and emits one record per key at end of stream.
 //
-// This is the operator the checkpointing tests are built on, and the reason it
-// is not the window operator is worth stating. Its ENTIRE state is its
-// KeyedState: no timers, no watermark, nothing held in a Go field that a
-// snapshot of the state backend would miss. That makes it the operator for
-// which "restore the KeyedState" is the whole of recovery, so a test built on
-// it measures the checkpointing machinery rather than what a particular
-// operator forgot to put in state.
+// This is the operator the tests in THIS file are built on, and the reason is
+// worth stating. Its entire state is its KeyedState and it holds nothing else:
+// no timers, no watermark, no Go field a snapshot of the backend would miss.
+// The tests here are about the checkpointing MACHINERY -- that a source resumes
+// from the offset a checkpoint recorded, that a shape mismatch is refused, that
+// the numbering continues -- and the simplest operator that can hold state is
+// the one that measures the machinery rather than what a particular operator
+// remembered to put in state.
 //
-// operators.WindowCount is NOT that operator. Its aggregates are in KeyedState
-// but its pending timers and its current watermark are in RAM, so restoring its
-// state alone gives back the counts with no timer to fire them. See the note on
-// TestRestoreDoesNotRecoverInRamOperatorState below.
+// operators.WindowCount used to be excluded here for a second reason, which no
+// longer holds: its timers and its watermark were Go fields. They are entries
+// in the key space now, so it recovers exactly as well, and the recovery suite
+// in recovery_test.go runs on it. See
+// TestRestoredWindowRecoversItsPendingTimers below.
 type keyedCount struct {
 	st  state.KeyedState
 	buf []byte
@@ -628,34 +634,149 @@ func TestCheckpointsKeepCompletingAfterAShorterSourceFinishes(t *testing.T) {
 	assertSameCounts(t, countsOf(t, collect.Records()), oracleCounts(t, a, b), "run")
 }
 
-// TestRestoreDoesNotRecoverInRamOperatorState records a real limit of this
-// phase rather than a property of it.
+// TestRestoredWindowRecoversItsPendingTimers is the inversion of a test this
+// phase deleted.
 //
-// The runtime restores a subtask's KeyedState and nothing else, so an operator
-// whose state is entirely in KeyedState recovers exactly -- keyedCount above is
-// that operator. operators.WindowCount is not: its aggregates are in KeyedState
-// but its pending timers and its current watermark are Go fields, so restoring
-// gives back the counts with no timer to fire them, and a (key, window) whose
-// records all arrived before the checkpoint would never be emitted. There is no
-// mechanism in this phase that would notice.
+// TestRestoreDoesNotRecoverInRamOperatorState used to pin a GAP: the runtime
+// restored a subtask's KeyedState and nothing else, so an operator holding
+// timers in a Go field came back with its aggregates and nothing to fire them,
+// and a (key, window) complete before the checkpoint was silently never
+// emitted. The gap is closed, and the property is pinned here in the opposite
+// direction rather than deleted with it -- a closed gap that nothing asserts is
+// a gap waiting to reopen.
 //
-// This test states the shape of that gap so it is not rediscovered as a
-// mystery. The reserved state.PrefixTimer is what closes it: once timers live
-// in the key space, snapshotting the key space snapshots them too, which is
-// Phase 6.
-func TestRestoreDoesNotRecoverInRamOperatorState(t *testing.T) {
-	// The one thing the runtime restores is what state.WriteTo wrote, and the
-	// one thing it writes is the KeyedState. Asserted against the operator
-	// interface so that a later phase routing snapshots through
-	// core.Operator.Snapshot has to come back and change this.
-	var op core.Operator = newKeyedCount()
-	if err := op.Snapshot(io.Discard); err != nil {
-		t.Fatalf("keyedCount.Snapshot: %v", err)
-	}
-	// Nothing in the runtime calls it: the payload a subtask acknowledges comes
-	// from state.WriteTo. A build that started calling Snapshot would make the
-	// operator below fail the whole suite rather than this line.
-	if err := op.Restore(strings.NewReader("")); err != nil {
-		t.Fatalf("keyedCount.Restore: %v", err)
-	}
+// It asserts two things, and the second is the one that matters. First, that a
+// checkpoint of a windowed job CONTAINS timers. Second, that a fresh operator
+// opened on the restored state fires them: every window still open at the cut
+// comes out of the MaxInt64 flush, with the count the checkpointed aggregate
+// held. Presence alone would pass against timers written in a layout nothing
+// could read back.
+func TestRestoredWindowRecoversItsPendingTimers(t *testing.T) {
+	forEachStateBackend(t, testRestoredWindowRecoversItsPendingTimers)
 }
+
+func testRestoredWindowRecoversItsPendingTimers(t *testing.T, backend stateBackend) {
+	const (
+		count           = 20000
+		barrierInterval = 3000
+		parallelism     = 2
+	)
+	root := t.TempDir()
+	cfg := restoreConfig(7, count)
+
+	f := &windowFactory{}
+	if err := RunWithOptions(context.Background(),
+		windowGraph(t, sinks.NewCollect(), parallelism, f,
+			windowSourceVertex("src", cfg, parallelism, barrierInterval)),
+		Options{CheckpointRoot: root, Seed: cfg.Seed, NewState: backend.newState}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	storage := checkpoint.NewStorage(root)
+	id, ok, err := storage.Latest()
+	if err != nil || !ok {
+		t.Fatalf("Latest = (%d, ok %t, err %v), want a complete checkpoint", id, ok, err)
+	}
+	_, payloads, err := storage.Load(id)
+	if err != nil {
+		t.Fatalf("Load(%d): %v", id, err)
+	}
+
+	totalTimers := 0
+	for index := range parallelism {
+		payload, ok := payloads[checkpoint.SubtaskKey{VertexID: "window", Index: index}]
+		if !ok {
+			t.Fatalf("checkpoint %d holds no state for window subtask %d", id, index)
+		}
+		restored := state.NewMemory()
+		if err := state.ReadFrom(restored, bytes.NewReader(payload)); err != nil {
+			t.Fatalf("subtask %d: ReadFrom: %v", index, err)
+		}
+
+		// What the checkpoint says is still open, read straight out of it.
+		want := make(map[oracle.Key]int64)
+		restored.Iterate(func(k, v []byte) bool {
+			if len(k) == 0 || k[0] != state.PrefixTimer {
+				return true
+			}
+			recordKey := string(k[1+state.OrderedInt64Bytes : len(k)-8])
+			windowStart := int64(binary.BigEndian.Uint64(k[len(k)-8:]))
+			// The aggregate the timer will fire. A timer with no aggregate
+			// behind it would make the operator error rather than emit, which
+			// is the one failure this test could not distinguish from success
+			// if it only counted rows.
+			aggregate := append([]byte{state.PrefixUserState}, recordKey...)
+			aggregate = binary.BigEndian.AppendUint64(aggregate, uint64(windowStart))
+			value, ok := restored.Get(aggregate)
+			if !ok {
+				t.Fatalf("subtask %d: a timer for key %x window %d has no aggregate behind it", index, recordKey, windowStart)
+			}
+			n, err := operators.DecodeCount(value)
+			if err != nil {
+				t.Fatalf("subtask %d: DecodeCount: %v", index, err)
+			}
+			want[oracle.Key{Key: recordKey, WindowStart: windowStart}] = n
+			return true
+		})
+		totalTimers += len(want)
+
+		// A fresh operator on the restored state, flushed. Nothing else is fed
+		// to it: every window it emits came from a timer that survived the
+		// checkpoint, which is the whole claim.
+		op := operators.NewTumblingCount(recoveryWindowSize, recoveryWindowLateness)
+		ctx := &restoredOpContext{state: restored}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("subtask %d: Open: %v", index, err)
+		}
+		if err := op.ProcessWatermark(math.MaxInt64, ctx); err != nil {
+			t.Fatalf("subtask %d: the MaxInt64 flush: %v", index, err)
+		}
+
+		got := make(map[oracle.Key]int64, len(ctx.emitted))
+		for _, rec := range ctx.emitted {
+			n, err := operators.DecodeCount(rec.Value)
+			if err != nil {
+				t.Fatalf("subtask %d: DecodeCount: %v", index, err)
+			}
+			k := oracle.Key{Key: string(rec.Key), WindowStart: rec.EventTime - (recoveryWindowSize - 1)}
+			if _, dup := got[k]; dup {
+				t.Errorf("subtask %d: key %x window %d was flushed twice", index, k.Key, k.WindowStart)
+			}
+			got[k] = n
+		}
+		if len(got) != len(want) {
+			t.Errorf("subtask %d: the restored operator flushed %d windows, want %d", index, len(got), len(want))
+		}
+		for k, n := range want {
+			gotCount, ok := got[k]
+			if !ok {
+				t.Fatalf("subtask %d: key %x window %d was open in the checkpoint and was never fired: its timer did not survive the restore",
+					index, k.Key, k.WindowStart)
+			}
+			if gotCount != n {
+				t.Errorf("subtask %d: key %x window %d flushed %d, want %d", index, k.Key, k.WindowStart, gotCount, n)
+			}
+		}
+	}
+
+	if totalTimers == 0 {
+		t.Fatal("the checkpoint holds no timers at all, so this test asserts nothing: " +
+			"either the run closed every window before its last barrier, or timers are not being checkpointed")
+	}
+	t.Logf("checkpoint %d holds %d pending timers across %d window subtasks, and all of them fire on restore",
+		id, totalTimers, parallelism)
+}
+
+// restoredOpContext is a core.Context over state a test restored by hand. It is
+// not the runtime's opContext, which needs a transport.Writer and a set of
+// output channels this test has no use for.
+type restoredOpContext struct {
+	state   state.KeyedState
+	emitted []*core.Record
+}
+
+func (c *restoredOpContext) Emit(rec *core.Record)   { c.emitted = append(c.emitted, rec) }
+func (c *restoredOpContext) CurrentWatermark() int64 { return math.MaxInt64 }
+func (c *restoredOpContext) State() state.KeyedState { return c.state }
+
+var _ core.Context = (*restoredOpContext)(nil)
