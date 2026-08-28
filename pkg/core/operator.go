@@ -17,6 +17,18 @@ type Context interface {
 	Emit(rec *Record)
 	// CurrentWatermark returns the watermark most recently delivered to the
 	// operator, or the initial minimum if none has arrived.
+	//
+	// It is NOT RESTORED. The runtime holds this value itself and starts it at
+	// the initial minimum in every subtask, restored or not, so between a
+	// restore and the first watermark from the resumed sources it reports the
+	// minimum rather than the watermark the checkpoint was taken at.
+	//
+	// So an operator whose correctness depends on the watermark across a
+	// restart -- anything with a lateness or purge rule -- must keep its own in
+	// its KeyedState and read it from there, which is what operators.WindowCount
+	// does under state.PrefixOperatorState. This method is for an operator that
+	// wants to know what the runtime has delivered so far, which is a different
+	// question and one whose answer is allowed to reset.
 	CurrentWatermark() int64
 	// State returns the keyed state of this subtask.
 	//

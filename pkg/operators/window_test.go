@@ -1608,6 +1608,30 @@ func TestWindowRejectsAWatermarkStoredWrong(t *testing.T) {
 // are fed to an operator opened on EMPTY state, and the assertion is that the
 // two disagree. Without it this test would pass against an operator that
 // dropped the record for some unrelated reason.
+//
+// # Why this has to be pinned HERE and not in the recovery suite
+//
+// The job-level recovery suite in pkg/runtime is blind to this. Deleting the
+// watermark from the restore path leaves every one of its cases passing, and
+// that is not a weakness in those cases -- it is a property of the input.
+//
+// The generator's out-of-orderness is BOUNDED: element n has event time
+// base + n*step - lag with lag in [0, MaxLag]. The source's watermark generator
+// emits maxSeen - MaxOutOfOrderness - 1, and the jobs there set
+// MaxOutOfOrderness to the generator's own MaxLag. So the watermark is always
+// strictly below the smallest event time any later element can carry, and NO
+// RECORD IS EVER LATE. The lateness path therefore has nothing to reject during
+// the gap between a restore and the first watermark from the resumed sources,
+// which is the only window in which a lost watermark is observable at all. A
+// watermark restored as MinInt64 is more permissive over that gap, and nothing
+// arrives that a correct one would have dropped.
+//
+// That guarantee belongs to the GENERATOR, not to the engine, and it stops
+// holding in Phase 6. Nexmark's input makes no bounded-lag promise, so a
+// record below the watermark is an ordinary event there rather than an
+// impossible one, and the gap this test covers becomes reachable from a whole
+// job. At that point the job level has to watch it too and this test stops
+// being the only thing standing between the bug and the sink.
 func TestRestoredWindowRecoversItsWatermark(t *testing.T) {
 	h := newWindowHarness(t, NewTumblingCount(100, 0))
 	h.record("a", 10)

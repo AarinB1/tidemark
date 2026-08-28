@@ -276,6 +276,26 @@ var watermarkStateKey = append([]byte{state.PrefixOperatorState}, "watermark"...
 // a map lookup; on Pebble it is a point read of a key rewritten on every
 // watermark, so it is in the memtable. Correctness is the deliverable here and
 // a cache with a validity flag is the clever version of this.
+//
+// # This and core.Context.CurrentWatermark are TWO different values
+//
+// The runtime keeps its own copy of the last watermark it delivered and hands
+// it out through core.Context.CurrentWatermark. This function does not read it
+// and must not be replaced by it, which is worth saying plainly because the
+// Context is right there and a Get against state looks redundant beside it.
+//
+// The runtime's copy is NOT restored. It starts at MinInt64 in a fresh
+// opContext and is only written when a watermark is delivered, so from the
+// moment a subtask is restored until its resumed sources produce a watermark,
+// core.Context.CurrentWatermark reports MinInt64 while this reports the value
+// the checkpoint recorded. They agree everywhere else, which is exactly what
+// makes the pair dangerous: two sources of truth that agree until a restore are
+// the shape of the bug this phase was written to fix, and an operator that
+// reached for the Context's copy would have that bug back with no test in
+// pkg/runtime able to see it.
+//
+// The late-record check is this one. isPurged is called with the value returned
+// here and with nothing else.
 func (w *WindowCount) currentWatermark() (int64, error) {
 	v, ok := w.state.Get(watermarkStateKey)
 	if !ok {
@@ -672,6 +692,10 @@ func (w *WindowCount) fire(key []byte, start int64, ctx core.Context) error {
 // The watermark is a parameter rather than a field because it lives in state;
 // each caller reads it once and passes it down, which also makes it obvious
 // that one call sees one watermark throughout.
+//
+// Every caller passes the value from currentWatermark, which reads state, and
+// never core.Context.CurrentWatermark, which is the runtime's own copy and is
+// not restored. See the note on currentWatermark.
 func (w *WindowCount) isPurged(watermark, start int64) bool {
 	return watermark > addCeil(addCeil(start, w.size), w.allowedLateness)
 }
