@@ -29,3 +29,25 @@ jobs:
       # and a tight threshold here produces false alarms that train you to
       # ignore the check. The 15 percent comparison stays local.
       - run: make bench-check BENCH_THRESHOLD=40
+
+  # Five hundred seeded fault schedules against the batch oracle, plus the
+  # census that says how many of them landed somewhere a bug could have
+  # surfaced. Its own job rather than a step in check, so that a divergence and
+  # a unit-test failure are told apart at a glance in the run list.
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # Without -race, deliberately. The detector costs 5 to 20x and 500
+      # schedules under it fit no budget this job could have.
+      - run: make chaos
+
+      # The subset that does run under it. 25 contiguous seeds, which are the
+      # same 25 schedules every time -- they are a function of the seed -- so
+      # this is a fixed slice of the suite above rather than a sample of it.
+      - run: make chaos-race
