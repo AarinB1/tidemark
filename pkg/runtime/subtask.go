@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 
@@ -69,6 +70,10 @@ type subtaskConfig struct {
 	// coordinator counting acknowledgements would be told about two different
 	// cuts under one name.
 	restoredCheckpoint int64
+	// injector is consulted at the three logical positions a subtask can be
+	// aborted at, and is nil for every job that is not a chaos run. See
+	// FaultInjector.
+	injector FaultInjector
 }
 
 // makeState returns the keyed state for one operator subtask.
@@ -132,6 +137,116 @@ func (c checkpointer) finished(payload []byte) error {
 	return c.co.Finished(c.key, payload)
 }
 
+// ErrFaultInjected is what a subtask returns when a FaultInjector aborts it.
+//
+// A sentinel rather than a type, matched with errors.Is, so that a harness can
+// tell an abort it asked for apart from a run that failed for some other
+// reason. A chaos suite that treated any error as its own fault would report a
+// real bug as a successful injection.
+var ErrFaultInjected = errors.New("fault injected")
+
+// FaultInjector decides, at three logical positions, whether a subtask should
+// abort.
+//
+// # Why this is an interface
+//
+// It is the sixth exported interface in this project and CLAUDE.md requires a
+// justification for each. It exists so that fault injection does not need a
+// second code path through the runtime: without it, "run with faults" would be
+// a parallel set of loops in the chaos harness, and the thing under test would
+// be that copy rather than the runtime a real job runs on. There are exactly
+// two implementations and there will not be a third: nil, which is every job
+// that is not a chaos run, and the schedule-driven one in test/chaos.
+//
+// # Logical position, never wall clock
+//
+// Every call site is keyed to a count the subtask keeps: records processed,
+// barriers forwarded, inputs that have delivered a barrier. None of them
+// consults a clock, and none of them can be reached by a path that a timer
+// decides. That is invariant 6: Go's scheduler is not deterministic, so a
+// fault schedule placed on a clock lands somewhere different on every run and
+// a seed stops naming a reproducible failure.
+//
+// An implementation is called from EVERY subtask goroutine of a job and must
+// be safe for concurrent use.
+type FaultInjector interface {
+	// BeforeElement is consulted before the subtask processes a record, with n
+	// the number of records it has already processed in this run. It is
+	// therefore called with n = 0 before the first record. Watermarks,
+	// barriers and end-of-stream are not records and are not counted.
+	//
+	// The count restarts at zero in a recovered run, because it is a position
+	// within a run rather than within the job: a resumed source begins again
+	// from its checkpointed offset, and a resumed operator has processed
+	// nothing.
+	BeforeElement(vertexID string, subtask int, n int64) bool
+	// AfterBarrierForwarded is consulted immediately after the subtask has put
+	// barrier checkpointID on its outputs -- and, for a SINK, immediately
+	// after it has acknowledged the barrier, which is a sink's whole part in
+	// the protocol since it forwards nothing.
+	AfterBarrierForwarded(vertexID string, subtask int, checkpointID int64) bool
+	// DuringAlignment is consulted when barrier checkpointID has arrived on
+	// one of the subtask's inputs, delivered of its live inputs have now
+	// delivered it, and at least one live input has not.
+	//
+	// It is NOT consulted for the barrier that completes alignment. There is
+	// no gap left to land in at that point, so offering the decision there
+	// would let a schedule aimed at an alignment window record a hit for a
+	// fault that fired somewhere else.
+	DuringAlignment(vertexID string, subtask int, checkpointID int64, delivered int) bool
+}
+
+// faults is a subtask's half of fault injection: the injector, plus the
+// identity of the subtask consulting it.
+//
+// It exists so that "this job injects no faults" is handled in ONE place,
+// which is the same reason checkpointer exists and the same shape. The zero
+// value injects nothing, so every existing test and every real job runs
+// through the same code with a nil injector rather than around it.
+//
+// It holds no counters. The element count belongs to the loop that does the
+// counting, so that the Gate can hold one of these without owning a number it
+// never touches.
+type faults struct {
+	injector FaultInjector
+	id       subtaskID
+}
+
+// beforeElement consults the injector for the record about to be processed,
+// with n the number this subtask has already processed.
+func (f faults) beforeElement(n int64) error {
+	if f.injector == nil {
+		return nil
+	}
+	if !f.injector.BeforeElement(f.id.vertexID, f.id.index, n) {
+		return nil
+	}
+	return fmt.Errorf("subtask %s: %w after %d elements", f.id, ErrFaultInjected, n)
+}
+
+// afterBarrierForwarded consults the injector for the barrier just forwarded.
+func (f faults) afterBarrierForwarded(checkpointID int64) error {
+	if f.injector == nil {
+		return nil
+	}
+	if !f.injector.AfterBarrierForwarded(f.id.vertexID, f.id.index, checkpointID) {
+		return nil
+	}
+	return fmt.Errorf("subtask %s: %w just after forwarding barrier %d", f.id, ErrFaultInjected, checkpointID)
+}
+
+// duringAlignment consults the injector inside an alignment window.
+func (f faults) duringAlignment(checkpointID int64, delivered int) error {
+	if f.injector == nil {
+		return nil
+	}
+	if !f.injector.DuringAlignment(f.id.vertexID, f.id.index, checkpointID, delivered) {
+		return nil
+	}
+	return fmt.Errorf("subtask %s: %w aligning barrier %d with %d inputs delivered",
+		f.id, ErrFaultInjected, checkpointID, delivered)
+}
+
 // positionBytes is the width of a source subtask's snapshot payload.
 const positionBytes = 8
 
@@ -170,24 +285,25 @@ func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, grou
 	defer w.CloseAll()
 
 	cp := checkpointer{co: cfg.coordinator, key: id.checkpointKey()}
+	fs := faults{injector: cfg.injector, id: id}
 	switch v.Kind {
 	case graph.VertexSource:
-		return runSourceSubtask(ctx, v, id, w, cp, cfg)
+		return runSourceSubtask(ctx, v, id, w, cp, fs, cfg)
 	case graph.VertexOperator:
-		return runOperatorSubtask(ctx, v, id, gate, w, cp, cfg)
+		return runOperatorSubtask(ctx, v, id, gate, w, cp, fs, cfg)
 	case graph.VertexSink:
 		// A sink restores nothing. Its payload is empty by construction, and it
 		// will be until the transactional sink in Phase 5 has a staging area to
 		// record. Ignored rather than checked, because a sink that found
 		// something there could not do anything with it either.
-		return runSinkSubtask(ctx, v, id, gate, w, cp)
+		return runSinkSubtask(ctx, v, id, gate, w, cp, fs)
 	default:
 		return fmt.Errorf("subtask %s: unknown kind %d", id, uint8(v.Kind))
 	}
 }
 
 // runSourceSubtask reads this subtask's slice of the offset space and emits it.
-func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *transport.Writer, cp checkpointer, cfg subtaskConfig) (err error) {
+func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *transport.Writer, cp checkpointer, fs faults, cfg subtaskConfig) (err error) {
 	src := v.NewSource()
 	oc := newOpContext(ctx, w)
 	if err := src.Open(oc); err != nil {
@@ -199,7 +315,17 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 		}
 	}()
 
-	emitRecord := func(rec *core.Record) error { return w.EmitRecord(ctx, rec) }
+	// elements is this subtask's logical position: the records it has emitted
+	// in this run. It is what a fault scheduled at an element count is keyed
+	// to, and it is a count rather than a clock for invariant 6's reason.
+	var elements int64
+	emitRecord := func(rec *core.Record) error {
+		if err := fs.beforeElement(elements); err != nil {
+			return err
+		}
+		elements++
+		return w.EmitRecord(ctx, rec)
+	}
 	// Watermarks broadcast; they never partition. A watermark that reached one
 	// subtask of a downstream vertex would leave the others with no event-time
 	// signal at all, so their windows would sit open until end of input and the
@@ -226,7 +352,14 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 				return fmt.Errorf("checkpoint %d: %w", b.CheckpointID, err)
 			}
 		}
-		return w.Broadcast(ctx, core.NewBarrierElement(b))
+		if err := w.Broadcast(ctx, core.NewBarrierElement(b)); err != nil {
+			return err
+		}
+		// After the broadcast, so a fault here leaves the barrier downstream and
+		// the snapshot already acknowledged. That is the interesting cut: the
+		// checkpoint can still complete without this subtask, and the run that
+		// recovers from it resumes at the offset this barrier recorded.
+		return fs.afterBarrierForwarded(b.CheckpointID)
 	}
 	wm := newWatermarkGenerator(v.WatermarkIntervalElements, v.MaxOutOfOrderness)
 
@@ -265,7 +398,7 @@ func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *tran
 	return w.Broadcast(ctx, core.NewEndOfStreamElement())
 }
 
-func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, cfg subtaskConfig) (err error) {
+func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, fs faults, cfg subtaskConfig) (err error) {
 	st, err := cfg.makeState()
 	if err != nil {
 		return fmt.Errorf("operator %s: state: %w", id, err)
@@ -301,16 +434,24 @@ func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate 
 		}
 	}
 
-	return runOperatorLoop(ctx, op, oc, id, gate, w, cp)
+	return runOperatorLoop(ctx, op, oc, id, gate, w, cp, fs)
 }
 
 // runOperatorLoop is the element loop of an operator subtask, split from the
 // open and close around it so that a test can drive it with a context whose
 // state backend is one that fails on demand. Nothing else calls it.
-func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer) error {
+func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, fs faults) error {
+	var elements int64
 	for {
 		e, ok := gate.Recv()
 		if !ok {
+			// A fault fired inside the gate's alignment. It is this subtask's
+			// failure and it is reported from here, because the gate has no
+			// error to return from Recv; everything downstream of it then takes
+			// the ordinary path an upstream failure already takes.
+			if err := gate.Err(); err != nil {
+				return err
+			}
 			// Every input closed without the gate delivering an end-of-stream:
 			// an upstream subtask failed, or the job was cancelled. That
 			// goroutine reports the cause, so this one exits quietly.
@@ -318,6 +459,10 @@ func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id su
 		}
 		switch e.Kind {
 		case core.KindRecord:
+			if err := fs.beforeElement(elements); err != nil {
+				return err
+			}
+			elements++
 			if err := op.ProcessElement(e.Record, oc); err != nil {
 				return fmt.Errorf("operator %s: process: %w", id, err)
 			}
@@ -380,13 +525,16 @@ func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id su
 			if err := w.Broadcast(ctx, e); err != nil {
 				return err
 			}
+			if err := fs.afterBarrierForwarded(e.Barrier.CheckpointID); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("operator %s: unexpected %s element", id, e.Kind)
 		}
 	}
 }
 
-func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer) (err error) {
+func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, fs faults) (err error) {
 	snk := v.NewSink()
 	oc := newOpContext(ctx, w)
 	if err := snk.Open(oc); err != nil {
@@ -398,13 +546,21 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 		}
 	}()
 
+	var elements int64
 	for {
 		e, ok := gate.Recv()
 		if !ok {
+			if err := gate.Err(); err != nil {
+				return err
+			}
 			return ctx.Err()
 		}
 		switch e.Kind {
 		case core.KindRecord:
+			if err := fs.beforeElement(elements); err != nil {
+				return err
+			}
+			elements++
 			if err := snk.Write(e.Record); err != nil {
 				return fmt.Errorf("sink %s: write: %w", id, err)
 			}
@@ -424,6 +580,12 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 			// the protocol rather than content to a payload.
 			if err := cp.snapshot(e.Barrier.CheckpointID, nil); err != nil {
 				return fmt.Errorf("sink %s: checkpoint %d: %w", id, e.Barrier.CheckpointID, err)
+			}
+			// A sink forwards nothing, so its acknowledgement is the whole of
+			// its part in the barrier protocol and is the position this trigger
+			// names here. See FaultInjector.AfterBarrierForwarded.
+			if err := fs.afterBarrierForwarded(e.Barrier.CheckpointID); err != nil {
+				return err
 			}
 		case core.KindEndOfStream:
 			return nil

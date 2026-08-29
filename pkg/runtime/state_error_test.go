@@ -134,7 +134,7 @@ func runOperatorWithState(t *testing.T, st state.KeyedState, elems []core.Stream
 	ctx, cancel := context.WithCancel(context.Background())
 	in := transport.NewChannel(len(elems) + 1)
 	out := transport.NewChannel(len(elems) + 1)
-	gate := NewGate(ctx, []transport.Input{in})
+	gate := NewGate(ctx, []transport.Input{in}, faults{})
 	w := transport.NewWriter([][]transport.Output{{out}})
 
 	oc := newOpContext(ctx, w)
@@ -156,7 +156,7 @@ func runOperatorWithState(t *testing.T, st state.KeyedState, elems []core.Stream
 	// checkpointer{} is a subtask in a job that takes no checkpoints, which is
 	// what every test here wants: the property under test is the state backend,
 	// and a coordinator would put a second failure path in the way of it.
-	err := runOperatorLoop(ctx, op, oc, subtaskID{vertexID: "op", index: 0}, gate, w, checkpointer{})
+	err := runOperatorLoop(ctx, op, oc, subtaskID{vertexID: "op", index: 0}, gate, w, checkpointer{}, faults{})
 
 	// Cancel first: a subtask that returned early leaves its forwarder blocked
 	// on a send to the merged channel, and Wait is what proves no goroutine
