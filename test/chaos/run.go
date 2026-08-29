@@ -102,6 +102,11 @@ func windowSpec() oracle.Spec { return oracle.Spec{Size: windowSize, Slide: wind
 // windowFactory builds one window operator per subtask and keeps a handle on
 // each, so a run can be asked afterwards whether anything was dropped.
 type windowFactory struct {
+	// tally is where the operators this factory makes report their firings. A
+	// nil tally means the run is not being timed, which is what the graph built
+	// only to be scheduled against uses.
+	tally *firingTally
+
 	mu   sync.Mutex
 	made []*operators.WindowCount
 }
@@ -109,9 +114,12 @@ type windowFactory struct {
 func (f *windowFactory) newOperator() core.Operator {
 	w := operators.NewTumblingCount(windowSize, windowLateness)
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.made = append(f.made, w)
-	return w
+	f.mu.Unlock()
+	if f.tally == nil {
+		return w
+	}
+	return &firingRecorder{inner: w, tally: f.tally}
 }
 
 func (f *windowFactory) dropped() int64 {
@@ -199,6 +207,12 @@ type Result struct {
 	// Recoveries is one entry per resume, in order. It is empty for a schedule
 	// whose faults never fired, including the empty ones.
 	Recoveries []Recovery
+	// CleanTiming and FaultTiming are what the oracle cannot see: where the
+	// windows fired and how much state was held while they had not. The fault
+	// side covers every attempt of the schedule together, because they are one
+	// job that happened to be interrupted. See Timing.
+	CleanTiming Timing
+	FaultTiming Timing
 }
 
 // RunSchedule runs seed's schedule and compares the result against the batch
@@ -236,12 +250,15 @@ func RunSchedule(t *testing.T, seed int64) Result {
 	// CONTENTS of the sink, and a run that has nothing to recover from has
 	// nothing to write. Barriers still flow through it, because they are part
 	// of the element stream whether or not anybody records snapshots.
-	cleanFactory := &windowFactory{}
+	cleanTally, cleanMeter := &firingTally{}, &stateMeter{}
+	cleanFactory := &windowFactory{tally: cleanTally}
 	cleanSink := sinks.NewCollect()
 	if err := runtime.RunWithOptions(context.Background(), jobGraph(cleanSink, cleanFactory),
-		runtime.Options{Seed: uint64(seed)}); err != nil {
+		runtime.Options{Seed: uint64(seed), NewState: cleanMeter.newState}); err != nil {
 		t.Fatalf("seed %d: the clean run failed: %v", seed, err)
 	}
+	res.CleanTiming = cleanTally.timing()
+	res.CleanTiming.PeakStateEntries = cleanMeter.peak.Load()
 	assertDroppedNothing(t, seed, cleanFactory, "clean run")
 	assertCleanRunFiredEachWindowOnce(t, seed, cleanSink)
 	assertMatchesOracle(t, seed, cleanSink, "clean run")
@@ -256,13 +273,22 @@ func RunSchedule(t *testing.T, seed int64) Result {
 			t.Fatalf("seed %d: still failing after %d recoveries with faults %v: a fault fires at most once, "+
 				"so this is a fault firing twice or a recovery that made no progress", seed, maxRecoveries, faults)
 		}
-		f := &windowFactory{}
+		// One tally and one meter per ATTEMPT. The firings sum across attempts
+		// because they are all firings of this schedule; the peak does not,
+		// because an attempt has unwound before the next one starts and the two
+		// were never held at once. Timing.add is where that distinction lives.
+		tally, meter := &firingTally{}, &stateMeter{}
+		f := &windowFactory{tally: tally}
 		err := runtime.RunWithOptions(context.Background(), jobGraph(sink, f), runtime.Options{
 			CheckpointRoot: root,
 			RestoreFrom:    restoreFrom,
 			Seed:           uint64(seed),
 			FaultInjector:  inj,
+			NewState:       meter.newState,
 		})
+		attempt := tally.timing()
+		attempt.PeakStateEntries = meter.peak.Load()
+		res.FaultTiming.add(attempt)
 		if err == nil {
 			assertDroppedNothing(t, seed, f, "fault run")
 			break

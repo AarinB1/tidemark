@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
+	"github.com/AarinB1/tidemark/pkg/core"
+	"github.com/AarinB1/tidemark/pkg/operators"
 	"github.com/AarinB1/tidemark/pkg/sources"
 	"github.com/AarinB1/tidemark/pkg/state"
 	"github.com/AarinB1/tidemark/test/oracle"
@@ -550,3 +556,472 @@ func floorMod(a, b int64) int64 {
 	}
 	return m
 }
+
+// The oracle is structurally blind to timing, and five hundred comparisons
+// against it inherit that blindness exactly.
+//
+// Phase 2 established the shape of it: freezing an exhausted input at its last
+// watermark instead of dropping it out of the minimum cannot change the final
+// contents of the sink, because the gate's MaxInt64 at end of input flushes
+// whatever is still open and fixes everything up. Every window comes out with
+// the right count. What changes is WHEN the windows fired and how much state
+// the run was holding while they did not, and neither is a thing the oracle
+// has an opinion about.
+//
+// So two numbers are recorded that the oracle cannot see, and both inflate
+// under exactly that class of bug: a watermark that advances too slowly leaves
+// windows open to the end, which raises the share of firings that come from the
+// flush and raises the peak state along with it.
+//
+// They are asserted on the AGGREGATE across the suite and never per run.
+// Recovery legitimately raises the flush fraction -- a resumed run re-fires
+// windows against a watermark that starts again from the minimum -- so a
+// per-run bound would be a bound on how many faults a seed happened to draw.
+
+// Timing is what one run, or one schedule's runs together, did in time rather
+// than in contents.
+type Timing struct {
+	// FlushFirings is how many windows fired on the end-of-input MaxInt64
+	// watermark, and WatermarkFirings how many fired on an advancing one.
+	FlushFirings     int64
+	WatermarkFirings int64
+	// OtherEmissions is anything this operator emitted outside
+	// ProcessWatermark. It is zero today -- WindowCount emits only from fire,
+	// which only ProcessWatermark calls -- and it is counted rather than
+	// assumed so that an operator that started emitting elsewhere would show up
+	// here instead of silently unbalancing the fraction above.
+	OtherEmissions int64
+	// PeakStateEntries is the greatest number of KeyedState entries the
+	// operator subtasks held between them at one moment.
+	PeakStateEntries int64
+}
+
+// firings is the denominator of the flush fraction.
+func (t Timing) firings() int64 { return t.FlushFirings + t.WatermarkFirings }
+
+// add folds another run's timing in: the firings sum, the peak is the greater.
+//
+// Summing the firings across the attempts of one schedule is what makes the
+// aggregate a fraction of every window this schedule fired, replay included. A
+// peak is not a sum: two runs each holding a thousand entries never held two
+// thousand, because the first had unwound before the second started.
+func (t *Timing) add(o Timing) {
+	t.FlushFirings += o.FlushFirings
+	t.WatermarkFirings += o.WatermarkFirings
+	t.OtherEmissions += o.OtherEmissions
+	if o.PeakStateEntries > t.PeakStateEntries {
+		t.PeakStateEntries = o.PeakStateEntries
+	}
+}
+
+// TimingAggregate is the suite's timing, clean runs and fault runs apart.
+//
+// Apart, because the difference between them is more informative than either
+// alone. A clean run and a recovered one hold the same final contents by
+// construction; if they also held the same peak state and fired the same share
+// of their windows on the flush, recovery would be costing nothing, and it does
+// cost something. The two columns are what makes that visible instead of
+// averaged away.
+type TimingAggregate struct {
+	Schedules int
+	Clean     Timing
+	Fault     Timing
+	// PeakStateSum is the total of the per-schedule peaks, from which the mean
+	// is taken. The mean rather than the maximum: one schedule that recovered
+	// three times has a peak the other four hundred and ninety-nine say nothing
+	// about, and a baseline pinned to it would be a baseline pinned to the
+	// unluckiest seed.
+	CleanPeakStateSum int64
+	FaultPeakStateSum int64
+}
+
+// AddTiming folds one schedule's timing into the aggregate.
+func (a *TimingAggregate) AddTiming(r Result) {
+	a.Schedules++
+	a.Clean.add(r.CleanTiming)
+	a.Fault.add(r.FaultTiming)
+	a.CleanPeakStateSum += r.CleanTiming.PeakStateEntries
+	a.FaultPeakStateSum += r.FaultTiming.PeakStateEntries
+}
+
+// FlushFraction is the share of windows that fired on the end-of-input flush.
+func (t Timing) FlushFraction() float64 {
+	if t.firings() == 0 {
+		return 0
+	}
+	return float64(t.FlushFirings) / float64(t.firings())
+}
+
+// MeanPeakState is the mean per-schedule peak entry count.
+func (a TimingAggregate) MeanPeakState(sum int64) float64 {
+	if a.Schedules == 0 {
+		return 0
+	}
+	return float64(sum) / float64(a.Schedules)
+}
+
+// Table renders the timing aggregate for a person to read.
+func (a TimingAggregate) Table() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "\ntiming over %d schedules            clean        fault\n", a.Schedules)
+	fmt.Fprintf(&b, "  %-28s %10d %12d\n", "windows fired on a watermark", a.Clean.WatermarkFirings, a.Fault.WatermarkFirings)
+	fmt.Fprintf(&b, "  %-28s %10d %12d\n", "windows fired on the flush", a.Clean.FlushFirings, a.Fault.FlushFirings)
+	fmt.Fprintf(&b, "  %-28s %9.1f%% %11.1f%%\n", "flush fraction", 100*a.Clean.FlushFraction(), 100*a.Fault.FlushFraction())
+	fmt.Fprintf(&b, "  %-28s %10.1f %12.1f\n", "mean peak state entries",
+		a.MeanPeakState(a.CleanPeakStateSum), a.MeanPeakState(a.FaultPeakStateSum))
+	fmt.Fprintf(&b, "  %-28s %10d %12d\n", "emissions outside a watermark", a.Clean.OtherEmissions, a.Fault.OtherEmissions)
+	return b.String()
+}
+
+// TimingBand is one baseline figure and the relative band the suite is allowed
+// around it.
+//
+// Per figure rather than one tolerance for all four, because the four do not
+// vary alike and a single number would have to be the widest of them.
+//
+// ASYMMETRIC, and the peaks are why. The failure this phase's timing metrics
+// are aimed at is inflation -- a watermark that stalls holds its windows to the
+// end of the run -- so the side of the band that has to be tight is the one
+// above the baseline. The side below is only there for the opposite bug, a
+// watermark that runs ahead, which the flush fraction catches far more sharply
+// than the peak does. So the peaks are given room below, where the noise is
+// (the race detector alone moves them four per cent), and held close above,
+// where the signal is.
+//
+// The peak metric has little room to move up in the first place, and that is
+// worth knowing rather than hiding. This workload's peak sits at about
+// seven-eighths of every window it will ever open being open at once, which is
+// the staircase again; a watermark that stalled completely could raise it by
+// about a seventh and no more. The flush fraction is the load-bearing half of
+// this pair.
+type TimingBand struct {
+	Baseline float64
+	// Below and Above are the relative distances the figure may fall or rise
+	// from the baseline.
+	Below float64
+	Above float64
+}
+
+func (b TimingBand) lo() float64 { return b.Baseline * (1 - b.Below) }
+func (b TimingBand) hi() float64 { return b.Baseline * (1 + b.Above) }
+
+// TimingBaseline is what the suite's timing aggregate is held to.
+//
+// A committed constant with a band, the way test/bench/baseline.json works. The
+// values are observations and not targets: they are what this workload does,
+// and the assertion is that it keeps doing it.
+//
+// # Why both sides are bounded
+//
+// The upper bound is the watermark that advances too slowly: windows stay open
+// to the end, the flush fires them, and the peak state carries the whole run.
+// That is the failure freezing an exhausted input at its last watermark
+// produces, and it is invisible to the oracle -- the MaxInt64 flush fixes the
+// contents up at the end, so every count comes out right.
+//
+// The lower bound is the opposite failure and is worth as much. A watermark
+// that runs AHEAD -- a gate taking the maximum over its inputs rather than the
+// minimum -- fires windows early, so almost nothing is left for the flush and
+// the fraction collapses. The oracle usually catches that one through the
+// counts, and a band that only bounded one side would be leaving the cheaper
+// detection on the floor.
+type TimingBaseline struct {
+	CleanFlushFraction TimingBand
+	FaultFlushFraction TimingBand
+	CleanPeakState     TimingBand
+	FaultPeakState     TimingBand
+}
+
+// flushToleranceSmallSuite and flushToleranceFullSuite are the bands the two
+// flush fractions get, and smallSuite is where one becomes the other.
+//
+// Two regimes because the figure has two variances, not because a tight number
+// was inconvenient. Over five hundred schedules the clean flush fraction lands
+// in a range of about 0.015; over twenty-five it ranges by 0.14, which is very
+// nearly ten times as wide. That is what a mean over twenty-five samples of a
+// concurrent job does, and no amount of care in the instrument changes it:
+// whether a window fires before the input ends depends on how far the sources
+// ran ahead of the operator, and that is the Go scheduler's to decide.
+//
+// This is the shape the throughput check already uses -- fifteen per cent
+// locally against forty in CI, because "a tight threshold there produces false
+// alarms that train you to ignore the check". The wide band is still an
+// assertion. What it is aimed at moves this fraction to nearly zero or nearly
+// one: a gate taking the maximum fires every window early, and one that freezes
+// an exhausted input at its last watermark fires almost none of them until the
+// end-of-input flush. Neither lands inside a band of 0.128 to 0.512.
+const (
+	flushToleranceFullSuite  = 0.20
+	flushToleranceSmallSuite = 0.60
+	smallSuite               = 200
+)
+
+// SuiteTimingBaseline is the committed baseline for this workload over the
+// given number of schedules.
+//
+// Observed over runs of both sizes, with zero divergence from the oracle
+// throughout:
+//
+//	                         500 schedules      25 schedules   baseline        band
+//	clean flush fraction   0.3117 - 0.3510   0.2176 - 0.4040      0.320       below
+//	fault flush fraction   0.3122 - 0.3382   0.1648 - 0.4077      0.320       below
+//	clean mean peak state  3807.6 - 3840.0   3628.3 - 3877.8       3810   -15% +8%
+//	fault mean peak state  3925.6 - 3941.7   3727.5 - 3969.3       3930   -15% +8%
+//
+// The twenty-five-schedule column spans runs with AND without the race
+// detector, which is what CI runs at that size. The detector costs the peaks
+// about four per cent -- everything is slower, so the sources run less far
+// ahead of the operator and less is open at once -- and that is the whole
+// reason those bands are given room below.
+//
+// The flush band is +-20% at or above two hundred schedules and +-60% below it;
+// see the constants above for why.
+//
+// Roughly a third of this workload's windows fire on the end-of-input flush.
+// That is the staircase runtime.watermarkGenerator documents, showing up as a
+// number: source subtasks cover contiguous event-time ranges, so the gate's
+// minimum sits at the earliest subtask's watermark until that subtask exhausts
+// its range, and the windows above it are still open when the input ends. It is
+// expected, it is recorded here so that it stops being a surprise, and it is
+// why the metric is a baseline rather than a target of zero.
+func SuiteTimingBaseline(schedules int) TimingBaseline {
+	flush := flushToleranceFullSuite
+	if schedules < smallSuite {
+		flush = flushToleranceSmallSuite
+	}
+	return TimingBaseline{
+		CleanFlushFraction: TimingBand{Baseline: 0.320, Below: flush, Above: flush},
+		FaultFlushFraction: TimingBand{Baseline: 0.320, Below: flush, Above: flush},
+		CleanPeakState:     TimingBand{Baseline: 3810, Below: 0.15, Above: 0.08},
+		FaultPeakState:     TimingBand{Baseline: 3930, Below: 0.15, Above: 0.08},
+	}
+}
+
+// Check reports every way a's timing leaves the baseline's bands, or nil.
+func (a TimingAggregate) Check(b TimingBaseline) error {
+	if a.Schedules == 0 {
+		return fmt.Errorf("the timing aggregate covers no schedules at all")
+	}
+	// The guard the floors have, in the shape timing needs it. A decorator that
+	// silently stopped counting -- an operator wrapper that lost a method, a
+	// factory handed no tally -- leaves every band below comparing zero against
+	// a baseline, and a zero flush fraction would read as a failure of the
+	// engine rather than of the instrument. Named here instead.
+	if a.Clean.firings() == 0 || a.Fault.firings() == 0 {
+		return fmt.Errorf("the timing aggregate recorded %d clean firings and %d fault firings: "+
+			"nothing was instrumented, so every band below is a comparison against zero",
+			a.Clean.firings(), a.Fault.firings())
+	}
+	var problems []string
+	if a.Clean.OtherEmissions != 0 || a.Fault.OtherEmissions != 0 {
+		problems = append(problems, fmt.Sprintf("the operator emitted %d records outside ProcessWatermark: "+
+			"the flush fraction is a fraction of the wrong denominator",
+			a.Clean.OtherEmissions+a.Fault.OtherEmissions))
+	}
+	band := func(name string, got float64, want TimingBand) {
+		if got < want.lo() || got > want.hi() {
+			problems = append(problems, fmt.Sprintf("%s: %.4f, baseline %.4f, band [%.4f, %.4f]",
+				name, got, want.Baseline, want.lo(), want.hi()))
+		}
+	}
+	band("clean flush fraction", a.Clean.FlushFraction(), b.CleanFlushFraction)
+	band("fault flush fraction", a.Fault.FlushFraction(), b.FaultFlushFraction)
+	band("clean mean peak state", a.MeanPeakState(a.CleanPeakStateSum), b.CleanPeakState)
+	band("fault mean peak state", a.MeanPeakState(a.FaultPeakStateSum), b.FaultPeakState)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the timing aggregate left its baseline:\n    %s", strings.Join(problems, "\n    "))
+}
+
+// firingTally accumulates one run's window firings, attributed to the
+// watermark that released them.
+//
+// The runtime calls an operator from one goroutine, but a job has two operator
+// subtasks and they share one tally, so it locks. The lock is taken once per
+// ProcessWatermark and never on the record path.
+type firingTally struct {
+	mu sync.Mutex
+	t  Timing
+}
+
+// atWatermark records that n windows were emitted while processing wm.
+//
+// math.MaxInt64 is the end-of-input flush and nothing else reaches it. No
+// source emits it -- see runtime.watermarkGenerator -- and the gate produces it
+// exactly when every one of its inputs has finished, because the minimum over
+// an empty set of live inputs IS the maximum int64. So the test is an equality
+// rather than a threshold: "no live input can contradict me" and "event time is
+// over" are the same statement, and a threshold would quietly also catch a
+// watermark that merely got very large.
+func (f *firingTally) atWatermark(wm int64, n int64) {
+	if n == 0 {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if wm == math.MaxInt64 {
+		f.t.FlushFirings += n
+	} else {
+		f.t.WatermarkFirings += n
+	}
+}
+
+// elsewhere records emissions from anywhere that is not ProcessWatermark.
+func (f *firingTally) elsewhere(n int64) {
+	if n == 0 {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.t.OtherEmissions += n
+}
+
+func (f *firingTally) timing() Timing {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.t
+}
+
+// countingContext is a core.Context that counts what an operator emits through
+// it and forwards everything else.
+//
+// Every method is forwarded EXPLICITLY rather than promoted from an embedded
+// core.Context. Embedding would compile and would leave a decorator that
+// silently stopped counting the moment core.Context grew a method -- which is
+// the trap CLAUDE.md records against decorators of core.Source, in a package
+// where the consequence is a fault suite that quietly measures nothing.
+type countingContext struct {
+	inner   core.Context
+	emitted int64
+}
+
+var _ core.Context = (*countingContext)(nil)
+
+func (c *countingContext) Emit(rec *core.Record) {
+	c.emitted++
+	c.inner.Emit(rec)
+}
+
+func (c *countingContext) CurrentWatermark() int64 { return c.inner.CurrentWatermark() }
+func (c *countingContext) State() state.KeyedState { return c.inner.State() }
+
+// firingRecorder wraps a WindowCount and attributes each window it emits to the
+// watermark that fired it.
+//
+// The operator emits only from fire, and only ProcessWatermark calls fire, so
+// counting the emissions of one ProcessWatermark call is counting the windows
+// that watermark released. That is a property of WindowCount today rather than
+// of core.Operator, which is why the other two element paths are wrapped as
+// well and their emissions counted separately: if it stopped being true, the
+// number would move to OtherEmissions and the suite would say so, instead of
+// the fraction quietly becoming a fraction of the wrong total.
+//
+// Every method is forwarded explicitly, for the reason on countingContext.
+type firingRecorder struct {
+	inner *operators.WindowCount
+	tally *firingTally
+}
+
+var _ core.Operator = (*firingRecorder)(nil)
+
+func (f *firingRecorder) Open(ctx core.Context) error {
+	c := &countingContext{inner: ctx}
+	err := f.inner.Open(c)
+	f.tally.elsewhere(c.emitted)
+	return err
+}
+
+func (f *firingRecorder) ProcessElement(rec *core.Record, ctx core.Context) error {
+	c := &countingContext{inner: ctx}
+	err := f.inner.ProcessElement(rec, c)
+	f.tally.elsewhere(c.emitted)
+	return err
+}
+
+func (f *firingRecorder) ProcessWatermark(wm int64, ctx core.Context) error {
+	c := &countingContext{inner: ctx}
+	err := f.inner.ProcessWatermark(wm, c)
+	f.tally.atWatermark(wm, c.emitted)
+	return err
+}
+
+func (f *firingRecorder) OnEndOfStream(ctx core.Context) error {
+	c := &countingContext{inner: ctx}
+	err := f.inner.OnEndOfStream(c)
+	f.tally.elsewhere(c.emitted)
+	return err
+}
+
+func (f *firingRecorder) Snapshot(w io.Writer) error { return f.inner.Snapshot(w) }
+func (f *firingRecorder) Restore(r io.Reader) error  { return f.inner.Restore(r) }
+func (f *firingRecorder) Close() error               { return f.inner.Close() }
+
+// stateMeter tracks the entries the operator subtasks of one run hold between
+// them, and the greatest number they held at once.
+//
+// Shared across the subtasks and read from the test goroutine afterwards, so it
+// is atomic rather than locked: the increment is on the record path, once per
+// new (key, window) and once per timer, and a mutex there would be paying for
+// contention on every window a record opens.
+type stateMeter struct {
+	current atomic.Int64
+	peak    atomic.Int64
+}
+
+func (m *stateMeter) inc() {
+	n := m.current.Add(1)
+	for {
+		p := m.peak.Load()
+		if n <= p || m.peak.CompareAndSwap(p, n) {
+			return
+		}
+	}
+}
+
+func (m *stateMeter) dec() { m.current.Add(-1) }
+
+// newState is what runtime.Options.NewState is set to.
+func (m *stateMeter) newState() (state.KeyedState, error) {
+	return &countingState{inner: state.NewMemory(), meter: m}, nil
+}
+
+// countingState is a KeyedState that keeps its entry count.
+//
+// Put and Delete each read the key first to tell an insert from an update and a
+// removal from a no-op. That doubles the reads on the record path, which is a
+// real cost and is the reason this decorator is confined to the chaos suite:
+// throughput is secondary here and the number is not obtainable any other way,
+// since KeyedState deliberately has no Len.
+//
+// The purge path deletes entries from inside an Iterate callback, and those
+// deletes come back through this Delete because the operator holds this type as
+// its state. That is what makes the count fall when windows are purged rather
+// than only ever rising.
+type countingState struct {
+	inner state.KeyedState
+	meter *stateMeter
+}
+
+var _ state.KeyedState = (*countingState)(nil)
+
+func (c *countingState) Get(key []byte) ([]byte, bool) { return c.inner.Get(key) }
+
+func (c *countingState) Put(key, value []byte) {
+	_, existed := c.inner.Get(key)
+	c.inner.Put(key, value)
+	if !existed {
+		c.meter.inc()
+	}
+}
+
+func (c *countingState) Delete(key []byte) {
+	_, existed := c.inner.Get(key)
+	c.inner.Delete(key)
+	if existed {
+		c.meter.dec()
+	}
+}
+
+func (c *countingState) Iterate(fn func(key, value []byte) bool) { c.inner.Iterate(fn) }
+func (c *countingState) Err() error                              { return c.inner.Err() }
