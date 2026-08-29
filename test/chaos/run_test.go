@@ -24,8 +24,8 @@ func TestRunScheduleOnSeedsThatFireNothing(t *testing.T) {
 			if len(res.Faults) != 0 {
 				t.Fatalf("seed %d was chosen for having no faults and has %v", seed, res.Faults)
 			}
-			if res.Recoveries != 0 {
-				t.Errorf("seed %d recovered %d times with nothing scheduled", seed, res.Recoveries)
+			if len(res.Recoveries) != 0 {
+				t.Errorf("seed %d recovered %d times with nothing scheduled", seed, len(res.Recoveries))
 			}
 		})
 	}
@@ -62,9 +62,9 @@ func TestRunScheduleRecoversFromAScheduledFault(t *testing.T) {
 			if len(res.Faults) == 0 {
 				t.Fatalf("seed %d was chosen for scheduling a fault and schedules none", seed)
 			}
-			t.Logf("seed %d: %d faults %v, %d recoveries", seed, len(res.Faults), res.Faults, res.Recoveries)
-			if res.Recoveries > maxRecoveries {
-				t.Errorf("seed %d recovered %d times, above the cap of %d", seed, res.Recoveries, maxRecoveries)
+			t.Logf("seed %d: %d faults %v, %d recoveries", seed, len(res.Faults), res.Faults, len(res.Recoveries))
+			if len(res.Recoveries) > maxRecoveries {
+				t.Errorf("seed %d recovered %d times, above the cap of %d", seed, len(res.Recoveries), maxRecoveries)
 			}
 		})
 	}
@@ -145,4 +145,31 @@ func cleanRunCheckpoints(t *testing.T) int64 {
 		t.Fatal("the clean run completed no checkpoint at all")
 	}
 	return id
+}
+
+// cleanRunCheckpointIDs runs the workload with checkpointing on and returns its
+// storage together with every complete checkpoint ID it left behind.
+func cleanRunCheckpointIDs(t *testing.T) (*checkpoint.Storage, []int64) {
+	t.Helper()
+	root := t.TempDir()
+	if err := runtime.RunWithOptions(context.Background(),
+		jobGraph(sinks.NewCollect(), &windowFactory{}),
+		runtime.Options{CheckpointRoot: root, Seed: 1}); err != nil {
+		t.Fatalf("the clean run failed: %v", err)
+	}
+	storage := checkpoint.NewStorage(root)
+	last, ok, err := storage.Latest()
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if !ok {
+		return storage, nil
+	}
+	var ids []int64
+	for id := int64(1); id <= last; id++ {
+		if _, _, err := storage.Load(id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return storage, ids
 }

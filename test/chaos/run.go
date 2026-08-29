@@ -193,9 +193,12 @@ var oracleCounts = sync.OnceValue(func() map[oracle.Key]int64 {
 type Result struct {
 	Seed   int64
 	Faults []Fault
-	// Recoveries is how many times the run was resumed after an abort. It is
-	// zero for a schedule whose faults never fired, including the empty ones.
-	Recoveries int
+	// Outcomes says what became of each scheduled fault, in the schedule's own
+	// order. It is the same length as Faults.
+	Outcomes []FaultOutcome
+	// Recoveries is one entry per resume, in order. It is empty for a schedule
+	// whose faults never fired, including the empty ones.
+	Recoveries []Recovery
 }
 
 // RunSchedule runs seed's schedule and compares the result against the batch
@@ -270,16 +273,21 @@ func RunSchedule(t *testing.T, seed int64) Result {
 		// A run that aborted before its first record reached a window may still
 		// have dropped nothing; asserting it here would be asserting on a run
 		// that did not finish, which is not what the oracle is compared to.
-		res.Recoveries++
-		restoreFrom = restorePoint(t, seed, root)
+		res.Recoveries = append(res.Recoveries, recoveryPoint(t, seed, root))
+		if res.Recoveries[len(res.Recoveries)-1].FromCheckpoint {
+			restoreFrom = root
+		} else {
+			restoreFrom = ""
+		}
 	}
 
 	assertMatchesOracle(t, seed, sink, "fault run")
+	res.Outcomes = inj.outcomes()
 	return res
 }
 
-// restorePoint returns the root to resume from: the same one, if it holds a
-// complete checkpoint, or the empty string, which restarts the job from zero.
+// recoveryPoint describes where the next attempt will resume from, and counts
+// the pending windows at that cut.
 //
 // Restarting from zero is CORRECT and is not a fallback that papers over
 // anything. A fault that fires before any checkpoint completes leaves nothing
@@ -287,7 +295,8 @@ func RunSchedule(t *testing.T, seed int64) Result {
 // that still holds what the aborted run wrote. The duplicates that leaves have
 // to agree with the oracle exactly as a recovered run's do -- a window fires
 // only once its watermark has passed, so its count is final whichever run
-// produced it.
+// produced it. What a suite of only such restarts would NOT do is exercise
+// restore, which is why the census counts the two apart.
 //
 // Writing the next run's checkpoints into the SAME root is safe in both cases.
 // Resuming continues the IDs from the one restored, so nothing is written over;
@@ -295,16 +304,21 @@ func RunSchedule(t *testing.T, seed int64) Result {
 // incomplete ones -- if a complete one existed this function would have
 // returned it -- and an incomplete directory is not a recovery point for
 // anybody.
-func restorePoint(t *testing.T, seed int64, root string) string {
+func recoveryPoint(t *testing.T, seed int64, root string) Recovery {
 	t.Helper()
-	_, ok, err := checkpoint.NewStorage(root).Latest()
+	storage := checkpoint.NewStorage(root)
+	id, ok, err := storage.Latest()
 	if err != nil {
 		t.Fatalf("seed %d: reading the checkpoint root: %v", seed, err)
 	}
 	if !ok {
-		return ""
+		return Recovery{}
 	}
-	return root
+	pending, err := pendingWindowsAt(storage, id)
+	if err != nil {
+		t.Fatalf("seed %d: counting the pending windows at checkpoint %d: %v", seed, id, err)
+	}
+	return Recovery{FromCheckpoint: true, CheckpointID: id, PendingWindows: pending}
 }
 
 // assertDroppedNothing is the precondition the oracle comparison rests on.
@@ -439,6 +453,28 @@ type injector struct {
 
 	mu    sync.Mutex
 	fired []bool
+	// windows records the alignment windows the gates actually opened, as the
+	// greatest number of inputs seen delivered for each (subtask, checkpoint).
+	//
+	// It is what lets the census tell "the fault had no window to land in" from
+	// "there was a window and alignment completed before the schedule's count".
+	// Without it every alignment fault that did not fire would look the same,
+	// and a trigger kind that had quietly stopped working would be
+	// indistinguishable from one that was merely unlucky -- which is the whole
+	// thing step 4 exists to rule out.
+	//
+	// Recorded on EVERY consultation, including the ones that fire nothing, and
+	// across every attempt of a schedule. A run that aborts truncates what it
+	// records, so a checkpoint absent from here may have been reached by a
+	// later attempt; the classification is conservative in the direction that
+	// under-reports a genuine window rather than inventing one.
+	windows map[alignKey]int
+}
+
+// alignKey names one subtask's alignment of one checkpoint.
+type alignKey struct {
+	site         siteKey
+	checkpointID int64
 }
 
 var _ runtime.FaultInjector = (*injector)(nil)
@@ -451,6 +487,7 @@ func newInjector(faults []Fault) *injector {
 		byAlignment: make(map[siteKey][]int),
 		fired:       make([]bool, len(faults)),
 	}
+	i.windows = make(map[alignKey]int)
 	for n, f := range faults {
 		key := siteKey{vertexID: f.VertexID, subtask: f.Subtask}
 		switch f.Trigger {
@@ -492,7 +529,59 @@ func (i *injector) AfterBarrierForwarded(vertexID string, subtask int, checkpoin
 }
 
 func (i *injector) DuringAlignment(vertexID string, subtask int, checkpointID int64, delivered int) bool {
-	return i.fire(i.byAlignment[siteKey{vertexID, subtask}], func(f Fault) bool {
+	site := siteKey{vertexID, subtask}
+	i.observeWindow(alignKey{site: site, checkpointID: checkpointID}, delivered)
+	return i.fire(i.byAlignment[site], func(f Fault) bool {
 		return f.N == checkpointID && f.Inputs == delivered
 	})
+}
+
+// observeWindow records that an alignment window was open at this many inputs.
+//
+// This one takes the lock unconditionally, unlike the three fire paths. It can
+// afford to: the gate consults during alignment a handful of times per
+// checkpoint per subtask, which is tens of calls in a run, against tens of
+// thousands on the record path.
+func (i *injector) observeWindow(k alignKey, delivered int) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if delivered > i.windows[k] {
+		i.windows[k] = delivered
+	}
+}
+
+// outcomes says what became of each scheduled fault, in the schedule's order.
+//
+// Called after every attempt has finished, so nothing is still writing.
+func (i *injector) outcomes() []FaultOutcome {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	out := make([]FaultOutcome, 0, len(i.faults))
+	for n, f := range i.faults {
+		o := FaultOutcome{Fault: f, Fired: i.fired[n]}
+		if f.Trigger == TriggerDuringAlignment {
+			o.Alignment = i.classifyAlignment(f, i.fired[n])
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+// classifyAlignment says which of the three alignment outcomes f reached.
+//
+// A fault that fired landed inside a window, and that is a fact about the call
+// site rather than an inference: the gate offers the decision only while a live
+// input has still to deliver the barrier. One that did not fire is separated by
+// whether that subtask ever opened an alignment for that checkpoint at all --
+// if it did, alignment completed before the schedule's input count; if it did
+// not, there was never a window there to aim at.
+func (i *injector) classifyAlignment(f Fault, fired bool) AlignmentOutcome {
+	if fired {
+		return AlignmentInsideWindow
+	}
+	k := alignKey{site: siteKey{vertexID: f.VertexID, subtask: f.Subtask}, checkpointID: f.N}
+	if _, ok := i.windows[k]; ok {
+		return AlignmentCompletedFirst
+	}
+	return AlignmentNeverOpened
 }
