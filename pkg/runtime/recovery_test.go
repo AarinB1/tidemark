@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 
@@ -45,13 +46,83 @@ func recoverySpec() oracle.Spec {
 	return oracle.Spec{Size: recoveryWindowSize, Slide: recoveryWindowSize}
 }
 
-// faultingGenerator fails after a fixed number of elements have been read from it.
+// checkpointPollElements is how many of a subtask's own elements pass between
+// two reads of the checkpoint root while a checkpoint-relative fault waits to
+// arm.
 //
-// The trigger is a LOGICAL POSITION -- elements read from this subtask's range
-// -- and never a wall clock. That is invariant 6, and the reason is not
-// tidiness: a fault on a timer lands somewhere different on every run, so a
-// test that means "kill between barrier k arriving on one input and arriving on
-// another" would sometimes kill somewhere else and pass for the wrong reason.
+// Counted in ELEMENTS and not on a timer, so the overshoot it permits is a
+// logical quantity rather than a duration: the fault lands somewhere within
+// fifty elements of the point where this subtask first observes a complete
+// checkpoint. Fifty against a barrier interval of five thousand is a hundredth
+// of an epoch, and polling on every element instead would cost a directory read
+// per record to buy back a precision no assertion here uses.
+const checkpointPollElements = 50
+
+// faultPosition says where the subtasks of source B abort. Exactly one of the
+// two forms is set.
+//
+// # Why there are two
+//
+// An ELEMENT position is what a case wants when the element position IS the
+// thing under test. TestCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom
+// has to abort before a barrier is ever injected, and no other phrasing says
+// that.
+//
+// A CHECKPOINT-RELATIVE position is what a case wants when its premise is that
+// there is something to recover from. Barrier injection is at a fixed element
+// offset, which is invariant 3, but a checkpoint COMPLETING is eight
+// acknowledgements, each carrying a state serialisation and an fsync, followed
+// by the _METADATA and _COMPLETE writes. That is wall-clock work. And the
+// source is not held back across it: when one operator subtask finishes its
+// snapshot and forwards the barrier while its sibling is still snapshotting,
+// the sink's gate buffers the first one's output without bound and the whole
+// source path runs free. So an element count chosen to sit "far enough" past a
+// barrier is a bet on relative speed. It wins on a fast machine and loses under
+// the race detector on a two-core runner, which is what it did.
+//
+// Naming the position relative to the thing that must be true makes the premise
+// structural instead. It is the same move TriggerDuringAlignment makes in
+// test/chaos: aim at the state, never at a counter that merely correlates with
+// it.
+type faultPosition struct {
+	// atElement aborts once this subtask has read that many elements.
+	atElement int64
+	// afterCheckpoint aborts once the run has written a complete checkpoint
+	// with at least this ID and thenElements further elements have been read
+	// from this subtask. Zero selects the element form above.
+	afterCheckpoint int64
+	thenElements    int64
+}
+
+func atElement(n int64) faultPosition { return faultPosition{atElement: n} }
+
+// afterCheckpointCompletes positions the fault then elements after a complete
+// checkpoint with ID id or higher exists on disk.
+func afterCheckpointCompletes(id, then int64) faultPosition {
+	return faultPosition{afterCheckpoint: id, thenElements: then}
+}
+
+func (p faultPosition) String() string {
+	if p.afterCheckpoint == 0 {
+		return fmt.Sprintf("at element %d of srcB", p.atElement)
+	}
+	return fmt.Sprintf("%d elements after a complete checkpoint %d existed", p.thenElements, p.afterCheckpoint)
+}
+
+// faultingGenerator fails at a chosen position in its own range.
+//
+// The trigger is a LOGICAL POSITION -- elements read from this subtask's range,
+// and a predicate over what the run has made durable -- and never a wall clock.
+// That is invariant 6, and the reason is not tidiness: a fault on a timer lands
+// somewhere different on every run, so a test that means "kill between barrier
+// k arriving on one input and arriving on another" would sometimes kill
+// somewhere else and pass for the wrong reason.
+//
+// Reading the checkpoint root is not a clock. It asks whether a thing has
+// happened, not how long has passed, and the answer is monotone: a complete
+// checkpoint is never unwritten, so a position expressed against one cannot
+// come undone later in the run. That monotonicity is what lets crashAndRestore
+// stop betting on relative speed.
 //
 // Every method core.Source declares is forwarded EXPLICITLY, and so is Count.
 // Embedding core.Source would compile and would leave Count off the concrete
@@ -60,23 +131,82 @@ func recoverySpec() oracle.Spec {
 // quietly run a topology in which alignment cannot fail. CLAUDE.md records this
 // trap for precisely this test.
 type faultingGenerator struct {
-	inner     *sources.Generator
-	failAfter int64
-	read      int64
+	inner *sources.Generator
+	at    faultPosition
+	// storage is the root this run checkpoints into. A checkpoint-relative
+	// position reads it; an element one never touches it.
+	storage *checkpoint.Storage
+
+	// opened is set by Open. The runtime makes one instance of a source per
+	// vertex purely to ask its Count -- see buildMetadata -- and never opens
+	// it, so without this the diagnostics below would report a subtask that
+	// read nothing alongside the ones that did the work.
+	opened bool
+	read   int64
+	// sincePoll counts down the elements to the next read of the root.
+	sincePoll int64
+	armed     bool
+	armedAt   int64
+	pollErr   error
 }
 
-func newFaultingGenerator(cfg sources.GeneratorConfig, failAfter int64) *faultingGenerator {
-	return &faultingGenerator{inner: sources.NewGenerator(cfg), failAfter: failAfter}
+func newFaultingGenerator(cfg sources.GeneratorConfig, at faultPosition, storage *checkpoint.Storage) *faultingGenerator {
+	return &faultingGenerator{inner: sources.NewGenerator(cfg), at: at, storage: storage}
 }
 
-func (s *faultingGenerator) Open(ctx core.Context) error { return s.inner.Open(ctx) }
+func (s *faultingGenerator) Open(ctx core.Context) error {
+	s.opened = true
+	return s.inner.Open(ctx)
+}
 
 func (s *faultingGenerator) Next() (*core.Record, bool, error) {
-	if s.read >= s.failAfter {
+	if s.due() {
 		return nil, false, fmt.Errorf("after %d elements: %w", s.read, errInjectedFailure)
+	}
+	// Surfaced rather than swallowed, and NOT as the injected failure: a root
+	// that cannot be read is a broken test rather than a landed fault, and a
+	// case that could not tell the two apart would report the second when it
+	// meant the first.
+	if s.pollErr != nil {
+		return nil, false, fmt.Errorf("reading the checkpoint root to arm the fault: %w", s.pollErr)
 	}
 	s.read++
 	return s.inner.Next()
+}
+
+// due reports whether this subtask should abort before the next element.
+func (s *faultingGenerator) due() bool {
+	if s.at.afterCheckpoint == 0 {
+		return s.read >= s.at.atElement
+	}
+	if !s.armed && !s.arm() {
+		return false
+	}
+	return s.read >= s.armedAt+s.at.thenElements
+}
+
+// arm reports whether the checkpoint this position waits for has now been
+// written, latching the element count at which it was first seen.
+//
+// Latched, so the root is read only while the fault is still waiting. It is
+// also why the position is stable once reached: what follows is a plain count
+// of this subtask's own elements from a point the run has already passed.
+func (s *faultingGenerator) arm() bool {
+	if s.sincePoll > 0 {
+		s.sincePoll--
+		return false
+	}
+	s.sincePoll = checkpointPollElements
+	id, ok, err := s.storage.Latest()
+	if err != nil {
+		s.pollErr = err
+		return false
+	}
+	if !ok || id < s.at.afterCheckpoint {
+		return false
+	}
+	s.armed, s.armedAt = true, s.read
+	return true
 }
 
 func (s *faultingGenerator) SeekTo(offset int64) error { return s.inner.SeekTo(offset) }
@@ -85,6 +215,73 @@ func (s *faultingGenerator) Count() int64              { return s.inner.Count() 
 func (s *faultingGenerator) Close() error              { return s.inner.Close() }
 
 var _ splittableSource = (*faultingGenerator)(nil)
+
+// faultingSources builds one faulting generator per subtask of source B and
+// keeps a handle on each, the way windowFactory does for the operators.
+//
+// It exists for the failure message. A run that finished WITHOUT the fault
+// landing is the one interesting way this harness can break -- a
+// checkpoint-relative position that armed too near the end of the range would
+// do it -- and "the fault did not land" on its own leaves the reader guessing
+// between "never armed" and "armed too late". The handles turn that into a
+// sentence naming which.
+type faultingSources struct {
+	cfg     sources.GeneratorConfig
+	at      faultPosition
+	storage *checkpoint.Storage
+
+	mu   sync.Mutex
+	made []*faultingGenerator
+}
+
+func (f *faultingSources) newSource() core.Source {
+	s := newFaultingGenerator(f.cfg, f.at, f.storage)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.made = append(f.made, s)
+	return s
+}
+
+// describe says how far each subtask got and whether its fault ever armed.
+//
+// Only the OPENED instances are listed. The runtime makes one more per source
+// vertex, purely to ask its Count, and reporting that one alongside the real
+// ones would read as a subtask that mysteriously did nothing.
+//
+// The subtasks are listed in the order the runtime happened to construct them,
+// which is not their index order, and it says so rather than implying one.
+//
+// The mutex covers the slice. The per-generator fields it reads are written by
+// the subtask goroutines, and are safe to read here only because every caller
+// is downstream of a RunWithOptions that has already joined them.
+func (f *faultingSources) describe() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parts := make([]string, 0, len(f.made))
+	for _, s := range f.made {
+		switch {
+		case !s.opened:
+			continue
+		case s.at.afterCheckpoint == 0:
+			parts = append(parts, fmt.Sprintf("read %d of a fault at element %d", s.read, s.at.atElement))
+		case s.armed:
+			parts = append(parts, fmt.Sprintf("read %d, armed at %d", s.read, s.armedAt))
+		default:
+			// Why it stopped is not visible from here: a subtask cancelled by
+			// its sibling's fault and one that ran off the end of its range
+			// both land in this branch, and only the first is normal. In the
+			// message crash prints when NO fault landed they are all the
+			// second, because a run that nothing aborted ended by exhausting
+			// every source.
+			parts = append(parts, fmt.Sprintf("read %d and stopped with no complete checkpoint %d in sight",
+				s.read, s.at.afterCheckpoint))
+		}
+	}
+	if len(parts) == 0 {
+		return "no faulting source was ever opened"
+	}
+	return "srcB subtasks, in construction order: " + strings.Join(parts, "; ")
+}
 
 // windowFactory builds one window operator per subtask and keeps a handle on
 // each, so a run can be asked afterwards whether anything was dropped.
@@ -251,9 +448,8 @@ type recoveryCase struct {
 	// against the range lengths is what decides how far apart in the stream the
 	// two sources reach barrier k.
 	barrierA, barrierB int64
-	// failAfterB is how many elements each subtask of source B reads before it
-	// fails.
-	failAfterB int64
+	// fault is where each subtask of source B aborts.
+	fault faultPosition
 	// parallelism of every vertex.
 	parallelism int
 	// backend is the keyed-state implementation the operator subtasks run on.
@@ -275,14 +471,16 @@ func crash(t *testing.T, c recoveryCase) (root string, collect *sinks.Collect, b
 	root = t.TempDir()
 	collect = sinks.NewCollect()
 
-	build = func(faulty bool) (*graph.Graph, *windowFactory) {
+	faulty := &faultingSources{cfg: c.b, at: c.fault, storage: checkpoint.NewStorage(root)}
+
+	build = func(withFault bool) (*graph.Graph, *windowFactory) {
 		f := &windowFactory{}
 		srcA := windowSourceVertex("srcA", c.a, c.parallelism, c.barrierA)
 		srcB := graph.Vertex{
 			ID: "srcB", Kind: graph.VertexSource, Parallelism: c.parallelism,
 			NewSource: func() core.Source {
-				if faulty {
-					return newFaultingGenerator(c.b, c.failAfterB)
+				if withFault {
+					return faulty.newSource()
 				}
 				return sources.NewGenerator(c.b)
 			},
@@ -297,8 +495,14 @@ func crash(t *testing.T, c recoveryCase) (root string, collect *sinks.Collect, b
 	err := RunWithOptions(context.Background(), g,
 		Options{CheckpointRoot: root, Seed: c.a.Seed, NewState: c.backend.newState})
 	if !errors.Is(err, errInjectedFailure) {
-		t.Fatalf("the crashed run returned %v, want the injected failure: the fault did not land", err)
+		t.Fatalf("the crashed run returned %v, want the injected failure %s: the fault did not land. %s",
+			err, c.fault, faulty.describe())
 	}
+	// Logged on the way out, not only on failure. Where a checkpoint-relative
+	// fault armed is the one number in this harness that varies with the
+	// machine, and a CI log that records it is what turns the next surprise
+	// into a reading rather than an investigation.
+	t.Logf("the fault was positioned %s; %s", c.fault, faulty.describe())
 	return root, collect, build
 }
 
@@ -313,48 +517,76 @@ func windowSourceVertex(id string, cfg sources.GeneratorConfig, p int, barrierIn
 	}
 }
 
+// recoveryOutcome is what the crashed half of a case left behind.
+type recoveryOutcome struct {
+	// checkpointID is the cut the resumed run recovered from.
+	checkpointID int64
+	// pendingWindows is how many (key, window) pairs at that cut have all their
+	// records behind it and their firing watermark ahead of it.
+	pendingWindows int
+	// crashedRows is how many rows the crashed run had already written to the
+	// sink when it stopped.
+	crashedRows int
+}
+
 // crashAndRestore runs the case to its fault, restarts from the last complete
 // checkpoint, and returns the sink both runs wrote into.
 //
-// # Why the fault is placed thousands of elements past a barrier
+// # Two premises, and where each comes from
 //
-// A checkpoint is complete only once every subtask has acknowledged, and a
-// source acknowledges when it INJECTS a barrier while an operator acknowledges
-// when it has PROCESSED one. Between those two lies the whole pipeline: the
-// records already in the channels ahead of the barrier, the operator's snapshot
-// write, and the sink's own acknowledgement behind it. A fault a few elements
-// after a barrier cancels the job before any of that finishes, so no checkpoint
-// completes and there is nothing to recover from. That is correct behaviour --
-// it is what the crash-before-any-checkpoint test below asserts -- but a case
-// meaning to test recovery has to leave the pipeline room to drain.
+// The case asserts nothing unless the crashed run left a complete checkpoint,
+// and unless that checkpoint holds a (key, window) whose timer has to survive
+// the restore. Both are guarded below rather than assumed.
 //
-// The depth is bounded by the transport: a source runs at most one channel
-// capacity ahead of its consumer, so a margin of several thousand elements is
-// the pipeline depth several times over. It is a margin in ELEMENTS and not in
-// time, so it does not vary with the scheduler -- but the ACKNOWLEDGEMENT
-// behind it is a goroutine and an fsync, so the margin is sized generously
-// rather than minimally. The window operator does strictly more work per record
-// than the keyed-count operator this suite used to run on, so a margin that was
-// comfortable for that one is not automatically comfortable here.
-func crashAndRestore(t *testing.T, c recoveryCase) (*sinks.Collect, int) {
+// The FIRST premise is the case's own to establish, and how it does so depends
+// on the fault position it chose. A checkpoint-relative position establishes it
+// by construction: the fault arms only once the run has observed a complete
+// checkpoint, and a complete checkpoint is never unwritten, so one exists when
+// the run stops. An element position does not establish it at all -- it names a
+// point in the stream and hopes the acknowledgement round beat the source
+// there, which is a bet on relative speed that the race detector on a small
+// runner is entitled to lose. The guard below is what tells the two apart
+// instead of letting the second quietly assert nothing.
+//
+// The SECOND premise is a property of the TOPOLOGY and not of any position.
+// Source B's records pile into windows far above a watermark that source A's
+// event times pin low, so every cut in this suite holds hundreds of them. It
+// does not vary with where the fault landed, which is why the guard on it has
+// never fired and why it is still worth keeping: it is the assertion that would
+// catch a checkpoint whose timers stopped being written.
+func crashAndRestore(t *testing.T, c recoveryCase) (*sinks.Collect, recoveryOutcome) {
 	t.Helper()
 	root, collect, build := crash(t, c)
-	crashedRows := len(collect.Records())
+	out := recoveryOutcome{crashedRows: len(collect.Records())}
 
 	storage := checkpoint.NewStorage(root)
 	id, ok, err := storage.Latest()
 	if err != nil {
 		t.Fatalf("Latest: %v", err)
 	}
+	// The vacuity guard. It cannot fire on a checkpoint-relative position,
+	// because the fault does not arm until this same call has already reported
+	// a complete checkpoint to the source and nothing removes one afterwards.
+	// It is NOT dead: the element positions above still reach it, and it is
+	// what caught the sweep betting on relative speed rather than letting the
+	// sweep pass on a fast machine and assert nothing on a slow one.
+	//
+	// For it to fire on a checkpoint-relative position, Latest would have to
+	// report a checkpoint that is not usable -- a _COMPLETE marker written
+	// before the state files it vouches for, which is invariant 8 read
+	// backwards -- or something would have to remove a checkpoint directory
+	// while the run was still going.
 	if !ok {
-		t.Fatal("the crashed run completed no checkpoint, so there is nothing to recover from and the test asserts nothing")
+		t.Fatalf("the crashed run completed no checkpoint, so there is nothing to recover from and the test asserts nothing. "+
+			"The fault was positioned %s", c.fault)
 	}
+	out.checkpointID = id
 
-	pending := pendingWindowsAtCheckpoint(t, storage, id, c)
-	t.Logf("crashed after %d elements of srcB per subtask, having written %d rows to the sink; "+
+	out.pendingWindows = pendingWindowsAtCheckpoint(t, storage, id, c)
+	t.Logf("crashed with the fault positioned %s, having written %d rows to the sink; "+
 		"resuming from checkpoint %d, which holds %d (key, window) pairs that are complete but unfired",
-		c.failAfterB, crashedRows, id, pending)
-	if pending == 0 {
+		c.fault, out.crashedRows, out.checkpointID, out.pendingWindows)
+	if out.pendingWindows == 0 {
 		t.Fatal("no (key, window) in this checkpoint has all its records behind the cut and its firing watermark ahead of it, " +
 			"so nothing here depends on a timer surviving the restore and this case proves nothing about recoverable timers")
 	}
@@ -367,7 +599,7 @@ func crashAndRestore(t *testing.T, c recoveryCase) (*sinks.Collect, int) {
 	if got := f.dropped(); got != 0 {
 		t.Errorf("the resumed run dropped %d assignments as late; the batch oracle has no lateness model, so the comparison below is only valid at zero", got)
 	}
-	return collect, pending
+	return collect, out
 }
 
 // pendingWindowsAtCheckpoint counts the (key, window) pairs that are COMPLETE
@@ -541,9 +773,20 @@ func testRecoveryAcrossAMultiInputTopology(t *testing.T, backend stateBackend) {
 		a: a, b: b,
 		// 20000 elements per subtask, so barriers at 5000, 10000, 15000, 20000.
 		barrierA: 5000, barrierB: 5000,
-		// Between source B's second barrier and its third, with 7000 elements
-		// of margin behind the first for the pipeline to drain.
-		failAfterB:  12000,
+		// An epoch in, which is the general case rather than an aimed one.
+		// Stated relative to the checkpoint rather than as an element count, so
+		// that "there is something to recover from" is a fact about the run
+		// rather than a bet on the acknowledgement round beating the source to
+		// element 12000.
+		//
+		// Behind the FIRST checkpoint and not a later one. How far a source
+		// runs past a barrier before that barrier's checkpoint is durable is
+		// the one quantity here that moves with the machine, and it moves by
+		// thousands of elements: a subtask has been seen reaching the end of a
+		// 20000-element range before checkpoint 2 appeared at all. Checkpoint 1
+		// is durable with three quarters of the range still ahead, so the two
+		// thousand elements of depth are bought where there is room for them.
+		fault:       afterCheckpointCompletes(1, 2000),
 		parallelism: 2,
 		backend:     backend,
 	})
@@ -554,18 +797,20 @@ func testRecoveryAcrossAMultiInputTopology(t *testing.T, backend stateBackend) {
 // TestRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers is the aimed case.
 //
 // The two sources have deliberately SKEWED range lengths, with barrier
-// intervals scaled so that both inject the same NUMBER of barriers at wildly
-// different points in the stream:
+// intervals scaled so that source A injects its barriers at wildly earlier
+// points in the stream, and keeps injecting them for longer:
 //
-//	srcA     400 elements, 200 per subtask, a barrier every 50 -> at 50, 100, 150, 200
-//	srcB   40000 elements, 20000 per subtask, every 5000       -> at 5000, 10000, 15000, 20000
+//	srcA     400 elements, 200 per subtask, a barrier every 25   -> at 25, 50, ... 200
+//	srcB   60000 elements, 30000 per subtask, every 5000         -> at 5000, 10000, ... 30000
 //
 // Source A runs through its entire range while source B is barely started, so
 // at any moment in the middle of the run the gate holds source A's barrier for
 // the next checkpoint and is still waiting for source B's. That is the
 // alignment window, and it is thousands of elements wide in LOGICAL terms
 // rather than a race: source A's whole range is 200 elements and source B's
-// barriers are 5000 apart.
+// barriers are 5000 apart. Source A carrying MORE barriers than source B is
+// what keeps that true to the end of the run: its end-of-stream is buffered
+// behind its own next barrier, so it never drops out of alignment first.
 //
 // With alignment working, source A's elements past its barrier are held in the
 // gate's buffers when the checkpoint is taken, so the operator's state is
@@ -592,14 +837,35 @@ func TestRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers(t *testing.T) {
 
 func testRecoveryWhenTheFaultLandsBetweenTwoInputsBarriers(t *testing.T, backend stateBackend) {
 	a := restoreConfig(21, 400)
-	b := restoreConfig(22, 40000)
+	b := restoreConfig(22, 60000)
 
 	collect, _ := crashAndRestore(t, recoveryCase{
 		a: a, b: b,
-		barrierA: 50, barrierB: 5000,
-		// Inside the window for source B's fourth barrier and 5000 elements
-		// clear of its third.
-		failAfterB:  15000,
+		// Source A's 200 elements per subtask carry eight barriers and source
+		// B's 30000 carry six. Source A having MORE is the half that matters:
+		// its end-of-stream sits in the gate's buffers behind its own next
+		// barrier, so it stays live at the gate for as long as it has barriers
+		// left. If it ran out first its end-of-stream would be delivered, it
+		// would drop out of alignment, and the window this case is aimed at
+		// would collapse into a race between source B's two subtasks.
+		barrierA: 25, barrierB: 5000,
+		// Inside the alignment window for source B's FOURTH barrier. Source A
+		// produced its whole range long ago and its remaining barriers sit in
+		// the gate's buffers, so the moment checkpoint 3 completes the drained
+		// buffer hands the gate source A's barrier 4 and alignment for it opens
+		// at once, with source B five thousand elements from delivering its
+		// own.
+		//
+		// No further into the epoch than that, and source B's range is half
+		// again what the element-count phrasing needed. Both buy the same
+		// thing: room. How far a source runs past a barrier before that
+		// barrier's checkpoint is durable is the one quantity in this harness
+		// that still moves with the machine -- it is several thousand elements
+		// and it grows with the size of the snapshot -- so a position behind a
+		// LATE checkpoint has to be given range to land in. This one armed at
+		// element 17034 of a 20000-element range here, and at 19941 on another
+		// run; at 30000 the same lag leaves ten thousand elements behind it.
+		fault:       afterCheckpointCompletes(3, 0),
 		parallelism: 2,
 		backend:     backend,
 	})
@@ -630,7 +896,10 @@ func testCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom(t *testing.T, 
 	root, _, build := crash(t, recoveryCase{
 		a: a, b: b,
 		barrierA: 5000, barrierB: 5000,
-		failAfterB:  1000,
+		// An ELEMENT position, and it has to be: this case's premise is that no
+		// barrier is ever injected, so it cannot be phrased against a checkpoint
+		// that by construction never exists.
+		fault:       atElement(1000),
 		parallelism: 2,
 		backend:     backend,
 	})
@@ -649,38 +918,128 @@ func testCrashBeforeAnyCheckpointCompletesHasNothingToRestoreFrom(t *testing.T, 
 // TestRecoveryIsIndependentOfWhereTheFaultLands sweeps the fault across the
 // skewed topology.
 //
-// Every position is inside the same alignment window -- source A finished its
-// range long ago and source B has not reached its next barrier -- so each row
-// is the aimed case at a different depth. A recovery that was right only at the
-// position the test above happens to name would show up here.
+// Every position is inside an alignment window. Source A produced its whole
+// range long ago and its remaining barriers sit in the gate's buffers, so the
+// moment checkpoint k completes the drained buffer hands the gate source A's
+// barrier k+1 and alignment for it opens at once, with source B five thousand
+// elements from delivering its own. Each row is that same aimed case at a
+// different depth; a recovery that was right only at the position the test
+// above happens to name would show up here.
 //
-// Each position leaves at least 4900 of source B's elements between it and the
-// barrier it recovers from, which is the pipeline depth several times over; see
-// the note on crashAndRestore. The last two share a barrier deliberately: the
-// difference between them is where in the replay the fault fell, not which cut
-// it recovers from.
+// # Why the positions are checkpoint-relative
+//
+// They used to be element counts: 9900, 14900, 19900, 19999, each chosen to sit
+// just under source B's next barrier so that the checkpoint it recovers from
+// had most of a barrier interval behind it to complete in. That is a bet on
+// relative speed and it lost in CI. The barrier's POSITION is fixed by
+// invariant 3, but the checkpoint COMPLETING is eight acknowledgements, each
+// with a state serialisation and an fsync, and the source is not held back
+// across them -- one operator subtask that finishes its snapshot first has its
+// output buffered without bound by the sink's gate while its sibling is still
+// writing, which lets the whole source path run free. On this machine
+// checkpoint 1 landed before source B's element 9900; under the race detector
+// on a two-core runner it did not, and the vacuity guard in crashAndRestore
+// correctly reported that the case was asserting nothing.
+//
+// A position stated as "this many elements after a complete checkpoint exists"
+// makes the premise structural. The fault does not arm until the run has
+// written one, so there is always something to recover from, at any speed on
+// any machine. It is the same move TriggerDuringAlignment makes in test/chaos:
+// aim at the state that must hold, not at a counter that merely correlates with
+// it.
+//
+// # What the rows cover
+//
+// Three cuts -- checkpoints 1, 2 and 3 -- and two depths into the epoch behind
+// the first of them. The depth is how much REPLAY the resumed run has to get
+// exactly right: at thenElements zero the fault lands within fifty elements of
+// the cut and there is almost nothing to replay, while at two thousand the
+// resumed run replays two thousand elements per subtask into a state restored
+// from before them. A recovery that was right only where there was nothing to
+// replay would show up in the difference.
+//
+// The depth is NOT a difference in how many windows have fired, and describing
+// it as one would be wrong. Source A's end-of-stream is buffered behind its own
+// next barrier, so source A never leaves the gate's watermark minimum while the
+// run is going, and that minimum sits at source A's event times -- two thousand
+// milliseconds into a range source B spans three hundred thousand of. Almost
+// nothing fires before the end-of-input flush: the runs log nine to eighteen
+// rows written at the fault, out of the thousands the job produces, and that
+// count barely moves between the two depths.
+//
+// So the sweep covers no position "before any window has fired" either. The
+// handful of rows that do fire are released before checkpoint 1 can complete --
+// its barrier is at source B's element 5000 -- so every completed checkpoint
+// here is already past them. That is not a gap to paper over: it is the same
+// property that makes this topology the one with the most to lose if timers do
+// not survive, since nearly every window is still open at every cut.
+// TestRecoveryAcrossAMultiInputTopology is where a run has fired most of its
+// windows by the time it dies, and that case is checkpoint-relative now too.
+//
+// The distinct cuts are ASSERTED after the loop rather than assumed. A sweep
+// whose rows all recovered from the same checkpoint would be one case run four
+// times, and it would look identical from the outside.
 func TestRecoveryIsIndependentOfWhereTheFaultLands(t *testing.T) {
 	forEachStateBackend(t, testRecoveryIsIndependentOfWhereTheFaultLands)
 }
 
 func testRecoveryIsIndependentOfWhereTheFaultLands(t *testing.T, backend stateBackend) {
 	a := restoreConfig(41, 400)
-	b := restoreConfig(42, 40000)
+	b := restoreConfig(42, 60000)
 
-	// Source B's subtasks take barriers at 5000, 10000, 15000 and 20000 of a
-	// 20000-element range, and each position below sits just under the NEXT
-	// one, so the checkpoint it recovers from has most of a barrier interval
-	// behind it to complete in.
-	for _, failAfter := range []int64{9900, 14900, 19900, 19999} {
-		t.Run(fmt.Sprintf("after%d", failAfter), func(t *testing.T) {
-			collect, _ := crashAndRestore(t, recoveryCase{
+	// Source B's subtasks take a barrier every 5000 elements of a 30000-element
+	// range, so the checkpoints these rows aim at sit in the first half of it.
+	//
+	// The range is half again what an element-count phrasing needed, and the
+	// reason is the one quantity in this harness that still moves with the
+	// machine: how far a source runs past a barrier before that barrier's
+	// checkpoint is durable. A source is not held back across the
+	// acknowledgement round -- an operator subtask that finishes its snapshot
+	// first has its output buffered without bound by the sink's gate while its
+	// sibling is still writing -- so the lag runs to several thousand elements
+	// even on the subtask the pipeline is waiting on. At 20000 per subtask that
+	// put checkpoint 3 as late as element 19941, sixty from the end, with
+	// nothing left for a fault to land in. At 30000 every row below arms with a
+	// third of the range still ahead of it.
+	recovered := make(map[int64]bool)
+	for _, tc := range []struct {
+		name string
+		at   faultPosition
+	}{
+		{"atCheckpoint1", afterCheckpointCompletes(1, 0)},
+		{"deepAfterCheckpoint1", afterCheckpointCompletes(1, 2000)},
+		{"atCheckpoint2", afterCheckpointCompletes(2, 0)},
+		{"atCheckpoint3", afterCheckpointCompletes(3, 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			collect, out := crashAndRestore(t, recoveryCase{
 				a: a, b: b,
-				barrierA: 50, barrierB: 5000,
-				failAfterB:  failAfter,
+				// 25 against 5000: source A's 200 elements per subtask carry
+				// eight barriers and source B's 30000 carry six.
+				//
+				// Source A having MORE is the half that matters, and it is not
+				// symmetry for its own sake. Source A's end-of-stream sits in
+				// the gate's buffers behind its own next barrier, so it stays
+				// live at the gate for as long as it has barriers left. If it
+				// ran out first its end-of-stream would be delivered, it would
+				// drop out of alignment, and every window after that would
+				// collapse into a race between source B's two subtasks --
+				// which is the narrow thing this topology exists not to be.
+				barrierA: 25, barrierB: 5000,
+				fault:       tc.at,
 				parallelism: 2,
 				backend:     backend,
 			})
+			recovered[out.checkpointID] = true
 			assertSameWindows(t, windowRowsOf(t, collect.Records()), oracleWindowCounts(t, a, b), "recovered run")
 		})
+	}
+
+	// The distinct cuts, asserted rather than assumed. A sweep whose rows all
+	// recovered from the same checkpoint would be one case run four times under
+	// four names, and from the outside it would look identical to this one.
+	if len(recovered) < 2 {
+		t.Errorf("every position in the sweep recovered from the same cut %v, so this is one case run four times "+
+			"under four names rather than a sweep across the run", recovered)
 	}
 }
