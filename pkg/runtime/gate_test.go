@@ -20,7 +20,7 @@ func newGateOver(ctx context.Context, n, capacity int) (*Gate, []*transport.Chan
 		chans[i] = transport.NewChannel(capacity)
 		inputs[i] = chans[i]
 	}
-	return NewGate(ctx, inputs), chans
+	return NewGate(ctx, inputs, faults{}), chans
 }
 
 // drain reads the gate until it reports closure and returns what it delivered.

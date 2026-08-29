@@ -220,7 +220,7 @@ func TestOperatorSnapshotsBeforeForwardingTheBarrier(t *testing.T) {
 		},
 	}
 
-	gate := NewGate(ctx, []transport.Input{in})
+	gate := NewGate(ctx, []transport.Input{in}, faults{})
 	w := transport.NewWriter([][]transport.Output{{out}})
 	oc := newOpContext(ctx, w)
 	op := &statefulOperator{}
@@ -253,7 +253,7 @@ func TestOperatorSnapshotsBeforeForwardingTheBarrier(t *testing.T) {
 	}()
 
 	cp := checkpointer{co: co, key: checkpoint.SubtaskKey{VertexID: "op", Index: 0}}
-	if err := runOperatorLoop(ctx, op, oc, subtaskID{vertexID: "op", index: 0}, gate, w, cp); err != nil {
+	if err := runOperatorLoop(ctx, op, oc, subtaskID{vertexID: "op", index: 0}, gate, w, cp, faults{}); err != nil {
 		t.Fatalf("runOperatorLoop: %v", err)
 	}
 	w.CloseAll()
@@ -286,7 +286,7 @@ func TestOperatorSnapshotHoldsTheStateAtTheBarrier(t *testing.T) {
 
 	in := transport.NewChannel(16)
 	out := transport.NewChannel(16)
-	gate := NewGate(ctx, []transport.Input{in})
+	gate := NewGate(ctx, []transport.Input{in}, faults{})
 	w := transport.NewWriter([][]transport.Output{{out}})
 	oc := newOpContext(ctx, w)
 	op := &statefulOperator{}
@@ -321,7 +321,7 @@ func TestOperatorSnapshotHoldsTheStateAtTheBarrier(t *testing.T) {
 	}()
 
 	cp := checkpointer{co: co, key: checkpoint.SubtaskKey{VertexID: "op", Index: 0}}
-	if err := runOperatorLoop(ctx, op, oc, subtaskID{vertexID: "op", index: 0}, gate, w, cp); err != nil {
+	if err := runOperatorLoop(ctx, op, oc, subtaskID{vertexID: "op", index: 0}, gate, w, cp, faults{}); err != nil {
 		t.Fatalf("runOperatorLoop: %v", err)
 	}
 	w.CloseAll()
@@ -364,7 +364,7 @@ func TestSinkAcknowledgesWithAnEmptyPayload(t *testing.T) {
 	defer cancel()
 
 	in := transport.NewChannel(16)
-	gate := NewGate(ctx, []transport.Input{in})
+	gate := NewGate(ctx, []transport.Input{in}, faults{})
 	collect := sinks.NewCollect()
 
 	for _, e := range []core.StreamElement{

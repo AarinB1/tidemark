@@ -118,6 +118,14 @@ type Gate struct {
 	// the smallest case; a completed alignment is the largest.
 	pending []core.StreamElement
 
+	// faults is consulted inside an alignment window, and injects nothing in
+	// its zero value. err is the abort it asked for.
+	//
+	// Both are touched only from Recv and the functions it calls, which run on
+	// the subtask's own goroutine. The forwarders never reach them.
+	faults faults
+	err    error
+
 	wg sync.WaitGroup
 }
 
@@ -132,9 +140,14 @@ type Gate struct {
 // The caller must drain the gate until Recv reports closure, or cancel ctx. The
 // forwarders select on ctx.Done when sending, so a gate abandoned after a
 // failure does not strand them.
-func NewGate(ctx context.Context, inputs []transport.Input) *Gate {
+//
+// fs is the subtask's fault injection, consulted inside an alignment window and
+// nowhere else in this file. Its zero value injects nothing, which is what
+// every job that is not a chaos run passes.
+func NewGate(ctx context.Context, inputs []transport.Input, fs faults) *Gate {
 	g := &Gate{
 		merged:      make(chan tagged, len(inputs)),
+		faults:      fs,
 		endOfStream: make([]bool, len(inputs)),
 		remaining:   len(inputs),
 		watermarks:  make([]int64, len(inputs)),
@@ -201,9 +214,19 @@ func NewGate(ctx context.Context, inputs []transport.Input) *Gate {
 // ok is false once every input has closed without the gate having delivered an
 // end-of-stream. That is the quiet exit: an upstream subtask failed or the job
 // was cancelled, that goroutine reports the cause, and this one has nothing to
-// add.
+// add. It is also false once a fault injector has aborted this subtask during
+// alignment, which is NOT quiet: Err then holds the failure and the subtask
+// returns it.
 func (g *Gate) Recv() (e core.StreamElement, ok bool) {
 	for {
+		// Checked before anything is delivered, including elements already
+		// queued. An abort is an abort: a gate that drained its pending queue
+		// first would let the subtask process elements from after the moment
+		// the fault was meant to stop it, and the position a seed names would
+		// stop meaning what it says.
+		if g.err != nil {
+			return core.StreamElement{}, false
+		}
 		if len(g.pending) > 0 {
 			e := g.pending[0]
 			g.pending = g.pending[1:]
@@ -291,7 +314,50 @@ func (g *Gate) onBarrier(t tagged) {
 		g.barrier = t.elem
 	}
 	g.alignedFor[t.input] = true
+
+	// A GENUINE alignment window: this barrier has arrived on some inputs and a
+	// live input has not delivered it yet. That gap is the thing alignment
+	// exists for and the thing TriggerDuringAlignment aims at, and it is the
+	// only place the injector is offered the decision. A barrier that completes
+	// alignment leaves no gap, so a schedule aimed at a window records a miss
+	// there rather than a hit somewhere else.
+	if g.awaitingBarrier() {
+		if err := g.faults.duringAlignment(t.elem.Barrier.CheckpointID, g.delivered()); err != nil {
+			g.err = err
+		}
+		return
+	}
 	g.completeAlignment()
+}
+
+// awaitingBarrier reports whether a live input has still to deliver the barrier
+// being aligned. It is false when nothing is aligning.
+func (g *Gate) awaitingBarrier() bool {
+	if !g.aligning {
+		return false
+	}
+	for i := range g.alignedFor {
+		if g.live(i) && !g.alignedFor[i] {
+			return true
+		}
+	}
+	return false
+}
+
+// delivered counts the inputs that have delivered the barrier being aligned.
+//
+// Every one of them is live, and liveness is not re-checked here: once an input
+// has delivered its barrier, handle buffers everything it sends afterwards
+// INCLUDING its end-of-stream, so an aligned input cannot have been marked
+// exhausted while the alignment is still open.
+func (g *Gate) delivered() int {
+	n := 0
+	for _, aligned := range g.alignedFor {
+		if aligned {
+			n++
+		}
+	}
+	return n
 }
 
 // onEndOfStream records that input t.input is exhausted.
@@ -331,13 +397,8 @@ func (g *Gate) onEndOfStream(t tagged) {
 // ahead of buffered records. The tail of the run comes out in order without
 // this function having to know about it.
 func (g *Gate) completeAlignment() {
-	if !g.aligning {
+	if !g.aligning || g.awaitingBarrier() {
 		return
-	}
-	for i := range g.alignedFor {
-		if g.live(i) && !g.alignedFor[i] {
-			return
-		}
 	}
 
 	g.pending = append(g.pending, g.barrier)
@@ -414,6 +475,16 @@ func (g *Gate) advance() (wm int64, advanced bool) {
 	g.out = min
 	return min, true
 }
+
+// Err returns the abort a fault injector asked for during alignment, or nil.
+//
+// It is how a gate reports a failure at all: Recv hands back one element and a
+// boolean and has nowhere to put an error, so the subtask reads it here when
+// Recv reports closure. A nil result there means the ordinary quiet exit --
+// every input closed -- which is why the two are not folded together.
+//
+// Called from the subtask's own goroutine, the same one that calls Recv.
+func (g *Gate) Err() error { return g.err }
 
 // Wait blocks until every forwarder has exited.
 //

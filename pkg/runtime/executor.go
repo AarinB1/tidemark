@@ -52,6 +52,15 @@ type Options struct {
 	// sharing one store would put two key spaces in one file with nothing
 	// between them. The runtime closes what it makes, if it has a Close.
 	NewState func() (state.KeyedState, error)
+	// FaultInjector, when non-nil, is consulted at the three logical positions
+	// a subtask can be aborted at: before a record, just after a barrier is
+	// forwarded, and inside an alignment window. nil means no faults, which is
+	// every job that is not a chaos run.
+	//
+	// It is the only way to abort a subtask at a chosen logical position, and
+	// it exists so that a chaos run goes through the same loops a real job
+	// does rather than through a copy of them. See FaultInjector.
+	FaultInjector FaultInjector
 }
 
 // Run executes g to completion with no checkpointing and no restore.
@@ -111,7 +120,7 @@ func RunWithOptions(ctx context.Context, g *graph.Graph, opts Options) error {
 	// waits for their forwarders. A subtask cannot: see Gate.Wait.
 	gates := make(map[subtaskID]*Gate, len(inputs))
 	for id, ins := range inputs {
-		gates[id] = NewGate(runCtx, ins)
+		gates[id] = NewGate(runCtx, ins, faults{injector: opts.FaultInjector, id: id})
 	}
 
 	subtasks := 0
@@ -133,6 +142,7 @@ func RunWithOptions(ctx context.Context, g *graph.Graph, opts Options) error {
 					coordinator:        coordinator,
 					newState:           opts.NewState,
 					restoredCheckpoint: restoredID,
+					injector:           opts.FaultInjector,
 				}
 				if payload, ok := restored[id.checkpointKey()]; ok {
 					cfg.restore, cfg.restored = payload, true
