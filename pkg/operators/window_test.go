@@ -1632,6 +1632,11 @@ func TestWindowRejectsAWatermarkStoredWrong(t *testing.T) {
 // impossible one, and the gap this test covers becomes reachable from a whole
 // job. At that point the job level has to watch it too and this test stops
 // being the only thing standing between the bug and the sink.
+//
+// The related hazard -- that the runtime hands out a SECOND watermark through
+// core.Context.CurrentWatermark which is not restored, and that q5's second
+// stage is where somebody reaches for it -- is pinned in
+// pkg/runtime/watermark_divergence_test.go.
 func TestRestoredWindowRecoversItsWatermark(t *testing.T) {
 	h := newWindowHarness(t, NewTumblingCount(100, 0))
 	h.record("a", 10)
