@@ -173,11 +173,19 @@ func TestNotifyingForACheckpointThatWasNeverStagedIsNotAnError(t *testing.T) {
 	root := t.TempDir()
 	s := openSink(t, root, "out", 0)
 
+	// Snapshot with no Write. That is the production sequence: a barrier
+	// arrives, the epoch advances, and no staging file is created. Notifying
+	// without snapshotting leaves epoch == 1, so checkpointID < epoch is
+	// false and the missing-file check never runs.
+	snapshot(t, s)
+	snapshot(t, s)
+
 	for _, tt := range []struct {
 		name string
 		id   int64
 	}{
 		{"an epoch that received no records", 1},
+		{"a later empty epoch", 2},
 		{"a checkpoint above every epoch this sink reached", 99},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

@@ -84,6 +84,11 @@ type Transactional struct {
 	// checkpoint I staged and whose file has gone missing", and the second is
 	// the drift this sink would otherwise commit silently.
 	firstEpoch int64
+	// written is the set of epochs this instance opened a staging file for.
+	// Snapshot of an epoch with no Write still advances `epoch`, so the range
+	// [firstEpoch, epoch) includes empty epochs; this set is what keeps a
+	// notification for one of those from looking like a missing file.
+	written map[int64]struct{}
 
 	// opened guards against one instance being handed to several subtasks; see
 	// Open.
@@ -214,10 +219,12 @@ func (t *Transactional) Snapshot(w io.Writer) error {
 // no records has no file, and a notification can arrive for a checkpoint that
 // completed after this sink's last barrier.
 //
-// The one case that is NOT success is a checkpoint inside this instance's own
-// staged range whose file is in neither directory. That is the epoch counter
-// having drifted from the checkpoint IDs, and the alternative to reporting it
-// is committing one epoch's records under another epoch's name.
+// The one case that is NOT success is a checkpoint this instance opened a
+// staging file for, inside its own range, whose file is in neither directory.
+// That is the epoch counter having drifted from the checkpoint IDs, and the
+// alternative to reporting it is committing one epoch's records under another
+// epoch's name. An empty epoch is not that case: Snapshot advanced `epoch`
+// and left no file, which is the documented no-op.
 func (t *Transactional) NotifyCheckpointComplete(checkpointID int64) error {
 	staging, committed := t.stagingPath(checkpointID), t.committedPath(checkpointID)
 	err := os.Rename(staging, committed)
@@ -235,8 +242,10 @@ func (t *Transactional) NotifyCheckpointComplete(checkpointID int64) error {
 		return nil
 	}
 	if checkpointID >= t.firstEpoch && checkpointID < t.epoch {
-		return fmt.Errorf("transactional sink: %w: checkpoint %d, subtask %s[%d]",
-			ErrStagedFileMissing, checkpointID, t.vertexID, t.index)
+		if _, ok := t.written[checkpointID]; ok {
+			return fmt.Errorf("transactional sink: %w: checkpoint %d, subtask %s[%d]",
+				ErrStagedFileMissing, checkpointID, t.vertexID, t.index)
+		}
 	}
 	// Never staged: an epoch with no records, or a checkpoint from before this
 	// instance began.
@@ -310,6 +319,7 @@ func (t *Transactional) Restore(r io.Reader) error {
 	// firstEpoch and turn a missing staging file for it from a reported drift
 	// into a shrug.
 	t.epoch, t.firstEpoch = k+1, k+1
+	t.written = nil
 	return nil
 }
 
@@ -541,6 +551,10 @@ func (t *Transactional) openEpoch() error {
 		return fmt.Errorf("transactional sink: staging checkpoint %d: %w", t.epoch, err)
 	}
 	t.file, t.buf = f, bufio.NewWriter(f)
+	if t.written == nil {
+		t.written = make(map[int64]struct{})
+	}
+	t.written[t.epoch] = struct{}{}
 	return nil
 }
 
