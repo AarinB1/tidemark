@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"slices"
@@ -154,6 +155,29 @@ func (c checkpointer) awaitCompletedAmong(ctx context.Context, ids []int64) []in
 		return nil
 	}
 	return c.co.AwaitCompletedAmong(ctx, ids)
+}
+
+// restorableSink is a sink with state to bring back from a checkpoint.
+//
+// An optional interface, asserted for, rather than a Restore on core.Sink. It
+// is the same shape as closableState and splittableSource and the same
+// argument: sinks.Collect and sinks.Discard have nothing to restore, and
+// putting the method on core.Sink would make every fake in every test implement
+// a no-op to satisfy it.
+//
+// The assertion is NOT silent when it fails. A sink that recorded a payload and
+// cannot read one back is refused, because the alternative -- ignoring it, the
+// way the runtime ignored a sink's empty payload until Phase 5 -- is a
+// transaction that is staged, complete, and never committed. That is missing
+// output with nothing in the logs.
+//
+// A decorator wrapping a sink must forward Restore EXPLICITLY. Embedding
+// core.Sink satisfies core.Sink and not this, so a decorator that embedded
+// would fail the assertion above rather than silently skip the restore, which
+// is the loud half of the trap CLAUDE.md records against decorators of
+// core.Source.
+type restorableSink interface {
+	Restore(r io.Reader) error
 }
 
 // ErrFaultInjected is what a subtask returns when a FaultInjector aborts it.
@@ -311,11 +335,7 @@ func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, grou
 	case graph.VertexOperator:
 		return runOperatorSubtask(ctx, v, id, gate, w, cp, fs, cfg)
 	case graph.VertexSink:
-		// A sink restores nothing. Its payload is empty by construction, and it
-		// will be until the transactional sink in Phase 5 has a staging area to
-		// record. Ignored rather than checked, because a sink that found
-		// something there could not do anything with it either.
-		return runSinkSubtask(ctx, v, id, gate, w, cp, fs)
+		return runSinkSubtask(ctx, v, id, gate, w, cp, fs, cfg)
 	default:
 		return fmt.Errorf("subtask %s: unknown kind %d", id, uint8(v.Kind))
 	}
@@ -553,7 +573,7 @@ func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id su
 	}
 }
 
-func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, fs faults) (err error) {
+func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, fs faults, cfg subtaskConfig) (err error) {
 	snk := v.NewSink()
 	oc := newOpContext(ctx, id, w)
 	if err := snk.Open(oc); err != nil {
@@ -564,6 +584,32 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 			err = fmt.Errorf("sink %s: close: %w", id, cerr)
 		}
 	}()
+
+	// AFTER Open and BEFORE any element, which is the same window an operator's
+	// restore takes and for the same reason: Open is where the sink learns the
+	// identity every path in its restore is named by.
+	//
+	// Restoring is what commits the transaction staged at the checkpoint being
+	// resumed from. _COMPLETE for it exists -- that is what selected it -- so it
+	// IS committable, and the crash may have landed between that marker and the
+	// notification. A sink that assumed the notification had arrived would lose
+	// that transaction with nothing to point at.
+	if cfg.restored {
+		restorable, ok := snk.(restorableSink)
+		if !ok && len(cfg.restore) > 0 {
+			// A payload with no reader is a sink that staged something a
+			// previous run recorded and that this one will never commit.
+			// Refused rather than ignored: the silent version is missing
+			// output.
+			return fmt.Errorf("sink %s: the checkpoint holds %d bytes of state for it and %T "+
+				"has no Restore to read them", id, len(cfg.restore), snk)
+		}
+		if ok {
+			if err := restorable.Restore(bytes.NewReader(cfg.restore)); err != nil {
+				return fmt.Errorf("sink %s: restore: %w", id, err)
+			}
+		}
+	}
 
 	// staged is the checkpoints this sink has acknowledged and not yet been
 	// told the outcome of, ascending. A checkpoint leaves it when it completes

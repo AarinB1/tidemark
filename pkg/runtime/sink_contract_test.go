@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
 	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/graph"
+	"github.com/AarinB1/tidemark/pkg/sinks"
 )
 
 // The sink half of the checkpoint protocol.
@@ -137,10 +139,42 @@ func (s *recordingSink) identities() []string {
 // It reuses the recovery suite's helpers on purpose: what these tests assert is
 // about the protocol the runtime runs, so the workload under it should be one
 // the rest of the package already trusts rather than a second one written here.
+//
+// The sink instance is SHARED across subtasks, which is what countingGraph
+// does. That is right for the recording sinks here and for sinks.Collect, both
+// of which lock; it is wrong for a sink that owns a file handle, which is what
+// sinkFactoryGraph below exists for.
 func sinkContractGraph(t *testing.T, sink core.Sink, p int, count int64, barrierInterval int64) *graph.Graph {
 	t.Helper()
 	return countingGraph(t, sink, p,
 		countingSourceVertex("src", restoreConfig(11, count), p, barrierInterval, nil))
+}
+
+// sinkFactoryGraph is a source, an identity map and a sink, with the sink built
+// PER SUBTASK.
+//
+// Two things separate it from sinkContractGraph, and both are load-bearing.
+//
+// The sink is built per subtask because a subtask is the unit of state, and a
+// sink that owns a file handle and an epoch counter is per-subtask state.
+// Sharing one across subtasks gives several goroutines one buffered writer:
+// they write into one staging file and commit it under one name, so half the
+// output disappears. sinks.Transactional refuses to be opened twice for exactly
+// that reason, and this is the shape a job wiring one has to use.
+//
+// The operator is an identity MAP rather than the keyed count, because a keyed
+// count emits only at end of stream. Every epoch before the last barrier would
+// then be empty, there would be no transaction to commit during the run, and a
+// test asserting on committed files would be asserting on an empty directory --
+// which is what it does if the operator is chosen for familiarity rather than
+// for whether the property under test can happen.
+func sinkFactoryGraph(t *testing.T, newSink func() core.Sink, p int, count int64, barrierInterval int64) *graph.Graph {
+	t.Helper()
+	return buildGraph(t, []graph.Vertex{
+		countingSourceVertex("src", restoreConfig(11, count), p, barrierInterval, nil),
+		{ID: "id", Kind: graph.VertexOperator, Parallelism: p, NewOperator: identity},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: p, NewSink: newSink},
+	}, [][2]string{{"src", "id"}, {"id", "out"}})
 }
 
 // TestASinkIsNotifiedOnlyAfterCompleteIsDurable is invariant 4 as an
@@ -387,4 +421,252 @@ func TestASinkStagesEvenWithoutCheckpointing(t *testing.T) {
 		t.Errorf("a job that takes no checkpoints notified the sink %d times: nothing completed, "+
 			"so nothing licensed a commit", notifications)
 	}
+}
+
+// The restore half.
+//
+// A sink's restore is the only thing that will ever commit the transaction
+// staged at the checkpoint a run resumes from: the crash may have landed after
+// _COMPLETE and before the notification, and nothing repeats a notification.
+// These assert that the runtime actually calls it, because a sink whose Restore
+// is perfect and never invoked fails in exactly the same silent way.
+
+// restorableRecordingSink is a recordingSink that also remembers what it was
+// handed to restore from.
+//
+// Restore is declared here rather than on recordingSink so that the two cases
+// below -- a sink that can restore and one that cannot -- are two types rather
+// than one type with a flag. The runtime distinguishes them with an interface
+// assertion, and a flag would test the flag.
+type restorableRecordingSink struct {
+	recordingSink
+
+	restoreMu sync.Mutex
+	restored  [][]byte
+}
+
+func (s *restorableRecordingSink) Restore(r io.Reader) error {
+	payload, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	s.restoreMu.Lock()
+	defer s.restoreMu.Unlock()
+	s.restored = append(s.restored, payload)
+	return nil
+}
+
+func (s *restorableRecordingSink) restorePayloads() [][]byte {
+	s.restoreMu.Lock()
+	defer s.restoreMu.Unlock()
+	return slices.Clone(s.restored)
+}
+
+// TestARestoredSinkIsHandedTheCheckpointsPayload.
+//
+// One run writes checkpoints, a second resumes from the newest. Each sink
+// subtask must be handed the bytes ITS OWN Snapshot wrote at that checkpoint --
+// not nil, not another subtask's. The payload names the staged transaction, so
+// a subtask given the wrong one commits the wrong file, and both files exist:
+// the failure is wrong output rather than a missing file.
+//
+// Two sink subtasks, because at parallelism 1 every payload is the right one.
+func TestARestoredSinkIsHandedTheCheckpointsPayload(t *testing.T) {
+	root := t.TempDir()
+	first := &restorableRecordingSink{recordingSink: recordingSink{root: root}}
+	g := sinkContractGraph(t, first, 2, 4000, 500)
+	if err := RunWithOptions(context.Background(), g, Options{CheckpointRoot: root, Seed: 5}); err != nil {
+		t.Fatalf("the first run failed: %v", err)
+	}
+
+	storage := checkpoint.NewStorage(root)
+	id, ok, err := storage.Latest()
+	if err != nil || !ok {
+		t.Fatalf("Latest = (%d, %t, %v), want a complete checkpoint", id, ok, err)
+	}
+	_, payloads, err := storage.Load(id)
+	if err != nil {
+		t.Fatalf("Load(%d): %v", id, err)
+	}
+
+	second := &restorableRecordingSink{recordingSink: recordingSink{root: root}}
+	g2 := sinkContractGraph(t, second, 2, 4000, 500)
+	if err := RunWithOptions(context.Background(), g2, Options{
+		CheckpointRoot: root, RestoreFrom: root, Seed: 5,
+	}); err != nil {
+		t.Fatalf("the resumed run failed: %v", err)
+	}
+
+	got := second.restorePayloads()
+	if len(got) != 2 {
+		t.Fatalf("Restore was called %d times, want once per sink subtask (2): a subtask that is "+
+			"not restored never commits the transaction the checkpoint vouched for", len(got))
+	}
+	var want [][]byte
+	for index := range 2 {
+		want = append(want, payloads[subtaskID{vertexID: "out", index: index}.checkpointKey()])
+	}
+	for _, payload := range got {
+		if len(payload) == 0 {
+			t.Errorf("a sink subtask was restored from an empty payload; checkpoint %d holds %q and %q",
+				id, want[0], want[1])
+			continue
+		}
+		if !slices.ContainsFunc(want, func(w []byte) bool { return string(w) == string(payload) }) {
+			t.Errorf("a sink subtask was restored from %q, which checkpoint %d does not hold for "+
+				"either subtask (%q, %q)", payload, id, want[0], want[1])
+		}
+	}
+}
+
+// TestASinkThatRecordedStateAndCannotRestoreItIsRefused.
+//
+// The runtime finds a sink's Restore by an interface assertion, and the way an
+// assertion fails is silently. A sink that staged a transaction, recorded it,
+// and has no way to read it back would come up on restore having forgotten
+// everything -- the transaction stays staged forever and its records are simply
+// absent from the output.
+//
+// So it is refused with an error naming the type. This is also the guard on
+// decorators: embedding core.Sink satisfies core.Sink and not restorableSink,
+// so a wrapper that forgot to forward Restore fails here rather than quietly
+// skipping it.
+func TestASinkThatRecordedStateAndCannotRestoreItIsRefused(t *testing.T) {
+	root := t.TempDir()
+	// recordingSink writes a non-empty payload and has no Restore.
+	sink := &recordingSink{root: root}
+	g := sinkContractGraph(t, sink, 1, 2000, 500)
+	if err := RunWithOptions(context.Background(), g, Options{CheckpointRoot: root, Seed: 5}); err != nil {
+		t.Fatalf("the first run failed: %v", err)
+	}
+
+	g2 := sinkContractGraph(t, &recordingSink{root: root}, 1, 2000, 500)
+	err := RunWithOptions(context.Background(), g2, Options{
+		CheckpointRoot: root, RestoreFrom: root, Seed: 5,
+	})
+	if err == nil {
+		t.Fatal("the resumed run succeeded with a sink that cannot read the state the checkpoint " +
+			"holds for it: the staged transaction is never committed and its records are absent")
+	}
+	if !strings.Contains(err.Error(), "has no Restore") {
+		t.Errorf("the run failed with %v, which does not name the missing Restore", err)
+	}
+}
+
+// TestASinkWithNoRecordedStateRestoresWithoutOne.
+//
+// The other side of the assertion. sinks.Collect and sinks.Discard record an
+// empty payload and have nothing to bring back, and a runtime that demanded a
+// Restore from every sink would make every fake in every test implement a
+// no-op. An empty payload and no Restore is the ordinary case, not an error.
+func TestASinkWithNoRecordedStateRestoresWithoutOne(t *testing.T) {
+	root := t.TempDir()
+	g := sinkContractGraph(t, sinks.NewCollect(), 2, 4000, 500)
+	if err := RunWithOptions(context.Background(), g, Options{CheckpointRoot: root, Seed: 5}); err != nil {
+		t.Fatalf("the first run failed: %v", err)
+	}
+	g2 := sinkContractGraph(t, sinks.NewCollect(), 2, 4000, 500)
+	if err := RunWithOptions(context.Background(), g2, Options{
+		CheckpointRoot: root, RestoreFrom: root, Seed: 5,
+	}); err != nil {
+		t.Fatalf("the resumed run failed: %v", err)
+	}
+}
+
+// TestTheTransactionalSinkCommitsAcrossARealRecovery.
+//
+// End to end through the runtime: a run aborted by a fault part way through,
+// then a run resumed from the newest complete checkpoint. What is asserted is
+// the COMMITTED FILE SET, because that is what says which transactions became
+// output -- and because the records inside them are replayable, so a contents
+// comparison alone cannot tell a committed transaction from a re-derived one.
+//
+// The fault is what makes this a recovery rather than a re-run. Without it the
+// first run reaches its last checkpoint at the end of the input, the resumed
+// run has nothing left to replay, and every assertion below is about a job that
+// recovered from nothing -- which is the shape this test had before, and it
+// passed.
+//
+// The tail of each run is NOT committed here. Records after the last barrier
+// belong to no checkpoint and nothing will ever notify for them; that is the
+// final epoch, and it arrives in the next step.
+func TestTheTransactionalSinkCommitsAcrossARealRecovery(t *testing.T) {
+	checkpoints := t.TempDir()
+	output := t.TempDir()
+	newTransactional := func() core.Sink { return sinks.NewTransactional(output) }
+
+	// Abort one source subtask three quarters of the way through its range, so
+	// several checkpoints are behind the fault and a quarter of the input is in
+	// front of it. Both halves matter: without checkpoints behind it there is
+	// nothing committed to carry across, and without input in front the resumed
+	// run replays nothing and recovers from nothing.
+	abort := &recordingInjector{fire: func(c consultation) bool {
+		return c.site == "before-element" && c.vertexID == "src" && c.subtask == 0 && c.n == 3000
+	}}
+	g := sinkFactoryGraph(t, newTransactional, 2, 8000, 500)
+	err := RunWithOptions(context.Background(), g, Options{
+		CheckpointRoot: checkpoints, Seed: 5, FaultInjector: abort,
+	})
+	if !errors.Is(err, ErrFaultInjected) {
+		t.Fatalf("the first run = %v, want the injected fault", err)
+	}
+
+	afterFirst, err := sinks.CommittedFiles(output)
+	if err != nil {
+		t.Fatalf("CommittedFiles: %v", err)
+	}
+	stagedAfterFirst, err := sinks.StagingFiles(output)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	if len(afterFirst) == 0 {
+		t.Fatal("the aborted run committed nothing, so this test asserts nothing about recovery")
+	}
+	if len(stagedAfterFirst) == 0 {
+		t.Fatal("the aborted run left nothing staged, so the discard-above-the-cut path is untouched")
+	}
+
+	restored, ok, err := checkpoint.NewStorage(checkpoints).Latest()
+	if err != nil || !ok {
+		t.Fatalf("Latest = (%d, %t, %v), want the checkpoint the resume will use", restored, ok, err)
+	}
+
+	g2 := sinkFactoryGraph(t, newTransactional, 2, 8000, 500)
+	if err := RunWithOptions(context.Background(), g2, Options{
+		CheckpointRoot: checkpoints, RestoreFrom: checkpoints, Seed: 5,
+	}); err != nil {
+		t.Fatalf("the resumed run failed: %v", err)
+	}
+
+	afterSecond, err := sinks.CommittedFiles(output)
+	if err != nil {
+		t.Fatalf("CommittedFiles: %v", err)
+	}
+	// A commit is a rename into committed/ and nothing renames back, so the
+	// resumed run can only add.
+	for _, name := range afterFirst {
+		if !slices.Contains(afterSecond, name) {
+			t.Errorf("%s was committed by the aborted run and is gone after the resumed one", name)
+		}
+	}
+	if len(afterSecond) <= len(afterFirst) {
+		t.Errorf("the aborted run committed %d files and the resumed one committed %d in total: "+
+			"the resumed run reached checkpoints of its own and committed none of them",
+			len(afterFirst), len(afterSecond))
+	}
+	// Every committed transaction the ABORTED run left staged above the cut is
+	// gone: those epochs never completed and their records are replayed.
+	staged, err := sinks.StagingFiles(output)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	for _, name := range staged {
+		if slices.Contains(stagedAfterFirst, name) {
+			t.Errorf("%s was staged by the aborted run and is still staged after the resumed one; "+
+				"the resume was at checkpoint %d and everything above it should have been discarded",
+				name, restored)
+		}
+	}
+	t.Logf("aborted run: %d committed, %d staged; resumed run: %d committed in total, restored at "+
+		"checkpoint %d", len(afterFirst), len(stagedAfterFirst), len(afterSecond), restored)
 }
