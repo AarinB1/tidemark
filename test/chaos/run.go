@@ -26,7 +26,7 @@ import (
 // # Why the lengths differ
 //
 // srcA covers its whole range in two thousand elements per subtask while srcB
-// needs eight thousand for its. Both inject four barriers, so srcA reaches
+// needs eight thousand for its. Both inject eight barriers, so srcA reaches
 // barrier k roughly four times as early in the stream as srcB does, and the
 // gate holds srcA's barrier for thousands of srcB elements waiting for the
 // matching one. That gap is the alignment window, and it is measured in
@@ -58,12 +58,40 @@ const (
 	sourceACount = 4000
 	sourceBCount = 16000
 	// Scaled against the range lengths so both vertices inject the same NUMBER
-	// of barriers: 2000/500 and 8000/2000 are both four. A vertex injecting
+	// of barriers: 2000/250 and 8000/1000 are both eight. A vertex injecting
 	// more barriers than another is not wrong, but it makes "checkpoint k" mean
 	// a different depth on each input and the alignment windows stop lining up
 	// with the schedule's checkpoint IDs.
-	barrierIntervalA = 500
-	barrierIntervalB = 2000
+	//
+	// # Why eight and not four
+	//
+	// Phase 4 ran these at 500 and 2000, four barriers a subtask, and the
+	// census that came out of it said the suite was weaker than its schedule
+	// count: 359 of 661 resumes restarted from ZERO because the fault fired
+	// before any checkpoint had completed, and a run that restarts from zero
+	// exercises replay rather than restore. Phase 5's exactly-once claim is
+	// about what restore commits, so a suite that reaches restore in fewer than
+	// half its resumes is validating the wrong half of the property.
+	//
+	// Halving both intervals halves the distance to the first complete
+	// checkpoint without touching the record count, the parallelism, the keys
+	// or the window size -- so the oracle's answer, the alignment skew and the
+	// state the operator holds are all the workload Phase 4 measured. What
+	// moves is where the cuts fall. Measured over three 500-seed runs and three
+	// 25-seed ones: resumes from a real checkpoint 45.7% -> 65.3-69.3%, and
+	// schedules recovering from a cut that held a complete but unfired window
+	// 47.4% -> 58.6-61.4%.
+	//
+	// The cost is fsyncs. Twice the barriers is twice the checkpoints and twice
+	// the state files, which is about twenty per cent on the 500-seed target
+	// (41s -> 48-53s) and about seven per cent on the 25-seed subset `make
+	// check` runs under the race detector. Quartering them instead was measured
+	// too and buys more (85.8% of resumes from a checkpoint) at ninety per cent
+	// more wall clock, and it moves the flush fraction out of the timing
+	// baseline this workload has been held to since Phase 4 -- which would mean
+	// re-committing a figure whose value is that it has not moved.
+	barrierIntervalA = 250
+	barrierIntervalB = 1000
 
 	// maxRecoveries bounds how many times one schedule is resumed.
 	//
