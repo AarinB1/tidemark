@@ -273,64 +273,91 @@ func (t *Transactional) NotifyCheckpointComplete(checkpointID int64) error {
 // own staging file for k+1 would be written over a previous run's, and a
 // notification for k+1 would commit a mixture of the two.
 func (t *Transactional) Restore(r io.Reader) error {
+	payload, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("transactional sink: restore: reading the payload: %w", err)
+	}
+	// Three cases, and they are told apart by LENGTH rather than by a flag.
+	//
+	// No bytes at all is a job that is not resuming, which the runtime reports
+	// by calling this with an empty payload rather than by not calling it. That
+	// uniformity is what makes the sweep below happen on a fresh start too: a
+	// staging file sitting in the directory when a job begins from checkpoint
+	// zero belongs to a run that will never be resumed, and leaving it there
+	// would let this run's own commit of that epoch pick up a dead run's
+	// records if this run happened to write nothing into it.
+	//
+	// Eight bytes is a checkpoint. Anything else is a payload this sink did not
+	// write, and continuing from it would pick an epoch out of the air.
 	var k int64
-	if err := binary.Read(r, binary.BigEndian, &k); err != nil {
-		return fmt.Errorf("transactional sink: restore: reading the staged checkpoint: %w", err)
+	switch len(payload) {
+	case 0:
+		k = 0
+	case 8:
+		k = int64(binary.BigEndian.Uint64(payload))
+	default:
+		return fmt.Errorf("transactional sink: restore: the payload is %d bytes, want 8 or none",
+			len(payload))
 	}
 	if k < 0 {
 		return fmt.Errorf("transactional sink: restore: the payload names checkpoint %d", k)
 	}
 
-	// The order is commit, then discard, then move to the next epoch, and it is
-	// not interchangeable. Discarding first over a range that included k would
-	// throw away the transaction this function exists to commit; moving the
-	// epoch first would put k below firstEpoch and turn a missing staging file
-	// for it from a reported drift into a shrug.
-	if err := t.commitPending(k); err != nil {
+	if err := t.settleStaged(k); err != nil {
 		return err
 	}
-	if err := t.discardAbove(k); err != nil {
-		return err
-	}
+	// After settling, not before. Moving the epoch first would put k below
+	// firstEpoch and turn a missing staging file for it from a reported drift
+	// into a shrug.
 	t.epoch, t.firstEpoch = k+1, k+1
 	return nil
 }
 
-// commitPending commits checkpoint k if its staging file is still there.
+// settleStaged commits every staged transaction of this subtask at or below k
+// and discards every one above it.
 //
-// Idempotent, and the idempotence is the naming rather than a check: the
-// committed path is a function of (subtask, checkpoint), so a k that a previous
-// run already committed is a rename whose source is gone and whose destination
-// exists, which is success. A run that restores twice from the same checkpoint
-// commits it twice and produces one file.
-func (t *Transactional) commitPending(k int64) error {
-	if k == 0 {
-		// Checkpoint IDs are contiguous from 1, so zero is the payload of a
-		// sink that never reached a barrier. There is nothing staged under that
-		// name and nothing to commit.
-		return nil
-	}
-	staging, committed := t.stagingPath(k), t.committedPath(k)
-	err := os.Rename(staging, committed)
-	if err == nil {
-		return syncDir(t.dir(committedDir))
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		// Either the notification arrived before the crash and this is already
-		// committed, or the epoch held no records and left no file. Both are
-		// the state this function is trying to reach.
-		return nil
-	}
-	return fmt.Errorf("transactional sink: restore: committing checkpoint %d: %w", k, err)
-}
-
-// discardAbove deletes THIS SUBTASK's staging files for checkpoints above k.
+// # Why at or below k, and not k alone
 //
-// This subtask's and no other's. Subtasks restore concurrently, so a sink that
-// swept the whole directory would delete a sibling's staging file while the
-// sibling was writing to it -- and the sibling would carry on appending to a
-// file with no name, whose records reach nothing.
-func (t *Transactional) discardAbove(k int64) error {
+// The brief for this step said "commit the pending transaction for checkpoint
+// k", and k is the common case rather than the rule. Restoring at k means the
+// replay starts at the cut k records, so every record the sink received BELOW
+// barrier k is one no run will produce again -- whatever epoch it was staged
+// into. A staging file for any j <= k is therefore a transaction that must be
+// committed here or lost outright.
+//
+// More than one can be pending, and the chaos suite found it: seed 105 lost 32
+// window rows. A fault fires just after a sink acknowledges a barrier and
+// before its notification pass, so checkpoint j completes with its transaction
+// uncommitted; the run then reaches k > j before it dies, and a restore that
+// commits only k leaves j staged forever. Its records are below the cut, so the
+// resumed run never produces them again and the loss is silent -- the oracle
+// sees a (key, window) that is simply absent.
+//
+// A j that was ABANDONED rather than completed is committed too, and that is
+// right for the same reason. "Abandoned" is a fact about the checkpoint, not
+// about the data: those records are still below cut k, still covered by the
+// state checkpoint k restores, and still never replayed.
+//
+// # Why above k is discarded
+//
+// An epoch above k belongs to a checkpoint that never completed. Its records
+// ARE below the replay point, so the resumed run produces them again --
+// committing it would duplicate them. Leaving it is no better: the resumed run
+// reuses the epoch numbers above k, so its own staging file for k+1 would be
+// written over a previous run's, and a notification for k+1 would commit a
+// mixture of the two.
+//
+// # Why it is this subtask's files and no other's
+//
+// Subtasks restore CONCURRENTLY. A sink that swept the whole directory would
+// delete a sibling's staging file while the sibling was writing to it, and the
+// sibling would carry on appending to a file with no name, whose records reach
+// nothing.
+//
+// Committing is idempotent by the naming: the committed path is a function of
+// (subtask, checkpoint), so a transaction a previous run already committed is a
+// rename whose source is gone and whose destination exists.
+func (t *Transactional) settleStaged(k int64) error {
 	dir := t.dir(stagingDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -339,27 +366,43 @@ func (t *Transactional) discardAbove(k int64) error {
 		}
 		return fmt.Errorf("transactional sink: restore: %w", err)
 	}
-	removed := false
+	committed, discarded := false, false
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		id, ok := t.checkpointOf(e.Name())
-		if !ok || id <= k {
+		if !ok {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("transactional sink: restore: discarding %s: %w", e.Name(), err)
+		if id > k {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("transactional sink: restore: discarding %s: %w", e.Name(), err)
+			}
+			discarded = true
+			continue
 		}
-		removed = true
+		err := os.Rename(filepath.Join(dir, e.Name()), t.committedPath(id))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("transactional sink: restore: committing checkpoint %d: %w", id, err)
+		}
+		if err == nil {
+			committed = true
+		}
 	}
-	if !removed {
-		return nil
+	// The renames and the removals, made durable. A crash that lost the
+	// removals would leave the resumed run's staging namespace holding a
+	// previous run's epochs; one that lost the renames would leave committed
+	// files whose names are not on the disk, which reads back as lost output.
+	if committed {
+		if err := syncDir(t.dir(committedDir)); err != nil {
+			return err
+		}
 	}
-	// The removals, made durable. A crash that lost them would leave the
-	// resumed run's staging namespace holding a previous run's epochs, which is
-	// the collision this function exists to prevent.
-	return syncDir(dir)
+	if committed || discarded {
+		return syncDir(dir)
+	}
+	return nil
 }
 
 // checkpointOf reads the checkpoint ID out of a staging file name belonging to
@@ -369,7 +412,9 @@ func (t *Transactional) discardAbove(k int64) error {
 // carry no '-', so the last two separators always mark the boundaries however
 // many the vertex ID contains -- which is the same property fileName relies on
 // to be injective. The vertex ID and index are then compared rather than
-// trusted, because "belonging to this subtask" is the whole question.
+// trusted, because "belonging to this subtask" is the whole question: settling
+// another subtask's file would commit or delete a transaction that is not this
+// one's to decide about.
 func (t *Transactional) checkpointOf(name string) (int64, bool) {
 	rest, ok := strings.CutSuffix(name, stagingSuffix)
 	if !ok {
@@ -389,34 +434,52 @@ func (t *Transactional) checkpointOf(name string) (int64, bool) {
 	return id, true
 }
 
-// CommitFinalEpoch commits the staging file for the epoch after the last
-// barrier.
+// CommitFinalEpoch commits every epoch this sink still has staged.
 //
 // # Why this exists at all
 //
-// Records written after the last barrier and before end of stream belong to no
-// checkpoint. No barrier closed that epoch, so no checkpoint covers it, so
-// nothing will ever notify for it -- and without this it would sit staged
-// forever and its records would simply be missing from the output.
+// The named case is the FINAL epoch: records written after the last barrier and
+// before end of stream. No barrier closed that epoch, so no checkpoint covers
+// it, so nothing will ever notify for it -- and without this it would sit
+// staged forever and its records would simply be missing from the output.
 //
-// It exists ONLY because the input is bounded. An unbounded job has no final
-// epoch: there is always another barrier coming, and every record is eventually
-// covered by a checkpoint that completes. A reader who knows Flink will look
-// for the equivalent there and not find one, and that is why.
+// That case exists ONLY because the input is bounded. An unbounded job has no
+// final epoch: there is always another barrier coming, and every record is
+// eventually covered by a checkpoint that completes. A reader who knows Flink
+// will look for the equivalent there and not find one, and that is why.
+//
+// # Why it is every staged epoch and not only the last
+//
+// Because two other epochs can still be staged when a job succeeds, and both
+// were being lost.
+//
+// A job that takes NO checkpoints never completes one, so nothing ever notifies
+// and every epoch it staged is still staged at the end. Committing only the
+// last one published the tail and dropped the rest -- measured at 1976 of 2178
+// window rows on the chaos workload, because most windows fire on the
+// end-of-input flush and land in the final epoch. It looked almost right.
+//
+// And a notification that FAILED is logged rather than fatal, on the grounds
+// that the sink will commit on restore instead. A job that then succeeds has no
+// restore, and that epoch would be stranded too.
+//
+// The precondition covers all of them equally: the job completed, so no run
+// will replay any of these records, so committing them cannot duplicate them.
+// Restricting it to the last epoch was arbitrary.
 //
 // # Why it is safe
 //
-// Because the job COMPLETED. There is no recovery to be consistent with: no run
-// will replay these records, so committing them cannot duplicate them. That
-// precondition is the whole justification and it is not this type's to check --
-// the runtime calls this only after every subtask of the job has returned
-// without an error. Calling it from the sink's own end-of-stream would be
-// calling it on a weaker precondition: a sink subtask that reaches end of
-// stream knows its own inputs finished, not that the job did, and a job where
-// another subtask fails afterwards IS replayed. The tail would then be
-// committed here under one epoch number and again by the resumed run under a
-// different one, which is a duplicate the naming cannot collapse because the
-// names differ.
+// Because the job COMPLETED, and that is not this type's to check -- the
+// runtime calls this only after every subtask has returned without an error.
+// Calling it from the sink's own end of stream would be a weaker precondition:
+// a sink subtask that reaches end of stream knows its own inputs finished, not
+// that the job did, and a job where another subtask fails afterwards IS
+// replayed. The tail would then be committed here under one epoch number and
+// again by the resumed run under a different one, which is a duplicate the
+// naming cannot collapse because the names differ.
+//
+// The range is this instance's own epochs, firstEpoch to epoch. Below
+// firstEpoch is a previous run's, which Restore already committed or discarded.
 func (t *Transactional) CommitFinalEpoch() error {
 	// closeEpoch is a no-op after Close, which is the ordinary case: the
 	// runtime closes a sink when its subtask returns and calls this afterwards,
@@ -425,17 +488,25 @@ func (t *Transactional) CommitFinalEpoch() error {
 	if err := t.closeEpoch(); err != nil {
 		return err
 	}
-	staging, committed := t.stagingPath(t.epoch), t.committedPath(t.epoch)
-	err := os.Rename(staging, committed)
-	if err == nil {
-		return syncDir(t.dir(committedDir))
+	committed := false
+	for id := t.firstEpoch; id <= t.epoch; id++ {
+		err := os.Rename(t.stagingPath(id), t.committedPath(id))
+		if err == nil {
+			committed = true
+			continue
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			// Either the epoch received no records and left no file, or its
+			// notification already committed it. Both are the state this is
+			// trying to reach.
+			continue
+		}
+		return fmt.Errorf("transactional sink: committing epoch %d at the end of the job: %w", id, err)
 	}
-	if errors.Is(err, os.ErrNotExist) {
-		// The final epoch received no records, so it left no file. A job whose
-		// last barrier fell on its last record is the ordinary way to get here.
+	if !committed {
 		return nil
 	}
-	return fmt.Errorf("transactional sink: committing the final epoch %d: %w", t.epoch, err)
+	return syncDir(t.dir(committedDir))
 }
 
 // Close releases the open staging file without committing it.

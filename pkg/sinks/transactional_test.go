@@ -774,8 +774,8 @@ func TestRestoreRejectsAPayloadItCannotRead(t *testing.T) {
 		name    string
 		payload []byte
 	}{
-		{"empty", nil},
 		{"truncated", []byte{0, 0, 0}},
+		{"too long", []byte{0, 0, 0, 0, 0, 0, 0, 0, 0}},
 		{"negative", []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -858,5 +858,161 @@ func TestCommittingAFinalEpochWithNoRecordsIsANoOp(t *testing.T) {
 	}
 	if want := []string{"out-0-1" + commitSuffix}; !slices.Equal(files, want) {
 		t.Errorf("committed holds %v, want %v: an empty final epoch produced a file", files, want)
+	}
+}
+
+// TestAnEmptyPayloadIsAFreshStartAndSweepsADeadRunsStaging.
+//
+// The runtime calls Restore on every job, resuming or not, and reports "not
+// resuming" with an empty payload. That uniformity is what lets a fresh run
+// sweep a directory holding a previous run's staged transactions.
+//
+// It matters because of what CommitFinalEpoch does at the end of a successful
+// job: it commits every epoch in this instance's range that is still staged. A
+// fresh run that did not sweep would find a dead run's file under one of its
+// own epoch names -- for any epoch it happened to write nothing into -- and
+// commit that run's records as its own output.
+func TestAnEmptyPayloadIsAFreshStartAndSweepsADeadRunsStaging(t *testing.T) {
+	root := t.TempDir()
+	stageDirectly(t, root, "out", 0, 1, "from-a-dead-run")
+	stageDirectly(t, root, "out", 0, 2, "also-from-a-dead-run")
+	stageDirectly(t, root, "out", 1, 1, "another-subtask")
+
+	s := openSink(t, root, "out", 0)
+	if err := s.Restore(bytes.NewReader(nil)); err != nil {
+		t.Fatalf("Restore over an empty payload: %v", err)
+	}
+	if got, want := s.Epoch(), int64(1); got != want {
+		t.Errorf("a sink starting fresh is in epoch %d, want %d", got, want)
+	}
+
+	staged, err := StagingFiles(root)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	if want := []string{"out-1-1" + stagingSuffix}; !slices.Equal(staged, want) {
+		t.Errorf("staging holds %v, want %v: a fresh start sweeps its OWN dead files and leaves "+
+			"another subtask's alone", staged, want)
+	}
+	if err := s.CommitFinalEpoch(); err != nil {
+		t.Fatalf("CommitFinalEpoch: %v", err)
+	}
+	if got := committedKeys(t, root); len(got) != 0 {
+		t.Errorf("a fresh run that wrote nothing committed %v: those are a dead run's records", got)
+	}
+}
+
+// TestASuccessfulJobCommitsEveryEpochItStillHasStaged.
+//
+// The final epoch is the named case and it is not the only one. A job that
+// takes NO checkpoints never completes one, so nothing ever notifies and every
+// epoch it staged is still staged at the end; a notification that failed leaves
+// one stranded the same way. The precondition covers all of them equally -- the
+// job completed, so nothing will replay these records -- so restricting the
+// commit to the last epoch drops the rest.
+func TestASuccessfulJobCommitsEveryEpochItStillHasStaged(t *testing.T) {
+	root := t.TempDir()
+	s := openSink(t, root, "out", 0)
+
+	for _, key := range []string{"epoch-1", "epoch-2", "epoch-3"} {
+		write(t, s, key)
+		snapshot(t, s)
+	}
+	write(t, s, "the-final-epoch")
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := s.CommitFinalEpoch(); err != nil {
+		t.Fatalf("CommitFinalEpoch: %v", err)
+	}
+
+	want := []string{"epoch-1", "epoch-2", "epoch-3", "the-final-epoch"}
+	if got := committedKeys(t, root); !slices.Equal(got, want) {
+		t.Errorf("committed output is %v, want %v: a job with no notifications published its tail "+
+			"and dropped everything before it", got, want)
+	}
+	staged, err := StagingFiles(root)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	if len(staged) != 0 {
+		t.Errorf("staging holds %v after a successful job", staged)
+	}
+}
+
+// TestARestoredSinkDoesNotCommitAPreviousRunsEpochsAtTheEnd.
+//
+// The range is firstEpoch to epoch, and firstEpoch is what keeps a resumed run
+// from adopting transactions below its cut. Anything there belongs to a
+// previous run and Restore already committed it or discarded it; sweeping it up
+// again at the end would commit an epoch the resumed run also replayed.
+func TestARestoredSinkDoesNotCommitAPreviousRunsEpochsAtTheEnd(t *testing.T) {
+	root := t.TempDir()
+	stageDirectly(t, root, "out", 0, 3, "committed-by-restore")
+	s := restoreFrom(t, root, "out", 0, 3)
+
+	// A file appears under an epoch below the cut after the restore swept: a
+	// previous run's, by construction, since this instance owns 4 upwards.
+	stageDirectly(t, root, "out", 0, 2, "a-dead-runs-epoch")
+
+	write(t, s, "this-runs-tail")
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := s.CommitFinalEpoch(); err != nil {
+		t.Fatalf("CommitFinalEpoch: %v", err)
+	}
+
+	want := []string{"committed-by-restore", "this-runs-tail"}
+	if got := committedKeys(t, root); !slices.Equal(got, want) {
+		t.Errorf("committed output is %v, want %v: the end-of-job commit reached below the cut", got, want)
+	}
+}
+
+// TestRestoreCommitsEveryStagedEpochAtOrBelowTheCut.
+//
+// The brief for restore said "commit the pending transaction for checkpoint k",
+// and k is the common case rather than the rule. More than one can be pending:
+// a fault that fires just after a sink acknowledges a barrier and before its
+// notification pass leaves checkpoint j complete with its transaction
+// uncommitted, and if the run reaches k > j before it dies, a restore that
+// commits only k leaves j staged forever.
+//
+// Its records are BELOW the cut, so the resumed run never produces them again.
+// The chaos suite found this at seed 105, as 32 window rows that were simply
+// absent.
+func TestRestoreCommitsEveryStagedEpochAtOrBelowTheCut(t *testing.T) {
+	root := t.TempDir()
+	for id, key := range map[int64]string{
+		1: "acknowledged-never-notified",
+		2: "also-never-notified",
+		3: "the-cut",
+		4: "above-the-cut",
+	} {
+		stageDirectly(t, root, "out", 0, id, key)
+	}
+
+	restoreFrom(t, root, "out", 0, 3)
+
+	files, err := CommittedFiles(root)
+	if err != nil {
+		t.Fatalf("CommittedFiles: %v", err)
+	}
+	want := []string{"out-0-1" + commitSuffix, "out-0-2" + commitSuffix, "out-0-3" + commitSuffix}
+	if !slices.Equal(files, want) {
+		t.Fatalf("committed holds %v, want %v: every epoch at or below the cut holds records the "+
+			"replay will not produce again", files, want)
+	}
+	wantKeys := []string{"acknowledged-never-notified", "also-never-notified", "the-cut"}
+	if got := committedKeys(t, root); !slices.Equal(got, wantKeys) {
+		t.Errorf("committed output is %v, want %v", got, wantKeys)
+	}
+	staged, err := StagingFiles(root)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	if len(staged) != 0 {
+		t.Errorf("staging holds %v after the restore", staged)
 	}
 }

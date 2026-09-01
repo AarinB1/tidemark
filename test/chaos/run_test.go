@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
+	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/runtime"
 	"github.com/AarinB1/tidemark/pkg/sinks"
 )
@@ -149,7 +150,7 @@ func cleanRunCheckpoints(t *testing.T) int64 {
 	t.Helper()
 	root := t.TempDir()
 	if err := runtime.RunWithOptions(context.Background(),
-		jobGraph(sinks.NewCollect(), &windowFactory{}),
+		jobGraph(func() core.Sink { return sinks.NewCollect() }, &windowFactory{}),
 		runtime.Options{CheckpointRoot: root, Seed: 1}); err != nil {
 		t.Fatalf("the clean run failed: %v", err)
 	}
@@ -169,7 +170,7 @@ func cleanRunCheckpointIDs(t *testing.T) (*checkpoint.Storage, []int64) {
 	t.Helper()
 	root := t.TempDir()
 	if err := runtime.RunWithOptions(context.Background(),
-		jobGraph(sinks.NewCollect(), &windowFactory{}),
+		jobGraph(func() core.Sink { return sinks.NewCollect() }, &windowFactory{}),
 		runtime.Options{CheckpointRoot: root, Seed: 1}); err != nil {
 		t.Fatalf("the clean run failed: %v", err)
 	}

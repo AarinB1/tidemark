@@ -650,20 +650,26 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 	// IS committable, and the crash may have landed between that marker and the
 	// notification. A sink that assumed the notification had arrived would lose
 	// that transaction with nothing to point at.
-	if cfg.restored {
-		restorable, ok := snk.(restorableSink)
-		if !ok && len(cfg.restore) > 0 {
-			// A payload with no reader is a sink that staged something a
-			// previous run recorded and that this one will never commit.
-			// Refused rather than ignored: the silent version is missing
-			// output.
-			return fmt.Errorf("sink %s: the checkpoint holds %d bytes of state for it and %T "+
-				"has no Restore to read them", id, len(cfg.restore), snk)
-		}
-		if ok {
-			if err := restorable.Restore(bytes.NewReader(cfg.restore)); err != nil {
-				return fmt.Errorf("sink %s: restore: %w", id, err)
-			}
+	restorable, canRestore := snk.(restorableSink)
+	if cfg.restored && !canRestore && len(cfg.restore) > 0 {
+		// A payload with no reader is a sink that staged something a previous
+		// run recorded and that this one will never commit. Refused rather than
+		// ignored: the silent version is missing output.
+		return fmt.Errorf("sink %s: the checkpoint holds %d bytes of state for it and %T "+
+			"has no Restore to read them", id, len(cfg.restore), snk)
+	}
+	if canRestore {
+		// ALWAYS, including on a job that is not resuming, which is reported by
+		// an EMPTY payload rather than by not calling at all. A sink that owns
+		// files outside the process needs to be told where it is starting in
+		// both cases: a fresh run over a directory holding a dead run's staged
+		// transactions must sweep them, and a sink that was never told it was
+		// starting fresh cannot tell that directory from its own.
+		//
+		// cfg.restore is nil when cfg.restored is false, so this passes exactly
+		// that empty payload.
+		if err := restorable.Restore(bytes.NewReader(cfg.restore)); err != nil {
+			return fmt.Errorf("sink %s: restore: %w", id, err)
 		}
 	}
 
