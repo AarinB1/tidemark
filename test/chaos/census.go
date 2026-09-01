@@ -929,6 +929,13 @@ func (c *countingContext) Emit(rec *core.Record) {
 func (c *countingContext) CurrentWatermark() int64 { return c.inner.CurrentWatermark() }
 func (c *countingContext) State() state.KeyedState { return c.inner.State() }
 
+// Subtask is the method core.Context grew in Phase 5, and this forwarder is the
+// comment above coming true: the compiler asked for it because nothing is
+// embedded here. Had core.Context been embedded instead, this decorator would
+// have kept compiling and would have answered every Subtask call with a nil
+// panic at run time.
+func (c *countingContext) Subtask() (string, int) { return c.inner.Subtask() }
+
 // firingRecorder wraps a WindowCount and attributes each window it emits to the
 // watermark that fired it.
 //

@@ -2,6 +2,7 @@
 package sinks
 
 import (
+	"io"
 	"slices"
 	"sync"
 
@@ -32,6 +33,21 @@ func (c *Collect) Write(rec *core.Record) error {
 	return nil
 }
 
+// Snapshot writes nothing. Collect holds its records in memory, so there is no
+// staged transaction to name: what an aborted run wrote is still in the slice
+// when the recovered run appends to it, which is exactly the at-least-once
+// behaviour the recovery tests compare against.
+func (c *Collect) Snapshot(w io.Writer) error { return nil }
+
+// NotifyCheckpointComplete does nothing, because Collect commits on Write.
+//
+// That makes it an AT-LEAST-ONCE sink and it is kept that way on purpose. It is
+// what the oracle comparison ran against for three phases: a recovered run
+// replays and the duplicates it leaves have to agree with each other, which is
+// an assertion a transactional sink cannot make because it collapses them.
+// Phase 5 adds sinks.Transactional beside this rather than in place of it.
+func (c *Collect) NotifyCheckpointComplete(checkpointID int64) error { return nil }
+
 func (c *Collect) Close() error { return nil }
 
 // Records returns a snapshot of what has been written so far. It is a copy, so
@@ -54,5 +70,9 @@ func NewDiscard() *Discard { return &Discard{} }
 func (d *Discard) Open(ctx core.Context) error { return nil }
 
 func (d *Discard) Write(rec *core.Record) error { return nil }
+
+func (d *Discard) Snapshot(w io.Writer) error { return nil }
+
+func (d *Discard) NotifyCheckpointComplete(checkpointID int64) error { return nil }
 
 func (d *Discard) Close() error { return nil }

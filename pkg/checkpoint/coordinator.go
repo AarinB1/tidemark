@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -82,6 +83,16 @@ type Coordinator struct {
 	// holding the payload a later checkpoint writes for them. A key that is
 	// in expected and not here is still live.
 	done map[SubtaskKey][]byte
+	// changed is closed and replaced whenever a checkpoint reaches a terminal
+	// state, so a waiter can be woken without this type owning a goroutine.
+	//
+	// A channel rather than a sync.Cond because the one waiter is a sink
+	// subtask blocking at end of stream, and it has to be able to give up when
+	// the job is cancelled. A Cond cannot be selected on; a channel can, and
+	// AwaitCompleted selects it against the caller's context. Without that, a
+	// sink waiting for a checkpoint that some OTHER subtask's failure will
+	// never complete would hold the whole job in wg.Wait.
+	changed chan struct{}
 }
 
 // checkpointState is one checkpoint's progress.
@@ -111,6 +122,7 @@ func NewCoordinator(storage *Storage, meta Metadata) *Coordinator {
 		expected: expected,
 		state:    make(map[int64]*checkpointState),
 		done:     make(map[SubtaskKey][]byte),
+		changed:  make(chan struct{}),
 	}
 }
 
@@ -152,8 +164,7 @@ func (c *Coordinator) Acknowledge(id int64, key SubtaskKey, payload []byte) erro
 	}
 
 	if err := c.storage.WriteSubtaskState(id, key, payload); err != nil {
-		st.abandoned = true
-		st.acked = nil
+		c.abandon(st)
 		return err
 	}
 	st.acked[key] = true
@@ -223,8 +234,7 @@ func (c *Coordinator) Fail(id int64, key SubtaskKey, cause error) {
 		// is already durable and already selectable.
 		return
 	}
-	st.abandoned = true
-	st.acked = nil
+	c.abandon(st)
 }
 
 // Completed reports whether checkpoint id has been written in full.
@@ -296,17 +306,131 @@ func (c *Coordinator) complete(id int64, st *checkpointState) error {
 			continue
 		}
 		if err := c.storage.WriteSubtaskState(id, key, c.done[key]); err != nil {
-			st.abandoned = true
-			st.acked = nil
+			c.abandon(st)
 			return err
 		}
 	}
 	if err := c.storage.Complete(id, c.meta); err != nil {
-		st.abandoned = true
-		st.acked = nil
+		c.abandon(st)
 		return err
 	}
+	// AFTER Complete returned, so _COMPLETE is on the disk and fsynced before
+	// anything can observe this checkpoint as complete. That ordering is
+	// invariant 4 and it is the reason a sink commits on the notification
+	// rather than at snapshot time: data committed at snapshot time belongs to
+	// a checkpoint that may never complete, and the run that recovered from the
+	// previous one would write those records again. See CompletedAmong and
+	// AwaitCompletedAmong, which are the only ways a sink learns of this.
 	st.complete = true
 	st.acked = nil
+	c.announce()
 	return nil
+}
+
+// abandon marks st given up on and wakes anything waiting on it. The caller
+// holds the mutex.
+//
+// The per-subtask record is dropped because nothing reads it again: a
+// checkpoint that was abandoned is never completed, and Acknowledge tells a
+// later acknowledgement apart by the flag rather than by the set.
+func (c *Coordinator) abandon(st *checkpointState) {
+	st.abandoned = true
+	st.acked = nil
+	c.announce()
+}
+
+// announce wakes every waiter, by closing the channel they are selecting on and
+// putting a fresh one in its place. The caller holds the mutex.
+func (c *Coordinator) announce() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+// CompletedAmong returns which of ids have been written in full, in the order
+// given. It does not block.
+//
+// Plural, and named apart from the Completed predicate above, because the two
+// answer different questions: that one is a test asking about one checkpoint,
+// this one is a sink asking which of the transactions it has staged it may now
+// commit.
+//
+// This is how a sink subtask learns it may commit. It asks rather than being
+// told, and the asking happens on the sink's own goroutine, which is what keeps
+// core.Sink's "one subtask goroutine, no locking" true. A coordinator that
+// called into sinks directly could not: a checkpoint completes inside the LAST
+// sink subtask's Acknowledge, so the call would reach every other sink subtask
+// on a foreign goroutine, in the middle of a Write.
+func (c *Coordinator) CompletedAmong(ids []int64) []int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.completed(ids)
+}
+
+// completed is CompletedAmong with the mutex already held.
+func (c *Coordinator) completed(ids []int64) []int64 {
+	var out []int64
+	for _, id := range ids {
+		if st, ok := c.state[id]; ok && st.complete {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// AwaitCompletedAmong blocks until every id has reached a terminal state, then
+// returns the ones that completed.
+//
+// A sink subtask calls this at end of stream, and it exists because of a race
+// that is otherwise silent data loss. Sink subtask 0 can reach end of stream,
+// return, and have Close called before sink subtask 1 acknowledges checkpoint
+// k. Nothing then commits subtask 0's staged transaction for k, and on a clean
+// run there is no recovery to fix it up: the records are simply absent, and a
+// comparison against the batch oracle catches it only if that (key, window)
+// had no other copy.
+//
+// It terminates. Checkpoint k completes exactly when the last subtask
+// acknowledges it -- and since a sink is downstream of everything, the last
+// acknowledgement of k is always a sink's -- while a subtask that fails
+// abandons it. The remaining case is a subtask that fails without telling the
+// coordinator, which is what ctx is for: a cancelled job is a failed job, and a
+// failed job has nothing to commit.
+func (c *Coordinator) AwaitCompletedAmong(ctx context.Context, ids []int64) []int64 {
+	for {
+		c.mu.Lock()
+		if c.settled(ids) {
+			out := c.completed(ids)
+			c.mu.Unlock()
+			return out
+		}
+		// Read under the same lock that guards the state just examined, so a
+		// transition between the two cannot be missed: announce closes THIS
+		// channel before any later check would see the new state.
+		wait := c.changed
+		c.mu.Unlock()
+
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			c.mu.Lock()
+			out := c.completed(ids)
+			c.mu.Unlock()
+			return out
+		}
+	}
+}
+
+// settled reports whether every id has reached a terminal state. The caller
+// holds the mutex.
+//
+// A checkpoint nobody has mentioned is NOT settled. It is a checkpoint whose
+// first acknowledgement has not arrived, which is exactly the state a waiter is
+// waiting out.
+func (c *Coordinator) settled(ids []int64) bool {
+	for _, id := range ids {
+		st, ok := c.state[id]
+		if !ok || !st.terminal() {
+			return false
+		}
+	}
+	return true
 }

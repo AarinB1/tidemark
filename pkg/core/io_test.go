@@ -20,9 +20,11 @@ func (s *nopSource) Close() error                 { return nil }
 
 type nopSink struct{}
 
-func (s *nopSink) Open(ctx Context) error  { return nil }
-func (s *nopSink) Write(rec *Record) error { return nil }
-func (s *nopSink) Close() error            { return nil }
+func (s *nopSink) Open(ctx Context) error                            { return nil }
+func (s *nopSink) Write(rec *Record) error                           { return nil }
+func (s *nopSink) Snapshot(w io.Writer) error                        { return nil }
+func (s *nopSink) NotifyCheckpointComplete(checkpointID int64) error { return nil }
+func (s *nopSink) Close() error                                      { return nil }
 
 var (
 	_ Source = (*nopSource)(nil)

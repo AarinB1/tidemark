@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math"
+	"slices"
 
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
 	"github.com/AarinB1/tidemark/pkg/core"
@@ -135,6 +137,23 @@ func (c checkpointer) finished(payload []byte) error {
 		return nil
 	}
 	return c.co.Finished(c.key, payload)
+}
+
+// completedAmong returns which of ids have completed. It does not block.
+func (c checkpointer) completedAmong(ids []int64) []int64 {
+	if c.co == nil {
+		return nil
+	}
+	return c.co.CompletedAmong(ids)
+}
+
+// awaitCompletedAmong blocks until every id is terminal and returns the ones
+// that completed, or gives up when ctx is done.
+func (c checkpointer) awaitCompletedAmong(ctx context.Context, ids []int64) []int64 {
+	if c.co == nil {
+		return nil
+	}
+	return c.co.AwaitCompletedAmong(ctx, ids)
 }
 
 // ErrFaultInjected is what a subtask returns when a FaultInjector aborts it.
@@ -305,7 +324,7 @@ func runSubtask(ctx context.Context, v graph.Vertex, index int, gate *Gate, grou
 // runSourceSubtask reads this subtask's slice of the offset space and emits it.
 func runSourceSubtask(ctx context.Context, v graph.Vertex, id subtaskID, w *transport.Writer, cp checkpointer, fs faults, cfg subtaskConfig) (err error) {
 	src := v.NewSource()
-	oc := newOpContext(ctx, w)
+	oc := newOpContext(ctx, id, w)
 	if err := src.Open(oc); err != nil {
 		return fmt.Errorf("source %s: open: %w", id, err)
 	}
@@ -412,7 +431,7 @@ func runOperatorSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate 
 	}
 
 	op := v.NewOperator()
-	oc := newOpContextWithState(ctx, w, st)
+	oc := newOpContextWithState(ctx, id, w, st)
 	if err := op.Open(oc); err != nil {
 		return fmt.Errorf("operator %s: open: %w", id, err)
 	}
@@ -536,7 +555,7 @@ func runOperatorLoop(ctx context.Context, op core.Operator, oc *opContext, id su
 
 func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gate, w *transport.Writer, cp checkpointer, fs faults) (err error) {
 	snk := v.NewSink()
-	oc := newOpContext(ctx, w)
+	oc := newOpContext(ctx, id, w)
 	if err := snk.Open(oc); err != nil {
 		return fmt.Errorf("sink %s: open: %w", id, err)
 	}
@@ -546,6 +565,10 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 		}
 	}()
 
+	// staged is the checkpoints this sink has acknowledged and not yet been
+	// told the outcome of, ascending. A checkpoint leaves it when it completes
+	// and the sink is notified, or when end of stream settles it as abandoned.
+	var staged []int64
 	var elements int64
 	for {
 		e, ok := gate.Recv()
@@ -567,31 +590,130 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 		case core.KindWatermark:
 			oc.watermark = e.Watermark
 		case core.KindBarrier:
-			// Acknowledged with an EMPTY payload, and nothing is committed. A
-			// sink commits on NotifyCheckpointComplete and never at snapshot
-			// time, because data committed at snapshot time belongs to a
-			// checkpoint that may never complete and comes back as duplicates
-			// on recovery (invariant 4). Neither the notification nor the
-			// transactional sink exists yet, so there is nothing to record.
+			// The sink STAGES and does not commit. Whatever it has written
+			// since the last barrier is made durable here and recorded in the
+			// payload as the transaction belonging to this checkpoint; nothing
+			// becomes output until the checkpoint completes.
 			//
-			// It still acknowledges. A sink that stayed out of the count would
-			// let a checkpoint complete while the sink was arbitrarily far
-			// behind the cut, and Phase 5 would have to add a participant to
-			// the protocol rather than content to a payload.
-			if err := cp.snapshot(e.Barrier.CheckpointID, nil); err != nil {
-				return fmt.Errorf("sink %s: checkpoint %d: %w", id, e.Barrier.CheckpointID, err)
+			// Committing here instead would commit data belonging to a
+			// checkpoint that may never complete. The run that recovered from
+			// the PREVIOUS checkpoint would replay those records and write them
+			// again, so the sink whose whole purpose is exactly-once output
+			// would be the thing producing the duplicates. That is invariant 4,
+			// and it is why the commit is on the notification below.
+			if err := snapshotSinkState(cp, snk, e.Barrier.CheckpointID); err != nil {
+				return fmt.Errorf("sink %s: %w", id, err)
 			}
+			staged = append(staged, e.Barrier.CheckpointID)
+
 			// A sink forwards nothing, so its acknowledgement is the whole of
 			// its part in the barrier protocol and is the position this trigger
 			// names here. See FaultInjector.AfterBarrierForwarded.
+			//
+			// BEFORE the notification pass below, deliberately. A fault here
+			// leaves a sink that acknowledged the barrier -- possibly the
+			// acknowledgement that COMPLETED the checkpoint, since a sink is
+			// downstream of everything -- and never committed for it. That is
+			// the crash window between _COMPLETE and the notification, which is
+			// the one the restore path exists for and the one no contents
+			// comparison necessarily catches.
 			if err := fs.afterBarrierForwarded(e.Barrier.CheckpointID); err != nil {
 				return err
 			}
+
+			// Asked for, not pushed. A checkpoint completes inside the LAST
+			// sink subtask's acknowledgement, so a coordinator that called into
+			// sinks directly would reach every other sink subtask on a foreign
+			// goroutine in the middle of a Write. Asking here keeps
+			// core.Sink's one-goroutine contract true.
+			//
+			// What this sees is checkpoints completed BEFORE this barrier, in
+			// the usual case the one before it: k completes only once every
+			// sink subtask has reached barrier k, and this subtask is at
+			// barrier k right now. The tail is settled at end of stream.
+			notifyCompleted(snk, cp.completedAmong(staged), &staged)
 		case core.KindEndOfStream:
+			// Everything still staged is settled here, and this is the point
+			// the wait exists for. Sink subtask 0 can otherwise reach end of
+			// stream and return before sink subtask 1 acknowledges checkpoint
+			// k; nothing would then commit subtask 0's transaction for k, and
+			// on a clean run there is no recovery to fix it up. See
+			// checkpoint.Coordinator.AwaitCompletedAmong for why this
+			// terminates.
+			notifyCompleted(snk, cp.awaitCompletedAmong(ctx, staged), &staged)
 			return nil
 		default:
 			return fmt.Errorf("sink %s: unexpected %s element", id, e.Kind)
 		}
+	}
+}
+
+// snapshotSinkState asks the sink to stage, and hands what it recorded to the
+// coordinator as this subtask's state for checkpoint id.
+//
+// The same shape as snapshotOperatorState and for the same reasons: buffered
+// rather than streamed to the file because the coordinator owns the on-disk
+// layout, and a snapshot that cannot be taken abandons the checkpoint before
+// the error goes back to the subtask, because the subtask is about to stop and
+// will never acknowledge.
+//
+// Unlike an operator's, a sink's payload comes from core.Sink.Snapshot rather
+// than from the runtime's own state. An operator's state IS its KeyedState, so
+// the runtime can read it; a sink's is whatever it staged outside the process,
+// which only the sink can name.
+func snapshotSinkState(cp checkpointer, snk core.Sink, id int64) error {
+	if !cp.enabled() {
+		// The sink still stages. A job that takes no checkpoints has no
+		// notification coming, so what is staged here is committed at end of
+		// stream -- and a sink that skipped staging on such a job would be a
+		// different code path from the one every checkpointing job runs.
+		var discard bytes.Buffer
+		if err := snk.Snapshot(&discard); err != nil {
+			return fmt.Errorf("checkpoint %d: snapshot: %w", id, err)
+		}
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := snk.Snapshot(&buf); err != nil {
+		cp.fail(id, err)
+		return fmt.Errorf("checkpoint %d: snapshot: %w", id, err)
+	}
+	if err := cp.snapshot(id, buf.Bytes()); err != nil {
+		return fmt.Errorf("checkpoint %d: %w", id, err)
+	}
+	return nil
+}
+
+// notifyCompleted tells snk about each completed checkpoint and drops it from
+// staged.
+//
+// A notification failure does NOT fail the job, and that is the deliberate
+// half. The checkpoint is complete: _COMPLETE is on the disk, it is a valid
+// recovery point, and a job that failed here would be a job destroyed by the
+// success of its own checkpoint. A sink that could not commit now commits on
+// restore instead, which is the path that exists precisely because the
+// notification is not guaranteed to arrive at all. So it is logged and the run
+// continues.
+//
+// Logged rather than counted or returned, because there is nothing for the
+// runtime to do with it and something for a person to do with it. It is the
+// only thing this package prints, and it prints only when a commit that was
+// licensed did not happen.
+//
+// staged is emptied of the notified IDs whether or not the notification
+// succeeded. Retrying it at the next barrier would be retrying a commit whose
+// failure the restore path already covers, and the sink that failed once is the
+// sink that would fail again.
+// It returns nothing, and the absence of an error return is the point: there is
+// no failure here a caller could act on, and a signature that offered one would
+// invite a caller to fail the job on it.
+func notifyCompleted(snk core.Sink, completed []int64, staged *[]int64) {
+	for _, id := range completed {
+		if err := snk.NotifyCheckpointComplete(id); err != nil {
+			log.Printf("tidemark: sink could not commit checkpoint %d: %v; "+
+				"the checkpoint is complete and the transaction will be committed on restore", id, err)
+		}
+		*staged = slices.DeleteFunc(*staged, func(n int64) bool { return n == id })
 	}
 }
 
@@ -629,7 +751,12 @@ func snapshotOperatorState(cp checkpointer, id int64, st state.KeyedState) error
 // the caller after each operator call. Dropping it instead would turn a
 // cancelled job into a silently truncated output.
 type opContext struct {
-	ctx       context.Context
+	ctx context.Context
+	// id is the subtask this context belongs to. It is the answer to
+	// core.Context.Subtask, and it is held rather than derived because the
+	// runtime is the only thing that knows it: the index is assigned when the
+	// executor starts the goroutine.
+	id        subtaskID
 	writer    *transport.Writer
 	watermark int64
 	err       error
@@ -644,15 +771,16 @@ type opContext struct {
 
 var _ core.Context = (*opContext)(nil)
 
-func newOpContext(ctx context.Context, w *transport.Writer) *opContext {
-	return newOpContextWithState(ctx, w, state.NewMemory())
+func newOpContext(ctx context.Context, id subtaskID, w *transport.Writer) *opContext {
+	return newOpContextWithState(ctx, id, w, state.NewMemory())
 }
 
 // newOpContextWithState is newOpContext over a chosen backend. Operator
 // subtasks use it; sources and sinks take the memory one above.
-func newOpContextWithState(ctx context.Context, w *transport.Writer, st state.KeyedState) *opContext {
+func newOpContextWithState(ctx context.Context, id subtaskID, w *transport.Writer, st state.KeyedState) *opContext {
 	return &opContext{
 		ctx:    ctx,
+		id:     id,
 		writer: w,
 		state:  st,
 		// No watermark has been delivered, so nothing is complete yet. Starting
@@ -681,6 +809,10 @@ func (c *opContext) CurrentWatermark() int64 { return c.watermark }
 
 // State returns this subtask's keyed state.
 func (c *opContext) State() state.KeyedState { return c.state }
+
+// Subtask returns the vertex ID and index of the subtask this context belongs
+// to.
+func (c *opContext) Subtask() (string, int) { return c.id.vertexID, c.id.index }
 
 // takeErr returns the first error stashed since the last call: one from a
 // failed Emit, or one the state backend recorded.
