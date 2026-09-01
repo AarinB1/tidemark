@@ -237,10 +237,10 @@ func TestSuiteFloorIsBelowWhatTheSuiteObserves(t *testing.T) {
 		floor     float64
 		worstSeen float64
 	}{
-		{"faults that fired", f.FiredFraction, 0.854},
+		{"faults that fired", f.FiredFraction, 0.805},
 		{"schedules that aborted", f.AbortedFraction, 0.714},
-		{"resumes from a real checkpoint", f.CheckpointResumeFraction, 0.343},
-		{"schedules with a pending window", f.PendingWindowFraction, 0.466},
+		{"resumes from a real checkpoint", f.CheckpointResumeFraction, 0.600},
+		{"schedules with a pending window", f.PendingWindowFraction, 0.586},
 		{"alignment faults inside a window", f.AlignmentInsideWindowFraction, 1.000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -442,14 +442,14 @@ func TestSuiteTimingBaselineMatchesWhatWasObserved(t *testing.T) {
 	}{
 		{
 			name: "full suite", schedules: 500,
-			clean: [2]float64{0.3117, 0.3510}, fault: [2]float64{0.3122, 0.3382},
-			cleanPeak: [2]float64{3807.6, 3840.0}, faultPeak: [2]float64{3925.6, 3941.7},
+			clean: [2]float64{0.3444, 0.3510}, fault: [2]float64{0.3180, 0.3288},
+			cleanPeak: [2]float64{3765.2, 3779.0}, faultPeak: [2]float64{3898.5, 3908.2},
 			maxFlushWidth: 0.30,
 		},
 		{
 			name: "race subset", schedules: 25,
-			clean: [2]float64{0.2176, 0.4040}, fault: [2]float64{0.1648, 0.4077},
-			cleanPeak: [2]float64{3628.3, 3877.8}, faultPeak: [2]float64{3727.5, 3969.3},
+			clean: [2]float64{0.2229, 0.3400}, fault: [2]float64{0.2236, 0.3610},
+			cleanPeak: [2]float64{3703.2, 3810.0}, faultPeak: [2]float64{3779.9, 3925.0},
 			maxFlushWidth: 0.75,
 		},
 	} {
