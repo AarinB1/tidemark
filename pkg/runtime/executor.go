@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
+	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/graph"
 	"github.com/AarinB1/tidemark/pkg/state"
 	"github.com/AarinB1/tidemark/pkg/transport"
@@ -131,6 +132,13 @@ func RunWithOptions(ctx context.Context, g *graph.Graph, opts Options) error {
 	// Buffered to the subtask count so no failing goroutine ever blocks on
 	// reporting, which would leave Run waiting for it in wg.Wait.
 	errs := make(chan error, subtasks)
+
+	// The sinks this run opened, collected so their final epochs can be
+	// committed once the job is known to have succeeded. Appended from every
+	// sink subtask's goroutine, read here after they have all returned.
+	var sinkMu sync.Mutex
+	var openedSinks []core.Sink
+
 	var wg sync.WaitGroup
 	for _, v := range order {
 		for index := range v.Parallelism {
@@ -143,6 +151,11 @@ func RunWithOptions(ctx context.Context, g *graph.Graph, opts Options) error {
 					newState:           opts.NewState,
 					restoredCheckpoint: restoredID,
 					injector:           opts.FaultInjector,
+					reportSink: func(s core.Sink) {
+						sinkMu.Lock()
+						defer sinkMu.Unlock()
+						openedSinks = append(openedSinks, s)
+					},
 				}
 				if payload, ok := restored[id.checkpointKey()]; ok {
 					cfg.restore, cfg.restored = payload, true
@@ -170,7 +183,16 @@ func RunWithOptions(ctx context.Context, g *graph.Graph, opts Options) error {
 	for err := range errs {
 		return err
 	}
-	return nil
+
+	// Every subtask returned and none of them failed, so the job COMPLETED --
+	// and that is the precondition the final epoch's commit rests on. Records
+	// after the last barrier belong to no checkpoint and nothing will ever
+	// notify for them; committing them is safe here and only here, because no
+	// run will replay them.
+	//
+	// After the gates rather than before, so nothing this job started is still
+	// moving when output becomes visible.
+	return commitFinalEpochs(openedSinks)
 }
 
 // wire creates the channels between subtasks and returns each subtask's inputs

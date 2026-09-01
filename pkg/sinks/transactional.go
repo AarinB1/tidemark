@@ -389,25 +389,73 @@ func (t *Transactional) checkpointOf(name string) (int64, bool) {
 	return id, true
 }
 
+// CommitFinalEpoch commits the staging file for the epoch after the last
+// barrier.
+//
+// # Why this exists at all
+//
+// Records written after the last barrier and before end of stream belong to no
+// checkpoint. No barrier closed that epoch, so no checkpoint covers it, so
+// nothing will ever notify for it -- and without this it would sit staged
+// forever and its records would simply be missing from the output.
+//
+// It exists ONLY because the input is bounded. An unbounded job has no final
+// epoch: there is always another barrier coming, and every record is eventually
+// covered by a checkpoint that completes. A reader who knows Flink will look
+// for the equivalent there and not find one, and that is why.
+//
+// # Why it is safe
+//
+// Because the job COMPLETED. There is no recovery to be consistent with: no run
+// will replay these records, so committing them cannot duplicate them. That
+// precondition is the whole justification and it is not this type's to check --
+// the runtime calls this only after every subtask of the job has returned
+// without an error. Calling it from the sink's own end-of-stream would be
+// calling it on a weaker precondition: a sink subtask that reaches end of
+// stream knows its own inputs finished, not that the job did, and a job where
+// another subtask fails afterwards IS replayed. The tail would then be
+// committed here under one epoch number and again by the resumed run under a
+// different one, which is a duplicate the naming cannot collapse because the
+// names differ.
+func (t *Transactional) CommitFinalEpoch() error {
+	// closeEpoch is a no-op after Close, which is the ordinary case: the
+	// runtime closes a sink when its subtask returns and calls this afterwards,
+	// once the whole job is known to have succeeded. It is here for a caller
+	// that has not closed.
+	if err := t.closeEpoch(); err != nil {
+		return err
+	}
+	staging, committed := t.stagingPath(t.epoch), t.committedPath(t.epoch)
+	err := os.Rename(staging, committed)
+	if err == nil {
+		return syncDir(t.dir(committedDir))
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		// The final epoch received no records, so it left no file. A job whose
+		// last barrier fell on its last record is the ordinary way to get here.
+		return nil
+	}
+	return fmt.Errorf("transactional sink: committing the final epoch %d: %w", t.epoch, err)
+}
+
 // Close releases the open staging file without committing it.
 //
 // Whatever is still staged stays staged. It is not output, it belongs to an
 // epoch no checkpoint has vouched for, and the run that recovers will either
 // commit it or discard it. Committing here would be committing on a path that
 // runs on failure as well as on success.
+//
+// It DOES fsync. The staging file is closed here and may be committed
+// afterwards by CommitFinalEpoch, which the runtime calls once the job is known
+// to have succeeded -- and a rename is atomic but is not a flush, so a file
+// whose contents were still in the page cache would become committed output
+// that a crash truncates. One fsync per sink subtask per run, on a file that is
+// either about to be committed or about to be discarded.
 func (t *Transactional) Close() error {
 	if t.buf == nil {
 		return nil
 	}
-	// Flushed but NOT fsynced, and not renamed. The bytes are handed to the
-	// kernel so the file a person looks at is the file that was written; their
-	// durability is not claimed, because nothing is going to rely on it.
-	err := t.buf.Flush()
-	if cerr := t.file.Close(); err == nil {
-		err = cerr
-	}
-	t.buf, t.file = nil, nil
-	return err
+	return t.closeEpoch()
 }
 
 // Epoch returns the checkpoint the current staging file belongs to. It is the

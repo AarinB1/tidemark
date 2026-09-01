@@ -77,6 +77,15 @@ type subtaskConfig struct {
 	// aborted at, and is nil for every job that is not a chaos run. See
 	// FaultInjector.
 	injector FaultInjector
+	// reportSink hands the executor the sink a sink subtask opened, so it can
+	// commit the final epoch once the whole job is known to have succeeded. It
+	// is nil for a test that drives runSubtask directly.
+	//
+	// The executor and not the subtask, because "the job completed" is a fact
+	// only the executor holds: a sink subtask that reaches end of stream knows
+	// its own inputs finished, not that every other subtask did. See
+	// commitFinalEpochs.
+	reportSink func(core.Sink)
 }
 
 // makeState returns the keyed state for one operator subtask.
@@ -155,6 +164,49 @@ func (c checkpointer) awaitCompletedAmong(ctx context.Context, ids []int64) []in
 		return nil
 	}
 	return c.co.AwaitCompletedAmong(ctx, ids)
+}
+
+// finalisableSink is a sink holding records that no checkpoint covers.
+//
+// The final epoch: everything written after the last barrier and before end of
+// stream. No barrier closed it, so no checkpoint covers it, so nothing will
+// ever notify for it. It exists only because the input is BOUNDED -- an
+// unbounded job always has another barrier coming and every record is
+// eventually covered by a checkpoint that completes.
+//
+// An optional interface for the reason restorableSink is one: sinks.Collect
+// commits on Write and has no epoch to flush. Unlike restorableSink this one is
+// silent when it fails, and it can afford to be -- a sink with no final epoch
+// is a sink that already committed everything it was given, which is exactly
+// what not implementing this says.
+type finalisableSink interface {
+	CommitFinalEpoch() error
+}
+
+// commitFinalEpochs commits the tail of every sink of a job that SUCCEEDED.
+//
+// The precondition is the whole of the justification. There is no recovery to
+// be consistent with, so committing these records cannot duplicate them; and
+// the only place that precondition is known is here, after every subtask has
+// returned and none of them reported an error.
+//
+// Doing it from a sink subtask's own end-of-stream would be a weaker
+// precondition: that subtask's inputs finished, which says nothing about the
+// other subtasks. A job where another one fails afterwards IS replayed, and the
+// tail would then be committed once by the run that got there and again by the
+// resumed run under a different epoch number -- a duplicate the naming cannot
+// collapse, because the two names differ.
+func commitFinalEpochs(opened []core.Sink) error {
+	for _, snk := range opened {
+		f, ok := snk.(finalisableSink)
+		if !ok {
+			continue
+		}
+		if err := f.CommitFinalEpoch(); err != nil {
+			return fmt.Errorf("committing the final epoch: %w", err)
+		}
+	}
+	return nil
 }
 
 // restorableSink is a sink with state to bring back from a checkpoint.
@@ -584,6 +636,10 @@ func runSinkSubtask(ctx context.Context, v graph.Vertex, id subtaskID, gate *Gat
 			err = fmt.Errorf("sink %s: close: %w", id, cerr)
 		}
 	}()
+
+	if cfg.reportSink != nil {
+		cfg.reportSink(snk)
+	}
 
 	// AFTER Open and BEFORE any element, which is the same window an operator's
 	// restore takes and for the same reason: Open is where the sink learns the

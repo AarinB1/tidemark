@@ -786,3 +786,77 @@ func TestRestoreRejectsAPayloadItCannotRead(t *testing.T) {
 		})
 	}
 }
+
+// The final epoch.
+//
+// Records after the last barrier belong to no checkpoint, so nothing will ever
+// notify for them. It exists only because the input is bounded.
+
+// TestTheFinalEpochIsCommittedDirectly.
+//
+// Two epochs' worth of records: one closed by a barrier and notified, one after
+// the last barrier. The second is the tail, and nothing in the checkpoint
+// protocol will ever mention it -- so without this commit it stays staged and
+// its records are absent from the output with nothing to point at.
+func TestTheFinalEpochIsCommittedDirectly(t *testing.T) {
+	root := t.TempDir()
+	s := openSink(t, root, "out", 0)
+
+	write(t, s, "covered-by-checkpoint-1")
+	snapshot(t, s)
+	if err := s.NotifyCheckpointComplete(1); err != nil {
+		t.Fatalf("NotifyCheckpointComplete(1): %v", err)
+	}
+	write(t, s, "after-the-last-barrier")
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := committedKeys(t, root); !slices.Contains(got, "covered-by-checkpoint-1") ||
+		slices.Contains(got, "after-the-last-barrier") {
+		t.Fatalf("committed output is %v after Close: Close must not commit, because it runs on "+
+			"failure as well as on success", got)
+	}
+
+	if err := s.CommitFinalEpoch(); err != nil {
+		t.Fatalf("CommitFinalEpoch: %v", err)
+	}
+	want := []string{"after-the-last-barrier", "covered-by-checkpoint-1"}
+	if got := committedKeys(t, root); !slices.Equal(got, want) {
+		t.Errorf("committed output is %v, want %v", got, want)
+	}
+	staged, err := StagingFiles(root)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	if len(staged) != 0 {
+		t.Errorf("staging holds %v after the final epoch was committed", staged)
+	}
+}
+
+// TestCommittingAFinalEpochWithNoRecordsIsANoOp.
+//
+// A job whose last barrier fell on its last record has an empty final epoch,
+// which left no staging file. Committing it must produce nothing rather than an
+// empty committed file a reader has to know to skip.
+func TestCommittingAFinalEpochWithNoRecordsIsANoOp(t *testing.T) {
+	root := t.TempDir()
+	s := openSink(t, root, "out", 0)
+
+	write(t, s, "a")
+	snapshot(t, s)
+	if err := s.NotifyCheckpointComplete(1); err != nil {
+		t.Fatalf("NotifyCheckpointComplete(1): %v", err)
+	}
+	if err := s.CommitFinalEpoch(); err != nil {
+		t.Fatalf("CommitFinalEpoch: %v", err)
+	}
+
+	files, err := CommittedFiles(root)
+	if err != nil {
+		t.Fatalf("CommittedFiles: %v", err)
+	}
+	if want := []string{"out-0-1" + commitSuffix}; !slices.Equal(files, want) {
+		t.Errorf("committed holds %v, want %v: an empty final epoch produced a file", files, want)
+	}
+}

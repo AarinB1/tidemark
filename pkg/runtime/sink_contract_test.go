@@ -670,3 +670,258 @@ func TestTheTransactionalSinkCommitsAcrossARealRecovery(t *testing.T) {
 	t.Logf("aborted run: %d committed, %d staged; resumed run: %d committed in total, restored at "+
 		"checkpoint %d", len(afterFirst), len(stagedAfterFirst), len(afterSecond), restored)
 }
+
+// TestTheFinalEpochIsCommittedWhenTheJobSucceeds.
+//
+// The tail: records after the last barrier and before end of stream. No
+// checkpoint covers them, so nothing in the protocol will ever notify for them,
+// and without the final commit they would be staged forever and absent from the
+// output.
+//
+// Asserted against a run with NO faults, where every record must appear exactly
+// once in committed output. That is the exactly-once claim at its simplest, and
+// the tail is the part of it that the checkpoint protocol alone does not
+// deliver.
+//
+// The record count is deliberately NOT a multiple of the barrier interval. At
+// 4000 records over two subtasks with a barrier every 500, the last barrier
+// falls on the last element and the final epoch is EMPTY -- so a runtime that
+// never committed a final epoch at all would produce the whole output and pass.
+// It did, until this comment. 4200 leaves a hundred records per subtask after
+// the last barrier, which is the tail this test is named for.
+func TestTheFinalEpochIsCommittedWhenTheJobSucceeds(t *testing.T) {
+	checkpoints := t.TempDir()
+	output := t.TempDir()
+
+	reference := sinks.NewCollect()
+	gRef := sinkFactoryGraph(t, func() core.Sink { return reference }, 2, 4200, 500)
+	if err := Run(context.Background(), gRef); err != nil {
+		t.Fatalf("the reference run failed: %v", err)
+	}
+
+	g := sinkFactoryGraph(t, func() core.Sink { return sinks.NewTransactional(output) }, 2, 4200, 500)
+	if err := RunWithOptions(context.Background(), g, Options{CheckpointRoot: checkpoints, Seed: 5}); err != nil {
+		t.Fatalf("the run failed: %v", err)
+	}
+
+	committed, err := sinks.ReadCommitted(output)
+	if err != nil {
+		t.Fatalf("ReadCommitted: %v", err)
+	}
+	want := sortedKeys(reference.Records())
+	got := sortedKeys(committed)
+	if len(got) != len(want) {
+		t.Fatalf("committed output holds %d records and a clean in-memory run produced %d: "+
+			"the difference is the epoch after the last barrier, which no checkpoint covers",
+			len(got), len(want))
+	}
+	if !slices.Equal(got, want) {
+		t.Error("committed output does not hold the same records as the in-memory run")
+	}
+	staged, err := sinks.StagingFiles(output)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	if len(staged) != 0 {
+		t.Errorf("staging still holds %v after a successful job: every epoch is either covered by "+
+			"a checkpoint or is the final one", staged)
+	}
+}
+
+// TestAJobAbortedMidStreamCommitsNoFinalEpoch is the simple statement: a run
+// that failed has no final epoch to commit, because there is a recovery to be
+// consistent with and it will produce those records again.
+func TestAJobAbortedMidStreamCommitsNoFinalEpoch(t *testing.T) {
+	output := t.TempDir()
+	checkpoints := t.TempDir()
+	abort := &recordingInjector{fire: func(c consultation) bool {
+		return c.site == "before-element" && c.vertexID == "out" && c.subtask == 1 && c.n == 1500
+	}}
+	g := sinkFactoryGraph(t, func() core.Sink { return sinks.NewTransactional(output) }, 2, 4200, 500)
+	err := RunWithOptions(context.Background(), g, Options{
+		CheckpointRoot: checkpoints, Seed: 5, FaultInjector: abort,
+	})
+	if !errors.Is(err, ErrFaultInjected) {
+		t.Fatalf("the run = %v, want the injected fault", err)
+	}
+	assertEveryCommittedFileNamesACompleteCheckpoint(t, output, checkpoints)
+}
+
+// TestASinkThatFinishedInsideAFailedJobCommitsNoFinalEpoch is the case that
+// decides where the final commit belongs, and it is the one a mid-stream abort
+// cannot reach.
+//
+// The precondition on the final commit is that the JOB succeeded, not that a
+// sink subtask reached end of stream. Those differ exactly when a subtask
+// finishes and the job fails behind it -- and the job IS then replayed, so the
+// tail committed here under one epoch number would be committed again by the
+// resumed run under a different one. The naming cannot collapse that, because
+// the two names differ.
+//
+// Reaching it takes care. An injected fault mid-stream cancels the context, and
+// the cancel beats the gate's forwarder: every sink subtask stops at a closed
+// channel rather than at end of stream, so no final epoch is ever reached and a
+// runtime committing on its own end of stream looks correct. Measured, before
+// this test was written this way. What does reach it is a sink whose own CLOSE
+// fails: Close is deferred, so it runs after that subtask has processed end of
+// stream, and by then the OTHER sink subtask has processed its own.
+func TestASinkThatFinishedInsideAFailedJobCommitsNoFinalEpoch(t *testing.T) {
+	output := t.TempDir()
+	checkpoints := t.TempDir()
+	g := sinkFactoryGraph(t, func() core.Sink {
+		return &closeFailingSink{inner: sinks.NewTransactional(output), failIndex: 1}
+	}, 2, 4200, 500)
+
+	err := RunWithOptions(context.Background(), g, Options{CheckpointRoot: checkpoints, Seed: 5})
+	if !errors.Is(err, errSinkCloseFailed) {
+		t.Fatalf("the run = %v, want the sink's Close to have failed it", err)
+	}
+	assertEveryCommittedFileNamesACompleteCheckpoint(t, output, checkpoints)
+}
+
+// assertEveryCommittedFileNamesACompleteCheckpoint is the assertion both cases
+// above share.
+//
+// EVERY committed file must name a checkpoint that completed. A final epoch
+// names the checkpoint AFTER the last barrier, and no such checkpoint exists --
+// so a final epoch committed inside a failed job shows up here as a committed
+// file whose checkpoint never completed.
+//
+// Asserting instead that no name is both committed and staged would be vacuous:
+// a commit MOVES the file, so the two lists cannot overlap whatever the runtime
+// does. That is what this asserted first, and both mutations survived it.
+func assertEveryCommittedFileNamesACompleteCheckpoint(t *testing.T, output, checkpoints string) {
+	t.Helper()
+	staged, err := sinks.StagingFiles(output)
+	if err != nil {
+		t.Fatalf("StagingFiles: %v", err)
+	}
+	if len(staged) == 0 {
+		t.Fatal("nothing was left staged by a failed job, so this asserts nothing")
+	}
+	committed, err := sinks.CommittedFiles(output)
+	if err != nil {
+		t.Fatalf("CommittedFiles: %v", err)
+	}
+	complete := completeCheckpoints(t, checkpoints)
+	for _, name := range committed {
+		id := checkpointOfCommittedFile(t, name)
+		if !complete[id] {
+			t.Errorf("%s is committed and checkpoint %d never completed: this is a final epoch "+
+				"committed inside a job that failed, and the resumed run will produce those "+
+				"records again under a different epoch number", name, id)
+		}
+	}
+	t.Logf("a failed job left %d staged files and committed %d, over %d complete checkpoints",
+		len(staged), len(committed), len(complete))
+}
+
+// completeCheckpoints is the set of checkpoint IDs with a _COMPLETE marker
+// under root.
+func completeCheckpoints(t *testing.T, root string) map[int64]bool {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", root, err)
+	}
+	out := make(map[int64]bool)
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "chk-") {
+			continue
+		}
+		id, convErr := strconv.ParseInt(strings.TrimPrefix(e.Name(), "chk-"), 10, 64)
+		if convErr != nil {
+			continue
+		}
+		if _, statErr := os.Stat(filepath.Join(root, e.Name(), "_COMPLETE")); statErr == nil {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// checkpointOfCommittedFile reads the checkpoint ID out of a committed file
+// name, against the layout sinks.Transactional documents:
+// <vertexID>-<index>-<checkpointID>.out.
+//
+// Split from the right, because a checkpoint ID is decimal digits and carries
+// no '-'. Read here rather than through a helper in pkg/sinks, so that this is
+// a reading of the layout rather than of the package's own opinion of it.
+func checkpointOfCommittedFile(t *testing.T, name string) int64 {
+	t.Helper()
+	rest, ok := strings.CutSuffix(name, ".out")
+	if !ok {
+		t.Fatalf("committed file %q does not end in .out", name)
+	}
+	cut := strings.LastIndexByte(rest, '-')
+	if cut < 0 {
+		t.Fatalf("committed file %q has no checkpoint ID", name)
+	}
+	id, err := strconv.ParseInt(rest[cut+1:], 10, 64)
+	if err != nil {
+		t.Fatalf("committed file %q: %v", name, err)
+	}
+	return id
+}
+
+// sortedKeys is the sorted record keys, which is what "the contents of the
+// sink" means. Never the order: delivery is at-least-once and the order after a
+// recovery differs from a clean run for reasons that have nothing to do with
+// correctness.
+func sortedKeys(recs []*core.Record) []string {
+	out := make([]string, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, string(rec.Key)+"@"+strconv.FormatInt(rec.EventTime, 10))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// errSinkCloseFailed is what closeFailingSink returns from Close.
+var errSinkCloseFailed = errors.New("the sink could not close")
+
+// closeFailingSink is a sink whose Close fails for one chosen subtask.
+//
+// It is the one construction that puts a job in the state
+// TestASinkThatFinishedInsideAFailedJobCommitsNoFinalEpoch is about: every sink
+// subtask reaches END OF STREAM and the job still FAILS. Close is deferred, so
+// it runs after this subtask has processed end of stream, and the other subtask
+// has processed its own by then.
+//
+// Every method is forwarded EXPLICITLY, CommitFinalEpoch and Restore included.
+// Embedding core.Sink would compile and would satisfy core.Sink without
+// satisfying finalisableSink or restorableSink -- so the correct path would
+// stop committing final epochs at all and this test would pass for the wrong
+// reason. That is the trap CLAUDE.md records against decorators, in the place
+// where it would silently invert the result.
+type closeFailingSink struct {
+	inner     *sinks.Transactional
+	failIndex int
+	index     int
+}
+
+var _ core.Sink = (*closeFailingSink)(nil)
+
+func (s *closeFailingSink) Open(ctx core.Context) error {
+	_, s.index = ctx.Subtask()
+	return s.inner.Open(ctx)
+}
+
+func (s *closeFailingSink) Write(rec *core.Record) error { return s.inner.Write(rec) }
+func (s *closeFailingSink) Snapshot(w io.Writer) error   { return s.inner.Snapshot(w) }
+func (s *closeFailingSink) Restore(r io.Reader) error    { return s.inner.Restore(r) }
+func (s *closeFailingSink) CommitFinalEpoch() error      { return s.inner.CommitFinalEpoch() }
+
+func (s *closeFailingSink) NotifyCheckpointComplete(checkpointID int64) error {
+	return s.inner.NotifyCheckpointComplete(checkpointID)
+}
+
+func (s *closeFailingSink) Close() error {
+	if err := s.inner.Close(); err != nil {
+		return err
+	}
+	if s.index == s.failIndex {
+		return errSinkCloseFailed
+	}
+	return nil
+}
