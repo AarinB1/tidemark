@@ -183,17 +183,26 @@ func (m Metadata) Subtasks() []SubtaskKey {
 
 // Storage reads and writes checkpoints under one root directory.
 //
-// It holds no state beyond the path. Concurrent use is the caller's to
-// serialise: the coordinator is the only writer and it holds a mutex, and a
-// restore reads a checkpoint nothing is writing to.
+// It holds no state beyond the path and the filesystem it writes through.
+// Concurrent use is the caller's to serialise: the coordinator is the only
+// writer and it holds a mutex, and a restore reads a checkpoint nothing is
+// writing to.
 type Storage struct {
 	root string
+	// fs is the filesystem the writes go through. It is osFS in production and
+	// a recorder in the one test that asserts the ORDER of them; see fileSystem
+	// for why the order needs a seam to be observable at all.
+	fs fileSystem
 }
 
 // NewStorage returns storage rooted at root. The directory is created when the
 // first checkpoint is written, not here, so constructing one costs nothing and
 // a job that never checkpoints leaves no directory behind.
-func NewStorage(root string) *Storage { return &Storage{root: root} }
+func NewStorage(root string) *Storage { return &Storage{root: root, fs: osFS{}} }
+
+// newStorageOn is NewStorage over a chosen filesystem. Unexported and called
+// only by the ordering test; production has exactly one implementation.
+func newStorageOn(root string, fs fileSystem) *Storage { return &Storage{root: root, fs: fs} }
 
 // Root returns the directory this storage writes under.
 func (s *Storage) Root() string { return s.root }
@@ -219,10 +228,10 @@ func (s *Storage) WriteSubtaskState(id int64, key SubtaskKey, payload []byte) er
 		return fmt.Errorf("checkpoint %d: subtask %s: %w", id, key, err)
 	}
 	dir := s.dir(id)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := s.fs.MkdirAll(dir); err != nil {
 		return fmt.Errorf("checkpoint %d: %w", id, err)
 	}
-	if err := writeFileSynced(dir, key.fileName(), encodeSubtaskState(id, key, payload)); err != nil {
+	if err := writeFileSynced(s.fs, dir, key.fileName(), encodeSubtaskState(id, key, payload)); err != nil {
 		return fmt.Errorf("checkpoint %d: subtask %s: %w", id, key, err)
 	}
 	return nil
@@ -246,24 +255,32 @@ func (s *Storage) WriteSubtaskState(id int64, key SubtaskKey, payload []byte) er
 // _COMPLETE, which Latest skips. There is no state in which _COMPLETE is
 // durable and the files it vouches for are not, and that is the whole claim
 // this function makes.
+//
+// The claim is held to by TestTheWriteOrderIsInvariantEight, which records the
+// sequence through the fileSystem seam. It is worth saying why that test exists
+// rather than a check on the directory afterwards: the two orders produce the
+// SAME final directory, so the only thing that ever caught a marker written
+// early was Load re-verifying every subtask the metadata names -- downstream of
+// the write, and not on the path a transactional sink takes when it commits on
+// the marker alone.
 func (s *Storage) Complete(id int64, meta Metadata) error {
 	dir := s.dir(id)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := s.fs.MkdirAll(dir); err != nil {
 		return fmt.Errorf("checkpoint %d: %w", id, err)
 	}
-	if err := writeFileSynced(dir, metadataName, encodeMetadata(meta)); err != nil {
+	if err := writeFileSynced(s.fs, dir, metadataName, encodeMetadata(meta)); err != nil {
 		return fmt.Errorf("checkpoint %d: metadata: %w", id, err)
 	}
-	if err := syncDir(dir); err != nil {
+	if err := s.fs.SyncDir(dir); err != nil {
 		return fmt.Errorf("checkpoint %d: sync directory before completing: %w", id, err)
 	}
 	// The marker's contents are not read by anything; its existence is the
 	// signal. The ID is in it so that a directory copied to the wrong name is
 	// visible to a person looking at the file.
-	if err := writeFileSynced(dir, completeName, []byte(strconv.FormatInt(id, 10)+"\n")); err != nil {
+	if err := writeFileSynced(s.fs, dir, completeName, []byte(strconv.FormatInt(id, 10)+"\n")); err != nil {
 		return fmt.Errorf("checkpoint %d: complete marker: %w", id, err)
 	}
-	if err := syncDir(dir); err != nil {
+	if err := s.fs.SyncDir(dir); err != nil {
 		return fmt.Errorf("checkpoint %d: sync directory after completing: %w", id, err)
 	}
 	return nil
@@ -575,36 +592,107 @@ func checkVertexID(id string) error {
 // fsync it can see the new NAME pointing at contents that never reached the
 // disk, which is a file of the right length full of whatever was in those
 // blocks. That is the case the CRC catches and this ordering avoids.
-func writeFileSynced(dir, name string, data []byte) error {
+func writeFileSynced(fs fileSystem, dir, name string, data []byte) error {
 	tmp := filepath.Join(dir, name+tempSuffix)
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := fs.Create(tmp)
 	if err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
-		os.Remove(tmp)
+		fs.Remove(tmp)
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		os.Remove(tmp)
+		fs.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		fs.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(dir, name))
+	return fs.Rename(tmp, filepath.Join(dir, name))
 }
 
-// syncDir fsyncs a directory, making the renames into it durable.
+// fileSystem is the writes this package makes, as a seam.
+//
+// # Why it exists
+//
+// Invariant 8 is an ORDER: every state file, then the metadata, then the
+// directory fsync that makes those renames durable, and only then _COMPLETE.
+// Until this seam existed the order was unenforced in the sense that mattered
+// -- a Complete that wrote the marker first was caught by Storage.Load, which
+// re-verifies every subtask the metadata names, and not by anything that knew
+// what order the writes went out in. Load is a fine backstop and it is the
+// wrong one to rely on: from Phase 5 a transactional sink commits on the
+// presence of _COMPLETE without calling Load at all, so a marker that reached
+// the disk before the state it vouches for would commit output for a
+// checkpoint that cannot be restored.
+//
+// The order cannot be observed from outside without crashing the process part
+// way through the sequence, which no unit test can arrange. So the sequence is
+// made observable instead: every write goes through this interface, the
+// production implementation is a passthrough to package os, and the ordering
+// test's implementation is the same passthrough with a log.
+//
+// # Why it is unexported and why there are two of them
+//
+// CLAUDE.md counts exported interfaces in pkg/core and asks for a justification
+// per interface. This is neither: it is package-private, it has exactly one
+// production implementation, and nothing outside this file names it. It is two
+// interfaces rather than one because writeFileSynced's guarantee is a sequence
+// WITHIN one file -- create, write, fsync, close, then rename -- and a single
+// WriteFile method would collapse the four operations the test has to tell
+// apart into one. "_COMPLETE is fsynced before its rename" is not a statement a
+// coarser seam can make.
+//
+// Reads are NOT on it. Latest and Load go to package os directly: this exists
+// to pin the order of the writes, and putting the reads through it would be an
+// indirection bought for symmetry.
+type fileSystem interface {
+	MkdirAll(dir string) error
+	// Create truncates or creates path and opens it for writing.
+	Create(path string) (syncFile, error)
+	Rename(from, to string) error
+	// SyncDir fsyncs a directory, making the renames into it durable.
+	SyncDir(dir string) error
+	// Remove deletes path. It is the cleanup on a failed write and its error is
+	// deliberately dropped by the caller, which already has a better one.
+	Remove(path string) error
+}
+
+// syncFile is one file open for writing, with the fsync that makes its contents
+// durable before it is renamed into place.
+type syncFile interface {
+	Write(p []byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+// osFS is the production filesystem: a passthrough to package os, and the only
+// implementation a job ever runs on.
+type osFS struct{}
+
+var _ fileSystem = osFS{}
+
+func (osFS) MkdirAll(dir string) error { return os.MkdirAll(dir, 0o755) }
+
+func (osFS) Create(path string) (syncFile, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+}
+
+func (osFS) Rename(from, to string) error { return os.Rename(from, to) }
+
+func (osFS) Remove(path string) error { return os.Remove(path) }
+
+// SyncDir fsyncs a directory, making the renames into it durable.
 //
 // Syncing a file makes its CONTENTS durable. The directory entry that names it
 // is a separate piece of metadata, and a crash between the two leaves a
 // directory that does not list a file whose data is safely on disk. Every
 // production checkpoint format gets this wrong at least once.
-func syncDir(dir string) error {
+func (osFS) SyncDir(dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
 		return err
