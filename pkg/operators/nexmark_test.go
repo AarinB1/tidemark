@@ -2,12 +2,16 @@ package operators
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
+	"math"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/sources"
+	"github.com/AarinB1/tidemark/pkg/state"
 )
 
 // nexmarkConfig is the input the query tests run over. It is the shape the
@@ -409,5 +413,533 @@ func TestNexmarkStatelessQueriesAreAFunctionOfTheRecordAlone(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// q7
+// ---------------------------------------------------------------------------
+
+// winner is what a fired q7 window looks like once decoded.
+type winner struct {
+	key         uint64
+	windowStart int64
+	price       uint64
+	bidder      uint64
+	auction     uint64
+}
+
+// maxBidHarness drives one q7 operator and decodes what it emits.
+type maxBidHarness struct {
+	t    *testing.T
+	op   *MaxBid
+	ctx  *emitContext
+	seen int
+}
+
+func newMaxBidHarness(t *testing.T, op *MaxBid) *maxBidHarness {
+	t.Helper()
+	h := &maxBidHarness{t: t, op: op, ctx: &emitContext{}}
+	if err := op.Open(h.ctx); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	return h
+}
+
+func (h *maxBidHarness) bid(auction, bidder, price uint64, at int64) {
+	h.t.Helper()
+	if err := h.op.ProcessElement(bidRecord(auction, bidder, price, at), h.ctx); err != nil {
+		h.t.Fatalf("ProcessElement(auction %d, bidder %d, price %d, t %d): %v", auction, bidder, price, at, err)
+	}
+}
+
+func (h *maxBidHarness) event(rec *core.Record) {
+	h.t.Helper()
+	if err := h.op.ProcessElement(rec, h.ctx); err != nil {
+		h.t.Fatalf("ProcessElement: %v", err)
+	}
+}
+
+// watermark delivers wm and returns the windows that fired in response.
+func (h *maxBidHarness) watermark(wm int64) []winner {
+	h.t.Helper()
+	h.ctx.watermark = wm
+	if err := h.op.ProcessWatermark(wm, h.ctx); err != nil {
+		h.t.Fatalf("ProcessWatermark(%d): %v", wm, err)
+	}
+	return h.take()
+}
+
+// take decodes everything emitted since the last call.
+//
+// The window start is DERIVED, not read: the operator stamps a fired window
+// with its end-1, so the start is EventTime-(size-1) and the harness undoes the
+// same saturating arithmetic the operator applied. Reading EventTime as a start
+// would shift every expectation in this file by size-1 and leave every row
+// looking plausible.
+func (h *maxBidHarness) take() []winner {
+	h.t.Helper()
+	var out []winner
+	for _, r := range h.ctx.emitted[h.seen:] {
+		w, err := DecodeWinningBid(r.Value)
+		if err != nil {
+			h.t.Fatalf("DecodeWinningBid: %v", err)
+		}
+		key, err := sources.NexmarkKeyID(r.Key)
+		if err != nil {
+			h.t.Fatalf("NexmarkKeyID: %v", err)
+		}
+		out = append(out, winner{
+			key:         key,
+			windowStart: subFloor(r.EventTime, h.op.size-1),
+			price:       w.Price, bidder: w.Bidder, auction: w.Auction,
+		})
+	}
+	h.seen = len(h.ctx.emitted)
+	return out
+}
+
+// TestQ7EmitsTheMaximumPricePerWindow.
+func TestQ7EmitsTheMaximumPricePerWindow(t *testing.T) {
+	h := newMaxBidHarness(t, NewQ7(100, 0))
+	h.bid(7, 1, 50, 10)
+	h.bid(7, 2, 90, 20)
+	h.bid(7, 3, 10, 30)
+	h.bid(8, 1, 5, 40)
+	// A second window for auction 7, so the assertion is per (key, window) and
+	// not per key.
+	h.bid(7, 4, 1, 120)
+
+	got := h.watermark(99)
+	want := []winner{
+		{key: 7, windowStart: 0, price: 90, bidder: 2, auction: 7},
+		{key: 8, windowStart: 0, price: 5, bidder: 1, auction: 8},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("at watermark 99 the operator emitted %+v, want %+v", got, want)
+	}
+
+	got = h.watermark(199)
+	want = []winner{{key: 7, windowStart: 100, price: 1, bidder: 4, auction: 7}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("at watermark 199 the operator emitted %+v, want %+v", got, want)
+	}
+}
+
+// TestQ7FiresAtEndMinusOneAndNotBefore.
+//
+// A watermark w asserts that nothing with event time <= w will arrive, so a
+// window [start, end) is complete at w == end-1 and not before. Firing at end
+// would hold every window one millisecond longer for nothing; firing at end-2
+// would report a window a later record could still join.
+func TestQ7FiresAtEndMinusOneAndNotBefore(t *testing.T) {
+	h := newMaxBidHarness(t, NewQ7(100, 0))
+	h.bid(7, 1, 50, 10)
+
+	for _, wm := range []int64{0, 50, 98} {
+		if got := h.watermark(wm); len(got) != 0 {
+			t.Fatalf("watermark %d fired %+v; the window [0, 100) completes at 99", wm, got)
+		}
+	}
+	if got := h.watermark(99); len(got) != 1 {
+		t.Fatalf("watermark 99 fired %+v, want the one window", got)
+	}
+	// And the emitted event time IS end-1, not the start. A downstream
+	// event-time stage would see the whole output as late otherwise.
+	if got := h.ctx.emitted[0].EventTime; got != 99 {
+		t.Errorf("the fired window carries event time %d, want 99 (its end-1)", got)
+	}
+}
+
+// TestQ7BreaksTiesDeterministically.
+//
+// The two tiers this operator can reach: equal prices go to the lowest bidder,
+// and that is asserted through the query rather than only through the
+// comparator. The auction tier is unreachable here -- the auction is the
+// grouping key -- and is tested directly in TestBetterBidIsATotalOrderOperator.
+func TestQ7BreaksTiesDeterministically(t *testing.T) {
+	tests := []struct {
+		name string
+		bids [][3]uint64 // auction, bidder, price
+		want winner
+	}{
+		{
+			name: "equal price goes to the lowest bidder",
+			bids: [][3]uint64{{7, 5, 90}, {7, 2, 90}, {7, 9, 90}},
+			want: winner{key: 7, windowStart: 0, price: 90, bidder: 2, auction: 7},
+		},
+		{
+			name: "a higher price beats a lower bidder",
+			bids: [][3]uint64{{7, 1, 90}, {7, 9, 91}},
+			want: winner{key: 7, windowStart: 0, price: 91, bidder: 9, auction: 7},
+		},
+		{
+			name: "the lowest bidder wins whatever order they arrive in",
+			bids: [][3]uint64{{7, 2, 90}, {7, 5, 90}},
+			want: winner{key: 7, windowStart: 0, price: 90, bidder: 2, auction: 7},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newMaxBidHarness(t, NewQ7(100, 0))
+			for i, b := range tt.bids {
+				h.bid(b[0], b[1], b[2], int64(10+i))
+			}
+			got := h.watermark(99)
+			if !slices.Equal(got, []winner{tt.want}) {
+				t.Fatalf("emitted %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestQ7IsIndependentOfArrivalOrder.
+//
+// Records reach an operator in whatever order the shuffle and the scheduler
+// produced. A winner decided by "greater price, otherwise keep what is there"
+// would depend on that order, so two runs of one job would commit different
+// bids for one window and the oracle comparison would fail intermittently --
+// looking exactly like a windowing bug.
+//
+// Every permutation of a set containing a two-way price tie, so the assertion
+// is over the arrival orders rather than over a couple of them.
+func TestQ7IsIndependentOfArrivalOrder(t *testing.T) {
+	bids := [][3]uint64{{7, 5, 90}, {7, 2, 90}, {7, 8, 42}, {7, 1, 7}}
+
+	var want []winner
+	for _, perm := range permutations(len(bids)) {
+		h := newMaxBidHarness(t, NewQ7(100, 0))
+		for i, at := range perm {
+			b := bids[at]
+			h.bid(b[0], b[1], b[2], int64(10+i))
+		}
+		got := h.watermark(99)
+		if want == nil {
+			want = got
+			continue
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("arrival order %v produced %+v, and another order produced %+v", perm, got, want)
+		}
+	}
+	if !slices.Equal(want, []winner{{key: 7, windowStart: 0, price: 90, bidder: 2, auction: 7}}) {
+		t.Fatalf("every order produced %+v, which is not the hand-computed winner", want)
+	}
+}
+
+// permutations returns every permutation of [0, n).
+func permutations(n int) [][]int {
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	var out [][]int
+	var rec func(k int)
+	rec = func(k int) {
+		if k == n {
+			out = append(out, slices.Clone(idx))
+			return
+		}
+		for i := k; i < n; i++ {
+			idx[k], idx[i] = idx[i], idx[k]
+			rec(k + 1)
+			idx[k], idx[i] = idx[i], idx[k]
+		}
+	}
+	rec(0)
+	return out
+}
+
+// TestBetterBidIsATotalOrderOperator exercises the tier q7 cannot reach.
+//
+// The auction tier is unreachable inside the operator, where the auction is the
+// grouping key. Testing the rule only through the query would leave a third of
+// it unexercised while looking covered.
+func TestBetterBidIsATotalOrderOperator(t *testing.T) {
+	for p1 := uint64(0); p1 < 3; p1++ {
+		for b1 := uint64(0); b1 < 3; b1++ {
+			for a1 := uint64(0); a1 < 3; a1++ {
+				for p2 := uint64(0); p2 < 3; p2++ {
+					for b2 := uint64(0); b2 < 3; b2++ {
+						for a2 := uint64(0); a2 < 3; a2++ {
+							x := WinningBid{Price: p1, Bidder: b1, Auction: a1}
+							y := WinningBid{Price: p2, Bidder: b2, Auction: a2}
+							ab, ba := betterBid(x, y), betterBid(y, x)
+							if x == y && (ab || ba) {
+								t.Fatalf("%+v beats itself", x)
+							}
+							if x != y && ab == ba {
+								t.Fatalf("%+v and %+v are both %v", x, y, ab)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// The three tiers, one row each, so a comparator that had lost a tier
+	// fails here rather than only in the antisymmetry sweep.
+	if !betterBid(WinningBid{Price: 2}, WinningBid{Price: 1}) {
+		t.Error("a higher price does not win")
+	}
+	if !betterBid(WinningBid{Price: 1, Bidder: 1}, WinningBid{Price: 1, Bidder: 2}) {
+		t.Error("an equal price does not go to the lower bidder")
+	}
+	if !betterBid(WinningBid{Price: 1, Bidder: 1, Auction: 1}, WinningBid{Price: 1, Bidder: 1, Auction: 2}) {
+		t.Error("an equal price and bidder do not go to the lower auction")
+	}
+}
+
+// TestQ7DropsEventsThatAreNotBids.
+//
+// q7 is defined over the bid stream. A person or an auction reaching the
+// window operator would open a window keyed on a person id, which is a row the
+// oracle does not have and a key nothing will ever bid on.
+func TestQ7DropsEventsThatAreNotBids(t *testing.T) {
+	h := newMaxBidHarness(t, NewQ7(100, 0))
+	h.event(personRecord(1, 10))
+	h.event(auctionRecord(2, 20))
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixUserState)); got != 0 {
+		t.Fatalf("%d windows opened for events that are not bids, want none", got)
+	}
+	if got := h.watermark(99); len(got) != 0 {
+		t.Fatalf("a person and an auction fired %+v", got)
+	}
+	// A bid on the same ids still opens a window, so the assertion above is
+	// about the types and not about the operator ignoring everything.
+	h.bid(1, 1, 5, 10)
+	if got := h.watermark(199); len(got) != 1 {
+		t.Fatalf("a bid fired %+v, want one window", got)
+	}
+}
+
+// TestQ7DropsAndCountsABidAfterPurge.
+//
+// A window past its allowed lateness has been fired and reported. A record
+// arriving for it must be dropped rather than reopening it: reopening emits a
+// (key, window) the sink already holds, and at a transactional sink that is a
+// second committed row for one window.
+func TestQ7DropsAndCountsABidAfterPurge(t *testing.T) {
+	h := newMaxBidHarness(t, NewQ7(100, 0))
+	h.bid(7, 1, 50, 10)
+	if got := h.watermark(250); len(got) != 1 {
+		t.Fatalf("watermark 250 fired %+v, want the one window", got)
+	}
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixUserState)); got != 0 {
+		t.Fatalf("%d aggregates survived the purge, want none", got)
+	}
+
+	before := h.op.OnTime()
+	h.bid(7, 9, 900, 10)
+	if got := h.op.Dropped(); got != 1 {
+		t.Errorf("the operator dropped %d bids, want 1", got)
+	}
+	if got := h.op.OnTime(); got != before {
+		t.Errorf("a dropped bid was counted on time")
+	}
+	if got := len(partitionKeys(h.ctx.State(), state.PrefixUserState)); got != 0 {
+		t.Errorf("a late bid opened %d windows, want none", got)
+	}
+	if got := h.watermark(math.MaxInt64); len(got) != 0 {
+		t.Errorf("the flush emitted %+v for a window the sink already holds", got)
+	}
+}
+
+// TestQ7StateLayout pins the three partitions and the value payload.
+//
+// The expected bytes are built here by hand rather than by calling the
+// encoders, which would be the operator agreeing with itself. The value is the
+// one thing this operator changes about WindowCount's layout, so it is the one
+// thing that most needs pinning.
+func TestQ7StateLayout(t *testing.T) {
+	h := newMaxBidHarness(t, NewQ7(100, 0))
+	h.bid(7, 3, 90, 10)
+	h.ctx.watermark = 0
+	if err := h.op.ProcessWatermark(0, h.ctx); err != nil {
+		t.Fatalf("ProcessWatermark: %v", err)
+	}
+
+	st := h.ctx.State()
+
+	// The aggregate: 0x00 || key || windowStart big-endian.
+	wantKey := append([]byte{state.PrefixUserState}, sources.NexmarkKey(7)...)
+	var start [8]byte
+	binary.BigEndian.PutUint64(start[:], 0)
+	wantKey = append(wantKey, start[:]...)
+
+	value, ok := st.Get(wantKey)
+	if !ok {
+		t.Fatalf("no aggregate stored under %x", wantKey)
+	}
+	// price 90, bidder 3, auction 7, each big-endian, in that order.
+	wantValue := []byte{
+		0, 0, 0, 0, 0, 0, 0, 90,
+		0, 0, 0, 0, 0, 0, 0, 3,
+		0, 0, 0, 0, 0, 0, 0, 7,
+	}
+	if !bytes.Equal(value, wantValue) {
+		t.Errorf("the aggregate value is %x, want %x", value, wantValue)
+	}
+	if len(value) != winningBidBytes {
+		t.Errorf("the aggregate value is %d bytes, want %d", len(value), winningBidBytes)
+	}
+
+	// The timer: 0x01 || fireTime ordered || key || windowStart big-endian.
+	wantTimer := []byte{state.PrefixTimer}
+	fire := state.EncodeOrderedInt64(99)
+	wantTimer = append(wantTimer, fire[:]...)
+	wantTimer = append(wantTimer, sources.NexmarkKey(7)...)
+	wantTimer = append(wantTimer, start[:]...)
+	if _, ok := st.Get(wantTimer); !ok {
+		t.Errorf("no timer stored under %x; the partition holds %x", wantTimer, partitionKeys(st, state.PrefixTimer))
+	}
+
+	// The watermark: 0x02 || "watermark".
+	wantWatermark := append([]byte{state.PrefixOperatorState}, "watermark"...)
+	stored, ok := st.Get(wantWatermark)
+	if !ok {
+		t.Fatalf("no watermark stored under %x", wantWatermark)
+	}
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(0)^(1<<63))
+	if !bytes.Equal(stored, encoded[:]) {
+		t.Errorf("the watermark is stored as %x, want %x", stored, encoded)
+	}
+
+	// Nothing outside the three partitions.
+	st.Iterate(func(k, v []byte) bool {
+		switch k[0] {
+		case state.PrefixUserState, state.PrefixTimer, state.PrefixOperatorState:
+		default:
+			t.Errorf("the operator wrote a key under discriminator %#x: %x", k[0], k)
+		}
+		return true
+	})
+}
+
+// TestWinningBidRoundTrips, and refuses anything that is not exactly 24 bytes.
+func TestWinningBidRoundTrips(t *testing.T) {
+	for _, w := range []WinningBid{
+		{},
+		{Price: 1, Bidder: 2, Auction: 3},
+		{Price: math.MaxUint64, Bidder: math.MaxUint64, Auction: math.MaxUint64},
+	} {
+		got, err := DecodeWinningBid(EncodeWinningBid(w))
+		if err != nil || got != w {
+			t.Errorf("%+v round-tripped to (%+v, %v)", w, got, err)
+		}
+	}
+	for _, bad := range [][]byte{nil, make([]byte, 23), make([]byte, 25), encodeCount(5)} {
+		if _, err := DecodeWinningBid(bad); err == nil {
+			t.Errorf("a %d-byte value was accepted as a winning bid", len(bad))
+		}
+	}
+}
+
+// TestRestoredQ7RecoversItsWatermark is the divergence the state-backed
+// watermark closes, asserted against the run that does not recover it.
+//
+// The script purges a window, then restores. A bid for that window arriving
+// after the restore is LATE and must be dropped: the window has been fired and
+// reported, and accepting the bid emits a (key, window) the sink already holds.
+// An operator whose watermark came back as minWatermark thinks nothing has been
+// purged, so it accepts the bid, opens the window a second time and emits it
+// again.
+//
+// The counterfactual is in the test rather than in a comment: the same bid is
+// fed to an operator opened on EMPTY state, and the assertion is that the two
+// disagree. Without it this would pass against an operator that dropped the bid
+// for some unrelated reason.
+func TestRestoredQ7RecoversItsWatermark(t *testing.T) {
+	h := newMaxBidHarness(t, NewQ7(100, 0))
+	h.bid(7, 1, 50, 10)
+	if got := h.watermark(250); len(got) != 1 {
+		t.Fatalf("the run before the checkpoint fired %+v, want the one window", got)
+	}
+
+	restored := restoreMaxBid(t, h, NewQ7(100, 0))
+	if got, err := loadWatermark(restored.ctx.State()); err != nil || got != 250 {
+		t.Fatalf("the restored operator's watermark is (%d, %v), want (250, nil)", got, err)
+	}
+
+	restored.bid(7, 9, 900, 10)
+	if got := restored.op.Dropped(); got != 1 {
+		t.Errorf("the restored operator dropped %d bids, want 1", got)
+	}
+	if got := restored.watermark(math.MaxInt64); len(got) != 0 {
+		t.Errorf("the restored operator emitted %+v for a window the sink already holds", got)
+	}
+
+	// The same bid against an operator that did not recover a watermark. This
+	// is what a Go field produces: the window comes back, with a different
+	// winner, and the sink ends up with two rows for one (key, window).
+	fresh := newMaxBidHarness(t, NewQ7(100, 0))
+	fresh.bid(7, 9, 900, 10)
+	if got := fresh.op.Dropped(); got != 0 {
+		t.Fatalf("an operator on empty state dropped %d, want 0: the counterfactual does not hold", got)
+	}
+	if got := fresh.watermark(math.MaxInt64); len(got) != 1 {
+		t.Fatalf("an operator on empty state emitted %+v, want the duplicate window: the counterfactual does not hold", got)
+	}
+}
+
+// restoreMaxBid serialises a harness's state, reads it back into fresh state,
+// and opens op on it. It is the restore path the runtime takes, in miniature.
+func restoreMaxBid(t *testing.T, h *maxBidHarness, op *MaxBid) *maxBidHarness {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := state.WriteTo(h.ctx.State(), &buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	restored := state.NewMemory()
+	if err := state.ReadFrom(restored, &buf); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	ctx := &emitContext{state: restored}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("Open on restored state: %v", err)
+	}
+	return &maxBidHarness{t: t, op: op, ctx: ctx}
+}
+
+// TestNewQ7RejectsABadSpecification.
+func TestNewQ7RejectsABadSpecification(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		size, lateness int64
+	}{
+		{"zero size", 0, 0},
+		{"negative size", -1, 0},
+		{"negative lateness", 100, -1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("NewQ7(%d, %d) did not panic", tt.size, tt.lateness)
+				}
+			}()
+			NewQ7(tt.size, tt.lateness)
+		})
+	}
+}
+
+// TestQ7OpenRefusesWithoutState. An operator quietly running on state the
+// runtime does not know about would checkpoint as empty and restore as empty.
+func TestQ7OpenRefusesWithoutState(t *testing.T) {
+	if err := NewQ7(100, 0).Open(&nilStateContext{}); err == nil {
+		t.Error("q7 opened with no keyed state")
+	}
+}
+
+// TestQ7SnapshotRefuses. Its state is the subtask's KeyedState, which
+// pkg/checkpoint serialises directly; a zero-byte snapshot would be a claim
+// that there is nothing to keep.
+func TestQ7SnapshotRefuses(t *testing.T) {
+	op := NewQ7(100, 0)
+	if err := op.Snapshot(io.Discard); err == nil {
+		t.Error("Snapshot wrote a snapshot")
+	}
+	if err := op.Restore(strings.NewReader("")); err == nil {
+		t.Error("Restore accepted a snapshot")
 	}
 }
