@@ -440,7 +440,15 @@ func (m *MaxBid) ProcessWatermark(wm int64, ctx core.Context) error {
 			return err
 		}
 	}
-	return purgeWindows(m.state, func(start int64) bool { return m.isPurged(wm, start) })
+	return purgeWindows(m.state, func(stateKey []byte) (bool, error) {
+		// q7's aggregate key is prefix || key || windowStart, so the start is
+		// the last eight bytes. See purgeWindows for why this is not shared.
+		start, err := windowStartOf(stateKey)
+		if err != nil {
+			return false, err
+		}
+		return m.isPurged(wm, start), nil
+	})
 }
 
 // fire emits the winning bid of one window.
@@ -583,17 +591,30 @@ func collectDue(st state.KeyedState, wm int64) ([]dueTimer, error) {
 	return due, nil
 }
 
-// purgeWindows deletes the aggregate of every window purged reports true for.
+// purgeWindows deletes every aggregate purged reports true for.
+//
+// purged is handed the WHOLE state key rather than a window start, and that is
+// not generality for its own sake. The two operators using this keep their
+// window start in different places: q7's aggregate key is
+// prefix || key || windowStart, so the start is the last eight bytes, and q5
+// stage 2's is prefix || windowKey || auction, so the last eight bytes are the
+// AUCTION. A shared helper that read the start off the end would hand stage 2
+// an auction id -- a number near zero against a watermark near 1.7e12 -- and
+// every aggregate it held would be purged on every watermark. It would still
+// produce output, because a window whose counts arrive and fire inside one
+// watermark call never notices; only a window whose counts arrive earlier than
+// its fire time does, and then it fires with nothing or with a share of its
+// auctions. That was a real bug and this signature is what closes it.
 //
 // Confined to the user-state partition and STOPS at the first key outside it,
 // which the layout puts contiguously at the end. That confinement is not
-// decoration: a timer key also carries a window start in its last eight bytes,
-// so an unconfined scan would delete timers it was never asked about and
+// decoration either: a timer key also carries a window start in its last eight
+// bytes, so an unconfined scan would delete timers it was never asked about and
 // windows would simply stop firing, with nothing to report.
 //
 // KeyedState.Iterate permits the callback to delete the entry it is handed and
 // only that entry, which is what this does.
-func purgeWindows(st state.KeyedState, purged func(windowStart int64) bool) error {
+func purgeWindows(st state.KeyedState, purged func(stateKey []byte) (bool, error)) error {
 	var err error
 	st.Iterate(func(stateKey, value []byte) bool {
 		if len(stateKey) == 0 {
@@ -606,12 +627,12 @@ func purgeWindows(st state.KeyedState, purged func(windowStart int64) bool) erro
 			// timer.
 			return false
 		}
-		start, decodeErr := windowStartOf(stateKey)
+		drop, decodeErr := purged(stateKey)
 		if decodeErr != nil {
 			err = decodeErr
 			return false
 		}
-		if purged(start) {
+		if drop {
 			st.Delete(stateKey)
 		}
 		return true
@@ -1022,7 +1043,7 @@ func (h *HotItems) ProcessWatermark(wm int64, ctx core.Context) error {
 		return fmt.Errorf("operators: q5 stage 2: %w", err)
 	}
 	if len(due) == 0 {
-		return purgeWindows(h.state, func(start int64) bool { return h.isPurged(wm, start) })
+		return h.purge(wm)
 	}
 
 	// The due windows, by window key, so the scan below can recognise one in
@@ -1089,7 +1110,27 @@ func (h *HotItems) ProcessWatermark(wm int64, ctx core.Context) error {
 			})
 		}
 	}
-	return purgeWindows(h.state, func(start int64) bool { return h.isPurged(wm, start) })
+	return h.purge(wm)
+}
+
+// purge drops the aggregates of every window the watermark has moved past.
+//
+// The window start is read out of the WINDOW KEY, which leads the composite
+// key, and NOT off the end of it -- the last eight bytes here are the auction.
+// See purgeWindows: reading the end would hand this an auction id and purge
+// every aggregate on every watermark.
+func (h *HotItems) purge(wm int64) error {
+	return purgeWindows(h.state, func(stateKey []byte) (bool, error) {
+		windowKey, _, err := parseHotItemKey(stateKey)
+		if err != nil {
+			return false, err
+		}
+		start, err := WindowKeyStart(windowKey)
+		if err != nil {
+			return false, err
+		}
+		return h.isPurged(wm, start), nil
+	})
 }
 
 // OnEndOfStream does nothing. The windows still open when the input runs out

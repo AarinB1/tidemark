@@ -1822,3 +1822,117 @@ func drive(t *testing.T, op core.Operator, ctx core.Context, first, second *core
 		t.Fatalf("OnEndOfStream: %v", err)
 	}
 }
+
+// TestQ5Stage2DoesNotPurgeAWindowItHasNotFired.
+//
+// The purge reads a window start out of the WINDOW KEY, which leads the
+// composite key. Reading it off the END instead gives the auction id -- a
+// number near zero against an epoch-scale watermark -- so every aggregate would
+// be purged on every watermark.
+//
+// Nothing in this file's other tests could see that, and the reason is worth
+// recording: they use window starts of 0, 100 and 200, where an auction id and
+// a window start are the same order of magnitude and isPurged answers the same
+// for both. It is the same shape of blindness the negative event-time rows
+// exist for in window_test.go. So the timestamps here are epoch-scale, which is
+// what every real run uses.
+//
+// The failure it guards is not an empty result. A window whose counts arrive
+// and fire inside ONE watermark call never notices, which is most of them; only
+// a window whose counts arrive in an earlier call than its fire time does, and
+// then it fires with a share of its auctions or with none at all.
+func TestQ5Stage2DoesNotPurgeAWindowItHasNotFired(t *testing.T) {
+	const (
+		size = 5000
+		w1   = int64(1700000000000)
+		w2   = w1 + size
+	)
+	h := newHotHarness(t, NewQ5HotItems(size, 0))
+
+	// Both windows' counts arrive before either fires, which is what a coarse
+	// watermark produces and what the pipeline does whenever stage 1 completes
+	// two windows between two watermarks.
+	h.count(w1, 7, 3)
+	h.count(w1, 8, 1)
+	h.count(w2, 7, 2)
+	h.count(w2, 9, 4)
+
+	got := h.watermark(w1 + size - 1)
+	if want := []hotRow{{windowStart: w1, auction: 7, count: 3}}; !slices.Equal(got, want) {
+		t.Fatalf("the first watermark emitted %+v, want %+v", got, want)
+	}
+	// The second window has NOT fired, so both its aggregates are still held.
+	//
+	// Counted PER WINDOW rather than in total, because a fired window's
+	// aggregates survive too: firing deletes the timer, and the purge needs the
+	// watermark to be strictly past end+lateness, which end-1 is not. That is
+	// what lets a record inside the allowed lateness re-fire a window, and a
+	// total here would be asserting the opposite.
+	if got := hotAggregatesPerWindow(t, h.ctx.State()); got[w2] != 2 {
+		t.Fatalf("window %d holds %d aggregates after a watermark that did not fire it, want 2 "+
+			"(the whole partition is %v): the purge is reading a window start from the wrong end of the key",
+			w2, got[w2], got)
+	}
+
+	got = h.watermark(w2 + size - 1)
+	if want := []hotRow{{windowStart: w2, auction: 9, count: 4}}; !slices.Equal(got, want) {
+		t.Fatalf("the second watermark emitted %+v, want %+v", got, want)
+	}
+}
+
+// hotAggregatesPerWindow counts stage 2's aggregates by window, reading the
+// window start out of the leading window key.
+func hotAggregatesPerWindow(t *testing.T, st state.KeyedState) map[int64]int {
+	t.Helper()
+	out := map[int64]int{}
+	for _, k := range partitionKeys(st, state.PrefixUserState) {
+		windowKey, _, err := parseHotItemKey(k)
+		if err != nil {
+			t.Fatalf("parseHotItemKey: %v", err)
+		}
+		start, err := WindowKeyStart(windowKey)
+		if err != nil {
+			t.Fatalf("WindowKeyStart: %v", err)
+		}
+		out[start]++
+	}
+	return out
+}
+
+// TestQ7DoesNotPurgeAWindowItHasNotFired is the same assertion for q7, whose
+// aggregate key ends with the window start rather than beginning with it. Both
+// operators are checked because purgeWindows serves both and each supplies its
+// own reader for its own layout.
+func TestQ7DoesNotPurgeAWindowItHasNotFired(t *testing.T) {
+	const (
+		size = 5000
+		w1   = int64(1700000000000)
+		w2   = w1 + size
+	)
+	h := newMaxBidHarness(t, NewQ7(size, 0))
+	h.bid(7, 1, 50, w1+10)
+	h.bid(8, 2, 90, w1+20)
+	h.bid(7, 3, 70, w2+10)
+
+	if got := h.watermark(w1 + size - 1); len(got) != 2 {
+		t.Fatalf("the first watermark emitted %+v, want the two windows of [%d, %d)", got, w1, w1+size)
+	}
+	perWindow := map[int64]int{}
+	for _, k := range partitionKeys(h.ctx.State(), state.PrefixUserState) {
+		start, err := windowStartOf(k)
+		if err != nil {
+			t.Fatalf("windowStartOf: %v", err)
+		}
+		perWindow[start]++
+	}
+	if perWindow[w2] != 1 {
+		t.Fatalf("window %d holds %d aggregates after a watermark that did not fire it, want 1 (the whole partition is %v)",
+			w2, perWindow[w2], perWindow)
+	}
+
+	got := h.watermark(w2 + size - 1)
+	want := []winner{{key: 7, windowStart: w2, price: 70, bidder: 3, auction: 7}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("the second watermark emitted %+v, want %+v", got, want)
+	}
+}
