@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -471,5 +472,165 @@ func TestUnwritableStorageAbandonsTheCheckpoint(t *testing.T) {
 	}
 	if !c.Abandoned(1) {
 		t.Error("a checkpoint whose write failed was left outstanding rather than abandoned")
+	}
+}
+
+// The completion queries a sink subtask commits on.
+//
+// These are the coordinator's half of invariant 4. A sink stages at a barrier
+// and commits when it learns the checkpoint completed, and "learns" means one
+// of the two calls below -- never a push, because a checkpoint completes inside
+// the last sink subtask's Acknowledge and a push would reach every OTHER sink
+// subtask on a foreign goroutine, mid-Write.
+
+// TestCompletedAmongReportsOnlyTheCompletedOnes.
+//
+// The interesting rows are the two that are not complete. An outstanding
+// checkpoint must not be reported, because a sink that committed on it would be
+// committing data belonging to a checkpoint that may never complete -- which is
+// exactly the duplicate invariant 4 exists to prevent. An ABANDONED one must
+// not be reported either, and for a different reason: it will never complete,
+// so a sink that treated "terminal" as "committable" would commit a cut that no
+// recovery will ever reproduce.
+func TestCompletedAmongReportsOnlyTheCompletedOnes(t *testing.T) {
+	c, _ := newTestCoordinator(t)
+
+	// 1 completes, 2 is abandoned, 3 is left outstanding, 4 is never mentioned.
+	ackAll(t, c, 1)
+	c.Fail(2, SubtaskKey{VertexID: "op"}, errors.New("no disk"))
+	ackAll(t, c, 3, SubtaskKey{VertexID: "out"})
+
+	for _, tt := range []struct {
+		name string
+		ids  []int64
+		want []int64
+	}{
+		{"the completed one", []int64{1}, []int64{1}},
+		{"an abandoned one", []int64{2}, nil},
+		{"an outstanding one", []int64{3}, nil},
+		{"one nothing has mentioned", []int64{4}, nil},
+		{"all of them, in order", []int64{1, 2, 3, 4}, []int64{1}},
+		{"none", nil, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := c.CompletedAmong(tt.ids)
+			if len(got) != len(tt.want) {
+				t.Fatalf("CompletedAmong(%v) = %v, want %v", tt.ids, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("CompletedAmong(%v) = %v, want %v", tt.ids, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestAwaitCompletedAmongWaitsForTheOutstandingOne.
+//
+// This is the end-of-stream case, and the race it closes is silent data loss:
+// sink subtask 0 reaches end of stream and returns before sink subtask 1
+// acknowledges checkpoint k, so nothing commits subtask 0's transaction for k
+// and a clean run has no recovery to fix it up.
+//
+// The test asserts the WAIT and not merely the answer. A CompletedAmong that
+// happened to be called late would return the same slice, so the assertion is
+// that the call had not returned while the checkpoint was outstanding.
+func TestAwaitCompletedAmongWaitsForTheOutstandingOne(t *testing.T) {
+	c, _ := newTestCoordinator(t)
+	ackAll(t, c, 1, SubtaskKey{VertexID: "out"})
+
+	returned := make(chan []int64)
+	go func() { returned <- c.AwaitCompletedAmong(context.Background(), []int64{1}) }()
+
+	// Nothing has completed, so the call must still be blocked. Read with a
+	// default rather than a timer: a sleep here would make the assertion "it
+	// had not returned within some duration", which is a statement about the
+	// scheduler. The goroutine may not have reached the call yet, and that is
+	// fine -- this direction can only fail if it returned EARLY, which is the
+	// failure being ruled out.
+	select {
+	case got := <-returned:
+		t.Fatalf("AwaitCompletedAmong returned %v while checkpoint 1 was outstanding", got)
+	default:
+	}
+
+	if err := c.Acknowledge(1, SubtaskKey{VertexID: "out"}, nil); err != nil {
+		t.Fatalf("Acknowledge: %v", err)
+	}
+	got := <-returned
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("AwaitCompletedAmong = %v, want [1] once the last subtask acknowledged", got)
+	}
+}
+
+// TestAwaitCompletedAmongReturnsOnAnAbandonedCheckpoint.
+//
+// Abandoned is terminal, so the wait ends -- and the checkpoint is not reported
+// as committable. Without this the sink at end of stream would block forever on
+// a checkpoint some subtask's failure had already given up on, and the job
+// would hang in the runtime's wait for its goroutines rather than fail.
+func TestAwaitCompletedAmongReturnsOnAnAbandonedCheckpoint(t *testing.T) {
+	c, _ := newTestCoordinator(t)
+	ackAll(t, c, 1, SubtaskKey{VertexID: "out"})
+	ackAll(t, c, 2)
+
+	go func() {
+		c.Fail(1, SubtaskKey{VertexID: "out"}, errors.New("the sink died before its barrier"))
+	}()
+
+	got := c.AwaitCompletedAmong(context.Background(), []int64{1, 2})
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("AwaitCompletedAmong([1 2]) = %v, want [2]: 1 was abandoned and is not committable", got)
+	}
+}
+
+// TestAwaitCompletedAmongGivesUpWhenTheJobIsCancelled.
+//
+// The remaining way a checkpoint never settles is a subtask that fails without
+// telling the coordinator -- it returns an error, the executor cancels, and
+// nobody abandons the checkpoint it had acknowledged. A wait with no way out
+// would hold the whole job in its goroutine wait, turning one subtask's failure
+// into a hang with no error anywhere.
+//
+// What comes back is what completed, which for a cancelled job is nothing worth
+// committing: a cancelled job is a failed job, and the transaction it staged is
+// the recovered run's to commit.
+func TestAwaitCompletedAmongGivesUpWhenTheJobIsCancelled(t *testing.T) {
+	c, _ := newTestCoordinator(t)
+	ackAll(t, c, 1, SubtaskKey{VertexID: "out"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go cancel()
+
+	if got := c.AwaitCompletedAmong(ctx, []int64{1}); len(got) != 0 {
+		t.Fatalf("AwaitCompletedAmong = %v, want nothing: checkpoint 1 never completed", got)
+	}
+}
+
+// TestAwaitCompletedAmongDoesNotMissACompletionItRacedWith.
+//
+// The wake-up is a channel read outside the mutex, so the question is whether a
+// completion landing between the state check and the select can be lost. It
+// cannot: announce closes the channel the waiter already read under the same
+// lock that guards the state it just examined, so a transition after the check
+// closes the channel the waiter is about to select on.
+//
+// Run over many attempts because it is a race, and a race that reproduces once
+// in fifty attempts is one a single attempt reports as passing.
+func TestAwaitCompletedAmongDoesNotMissACompletionItRacedWith(t *testing.T) {
+	for attempt := range 200 {
+		c, _ := newTestCoordinator(t)
+		ackAll(t, c, 1, SubtaskKey{VertexID: "out"})
+
+		returned := make(chan []int64, 1)
+		go func() { returned <- c.AwaitCompletedAmong(context.Background(), []int64{1}) }()
+		go func() { _ = c.Acknowledge(1, SubtaskKey{VertexID: "out"}, nil) }()
+
+		got := <-returned
+		if len(got) != 1 || got[0] != 1 {
+			t.Fatalf("attempt %d: AwaitCompletedAmong = %v, want [1]: a completion was lost between "+
+				"the state check and the wait", attempt, got)
+		}
 	}
 }

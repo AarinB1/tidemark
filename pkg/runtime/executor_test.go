@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"sync/atomic"
 	"testing"
@@ -179,7 +180,9 @@ func (s *failingSink) Write(*core.Record) error {
 	return nil
 }
 
-func (s *failingSink) Close() error { return nil }
+func (s *failingSink) Snapshot(io.Writer) error             { return nil }
+func (s *failingSink) NotifyCheckpointComplete(int64) error { return nil }
+func (s *failingSink) Close() error                         { return nil }
 
 // TestRunPropagatesSinkError also exercises the unwinding path: the source and
 // operator are upstream of the failure and may be blocked in Send when it
@@ -215,7 +218,9 @@ func (s *blockingSink) Write(*core.Record) error {
 	return nil
 }
 
-func (s *blockingSink) Close() error { return nil }
+func (s *blockingSink) Snapshot(io.Writer) error             { return nil }
+func (s *blockingSink) NotifyCheckpointComplete(int64) error { return nil }
+func (s *blockingSink) Close() error                         { return nil }
 
 // closeRecording wraps a source, operator or sink so the test can observe
 // exactly when the runtime finished with it. Close runs on every exit path, so
@@ -359,7 +364,7 @@ func TestRunRejectsInvalidGraph(t *testing.T) {
 }
 
 func TestOpContextInitialWatermark(t *testing.T) {
-	oc := newOpContext(context.Background(), nil)
+	oc := newOpContext(context.Background(), subtaskID{vertexID: "op", index: 0}, nil)
 	if got := oc.CurrentWatermark(); got != math.MinInt64 {
 		t.Errorf("CurrentWatermark = %d, want math.MinInt64", got)
 	}
@@ -425,7 +430,7 @@ func TestOpContextEmitStopsAfterFirstFailure(t *testing.T) {
 	const capacity = 4
 	ch := transport.NewChannel(capacity)
 	ctx, cancel := context.WithCancel(context.Background())
-	oc := newOpContext(ctx, transport.NewWriter([][]transport.Output{{ch}}))
+	oc := newOpContext(ctx, subtaskID{vertexID: "op", index: 0}, transport.NewWriter([][]transport.Output{{ch}}))
 
 	// Fill the buffer first, so the Emit after cancellation has nowhere to put
 	// its record and fails on the cancelled context rather than racing it.
@@ -484,7 +489,7 @@ func TestOpContextEmitStopsAfterFirstFailure(t *testing.T) {
 func TestOpContextEmitHoldsSendError(t *testing.T) {
 	ch := transport.NewChannel(1)
 	ctx, cancel := context.WithCancel(context.Background())
-	oc := newOpContext(ctx, transport.NewWriter([][]transport.Output{{ch}}))
+	oc := newOpContext(ctx, subtaskID{vertexID: "op", index: 0}, transport.NewWriter([][]transport.Output{{ch}}))
 
 	oc.Emit(&core.Record{Key: []byte("a")})
 	if err := oc.takeErr(); err != nil {

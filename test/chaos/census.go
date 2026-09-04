@@ -300,22 +300,35 @@ type Floor struct {
 // # Where these numbers come from
 //
 // Three independent five-hundred-seed runs and three twenty-five-seed ones,
-// with zero divergence from the batch oracle in all six. What they observed:
+// with zero divergence from the batch oracle in all six. What they observed,
+// at the eight-barrier interval this workload runs at from Phase 5 on:
 //
 //	                                      500 seeds        25 seeds     floor
-//	faults that fired                 91.0 - 91.7%    85.4 - 87.8%      70%
+//	faults that fired                 88.9 - 89.8%    80.5 - 87.8%      65%
 //	schedules that aborted                   71.4%           76.0%      60%
-//	resumes from a real checkpoint    44.2 - 45.2%    34.3 - 38.9%      25%
-//	schedules with a pending window   46.6 - 47.8%    48.0 - 56.0%      30%
+//	resumes from a real checkpoint    65.3 - 69.3%    60.0 - 81.8%      45%
+//	schedules with a pending window   58.6 - 61.4%    64.0 - 76.0%      40%
 //	alignment faults inside a window        100.0%          100.0%      80%
 //
-// Each floor sits twenty to thirty-five per cent below the WORST of the six,
+// Each floor sits sixteen to thirty-two per cent below the WORST of the six,
 // which is the margin the numbers themselves ask for: a schedule is a pure
 // function of its seed, but whether a fault fires is not. Whether the fault
 // aimed between two inputs' barriers lands depends on the order those inputs
 // reach the gate, and that is the Go scheduler's to decide. The spread above
 // is what that costs, and the margin is set against it rather than against a
 // guess.
+//
+// # Why the fired floor came DOWN
+//
+// It is the one figure the shorter interval cost, and it is not a regression.
+// Twice the barriers means twice as many chances for a barrier fault to abort
+// a run early, and a run that stops early never reaches the element faults
+// scheduled behind it -- so the after-elements kind fires 73.6% of the time
+// where it fired 80.5%, and the total falls with it. Those are misses that a
+// fault ahead of them caused, which is the at-most-once rule working rather
+// than a trigger that stopped landing. The two floors that say whether the
+// suite reaches anything, resumes-from-a-checkpoint and pending-window, both
+// went up by twenty and ten points; this is what paid for them.
 //
 // Fractions and not counts, so that the same floor holds for the five hundred
 // schedules CI runs without the race detector and the twenty-five it runs with
@@ -330,17 +343,17 @@ type Floor struct {
 // still be worthless: every fault could fire early, every recovery could
 // restart from zero, and five hundred schedules would then be five hundred
 // runs of a job that recovered from nothing. The pending-window floor is the
-// one that says otherwise, and it is the number to read first -- at 47 per
-// cent, the strength of this suite is about two hundred and thirty-seven
-// schedules and not five hundred. The alignment floor is what says the third
-// trigger kind is still buying what it was added for.
+// one that says otherwise, and it is the number to read first -- at about 60
+// per cent, the strength of this suite is roughly three hundred schedules and
+// not five hundred. The alignment floor is what says the third trigger kind is
+// still buying what it was added for.
 func SuiteFloor(schedules int) Floor {
 	return Floor{
 		Schedules:                     schedules,
-		FiredFraction:                 0.70,
+		FiredFraction:                 0.65,
 		AbortedFraction:               0.60,
-		CheckpointResumeFraction:      0.25,
-		PendingWindowFraction:         0.30,
+		CheckpointResumeFraction:      0.45,
+		PendingWindowFraction:         0.40,
 		AlignmentInsideWindowFraction: 0.80,
 	}
 }
@@ -749,7 +762,8 @@ type TimingBaseline struct {
 // assertion. What it is aimed at moves this fraction to nearly zero or nearly
 // one: a gate taking the maximum fires every window early, and one that freezes
 // an exhausted input at its last watermark fires almost none of them until the
-// end-of-input flush. Neither lands inside a band of 0.128 to 0.512.
+// end-of-input flush. Neither lands inside the widest of these bands, which
+// runs 0.138 to 0.552.
 const (
 	flushToleranceFullSuite  = 0.20
 	flushToleranceSmallSuite = 0.60
@@ -763,10 +777,19 @@ const (
 // throughout:
 //
 //	                         500 schedules      25 schedules   baseline        band
-//	clean flush fraction   0.3117 - 0.3510   0.2176 - 0.4040      0.320       below
-//	fault flush fraction   0.3122 - 0.3382   0.1648 - 0.4077      0.320       below
-//	clean mean peak state  3807.6 - 3840.0   3628.3 - 3877.8       3810   -15% +8%
-//	fault mean peak state  3925.6 - 3941.7   3727.5 - 3969.3       3930   -15% +8%
+//	clean flush fraction   0.3444 - 0.3510   0.2229 - 0.3400      0.345       below
+//	fault flush fraction   0.3180 - 0.3288   0.2236 - 0.3610      0.320       below
+//	clean mean peak state  3765.2 - 3779.0   3703.2 - 3810.0       3810   -15% +8%
+//	fault mean peak state  3898.5 - 3908.2   3779.9 - 3925.0       3930   -15% +8%
+//
+// The clean flush fraction is the one figure Phase 5's shorter barrier interval
+// moved: 0.320 to about 0.345. More barriers is more alignment, and a subtask
+// aligning is a subtask not processing the input that already delivered, so the
+// sources run a little further ahead of the operator and a little more is still
+// open when the input ends. It is re-centred rather than left off-centre --
+// the old band held it, but only just, and a baseline the observations sit
+// against the ceiling of turns the next ordinary drift into a failure that
+// reads as the engine's. The fault side barely moved and keeps its number.
 //
 // The twenty-five-schedule column spans runs with AND without the race
 // detector, which is what CI runs at that size. The detector costs the peaks
@@ -790,7 +813,7 @@ func SuiteTimingBaseline(schedules int) TimingBaseline {
 		flush = flushToleranceSmallSuite
 	}
 	return TimingBaseline{
-		CleanFlushFraction: TimingBand{Baseline: 0.320, Below: flush, Above: flush},
+		CleanFlushFraction: TimingBand{Baseline: 0.345, Below: flush, Above: flush},
 		FaultFlushFraction: TimingBand{Baseline: 0.320, Below: flush, Above: flush},
 		CleanPeakState:     TimingBand{Baseline: 3810, Below: 0.15, Above: 0.08},
 		FaultPeakState:     TimingBand{Baseline: 3930, Below: 0.15, Above: 0.08},
@@ -905,6 +928,13 @@ func (c *countingContext) Emit(rec *core.Record) {
 
 func (c *countingContext) CurrentWatermark() int64 { return c.inner.CurrentWatermark() }
 func (c *countingContext) State() state.KeyedState { return c.inner.State() }
+
+// Subtask is the method core.Context grew in Phase 5, and this forwarder is the
+// comment above coming true: the compiler asked for it because nothing is
+// embedded here. Had core.Context been embedded instead, this decorator would
+// have kept compiling and would have answered every Subtask call with a nil
+// panic at run time.
+func (c *countingContext) Subtask() (string, int) { return c.inner.Subtask() }
 
 // firingRecorder wraps a WindowCount and attributes each window it emits to the
 // watermark that fired it.

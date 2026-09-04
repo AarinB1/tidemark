@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -114,7 +115,7 @@ func TestLatestIgnoresACheckpointWithoutComplete(t *testing.T) {
 			t.Fatalf("WriteSubtaskState(3, %s): %v", key, err)
 		}
 	}
-	if err := writeFileSynced(s.dir(3), metadataName, encodeMetadata(meta)); err != nil {
+	if err := writeFileSynced(s.fs, s.dir(3), metadataName, encodeMetadata(meta)); err != nil {
 		t.Fatalf("writing metadata for 3: %v", err)
 	}
 
@@ -457,12 +458,14 @@ func TestWriteSubtaskStateRejectsAVertexIDThatIsNotAFileName(t *testing.T) {
 // TestCompleteIsWrittenLast reads the directory back and checks the ordering
 // claim from the outside.
 //
-// The sequence itself cannot be observed without crashing the process part way
-// through it, which no unit test can arrange. What can be checked is the state
-// it is supposed to produce: before Complete there is no marker and Latest
-// finds nothing; after it there is a marker, every state file, and the
-// metadata. A Complete that wrote the marker first would pass the second half
-// and fail the first.
+// What is checked here is the state the sequence produces: before Complete
+// there is no marker and Latest finds nothing; after it there is a marker,
+// every state file, and the metadata. That is a weaker claim than the order
+// itself, and deliberately kept: it is the claim a reader can check against the
+// directory in front of them. The order is TestTheWriteOrderIsInvariantEight,
+// which records the sequence through the filesystem seam rather than inferring
+// it from the state left behind -- a Complete that wrote the marker first
+// leaves exactly this state and fails that one.
 func TestCompleteIsWrittenLast(t *testing.T) {
 	s := NewStorage(t.TempDir())
 	meta := testMetadata()
@@ -501,5 +504,336 @@ func TestCompleteIsWrittenLast(t *testing.T) {
 		if filepath.Ext(e.Name()) == tempSuffix {
 			t.Errorf("temporary file %s survived", e.Name())
 		}
+	}
+}
+
+// The ordering seam and the test that holds invariant 8 to it.
+//
+// TestCompleteIsWrittenLast above checks the STATE the sequence produces:
+// before Complete there is no marker, after it there is one and everything it
+// vouches for. That is worth having and it is not invariant 8. A Complete that
+// wrote _COMPLETE first and the state files afterwards produces the same final
+// state, and the only thing that ever caught it was Storage.Load re-verifying
+// every subtask the metadata names -- a backstop, downstream of the write, and
+// one that a transactional sink committing on the marker does not go through.
+//
+// So the sequence is recorded instead. See fileSystem.
+
+// fsOpKind is one filesystem operation, in the order a correct sequence
+// performs them within a single file.
+type fsOpKind uint8
+
+const (
+	opMkdirAll fsOpKind = iota
+	opCreate
+	opWrite
+	opSync
+	opClose
+	opRename
+	opSyncDir
+	opRemove
+)
+
+func (k fsOpKind) String() string {
+	switch k {
+	case opMkdirAll:
+		return "mkdir"
+	case opCreate:
+		return "create"
+	case opWrite:
+		return "write"
+	case opSync:
+		return "fsync"
+	case opClose:
+		return "close"
+	case opRename:
+		return "rename"
+	case opSyncDir:
+		return "fsync-dir"
+	case opRemove:
+		return "remove"
+	default:
+		return "unknown"
+	}
+}
+
+// fsOp is one recorded operation. Path is the file or directory it acted on,
+// and for a rename it is the DESTINATION: what the ordering assertions are
+// about is when a name became visible, not which temporary file it came from.
+type fsOp struct {
+	Kind fsOpKind
+	Path string
+}
+
+func (o fsOp) String() string { return o.Kind.String() + " " + filepath.Base(o.Path) }
+
+// recordingFS is osFS with a log. Every operation is performed for real, so the
+// checkpoint this test writes is a checkpoint Load can read back afterwards --
+// which it does, because an ordering assertion over a sequence that produced
+// nothing usable would be an assertion about a broken write.
+type recordingFS struct {
+	inner osFS
+	ops   []fsOp
+}
+
+var _ fileSystem = (*recordingFS)(nil)
+
+func (r *recordingFS) record(kind fsOpKind, path string) {
+	r.ops = append(r.ops, fsOp{Kind: kind, Path: path})
+}
+
+func (r *recordingFS) MkdirAll(dir string) error {
+	r.record(opMkdirAll, dir)
+	return r.inner.MkdirAll(dir)
+}
+
+func (r *recordingFS) Create(path string) (syncFile, error) {
+	r.record(opCreate, path)
+	f, err := r.inner.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return &recordingFile{inner: f, fs: r, path: path}, nil
+}
+
+func (r *recordingFS) Rename(from, to string) error {
+	r.record(opRename, to)
+	return r.inner.Rename(from, to)
+}
+
+func (r *recordingFS) SyncDir(dir string) error {
+	r.record(opSyncDir, dir)
+	return r.inner.SyncDir(dir)
+}
+
+func (r *recordingFS) Remove(path string) error {
+	r.record(opRemove, path)
+	return r.inner.Remove(path)
+}
+
+// recordingFile logs what happens to one open file and forwards it.
+//
+// Every method is forwarded EXPLICITLY rather than promoted from an embedded
+// syncFile. Embedding would compile and would leave a recorder that silently
+// stopped logging the moment syncFile grew a method, which is the trap
+// CLAUDE.md records against decorators -- and here the consequence is an
+// ordering assertion over a sequence with a hole in it.
+type recordingFile struct {
+	inner syncFile
+	fs    *recordingFS
+	path  string
+}
+
+func (f *recordingFile) Write(p []byte) (int, error) {
+	f.fs.record(opWrite, f.path)
+	return f.inner.Write(p)
+}
+
+func (f *recordingFile) Sync() error {
+	f.fs.record(opSync, f.path)
+	return f.inner.Sync()
+}
+
+func (f *recordingFile) Close() error {
+	f.fs.record(opClose, f.path)
+	return f.inner.Close()
+}
+
+// indexOf returns the position of the first op matching kind and base name, or
+// -1.
+func (r *recordingFS) indexOf(kind fsOpKind, base string) int {
+	for i, op := range r.ops {
+		if op.Kind == kind && filepath.Base(op.Path) == base {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastIndexOf returns the position of the LAST op of this kind, or -1.
+func (r *recordingFS) lastIndexOf(kind fsOpKind) int {
+	last := -1
+	for i, op := range r.ops {
+		if op.Kind == kind {
+			last = i
+		}
+	}
+	return last
+}
+
+// renamesOfStateFiles returns the positions of every .state rename.
+func (r *recordingFS) renamesOfStateFiles() []int {
+	var out []int
+	for i, op := range r.ops {
+		if op.Kind == opRename && filepath.Ext(op.Path) == stateSuffix {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+func (r *recordingFS) trace() string {
+	var b []byte
+	for i, op := range r.ops {
+		b = append(b, []byte("\n    "+strconv.Itoa(i)+"  "+op.String())...)
+	}
+	return string(b)
+}
+
+// TestTheWriteOrderIsInvariantEight records the whole sequence a checkpoint is
+// written in and asserts the four orderings that make _COMPLETE mean something.
+//
+// A checkpoint is usable for recovery only after _COMPLETE is written, so
+// _COMPLETE must be the last thing that becomes visible and everything it
+// vouches for must be durable before it does. Each assertion below is one half
+// of that, and each names the failure it is for -- a reader who changes the
+// sequence and trips one should not have to work out what it was protecting.
+func TestTheWriteOrderIsInvariantEight(t *testing.T) {
+	root := t.TempDir()
+	fs := &recordingFS{}
+	s := newStorageOn(root, fs)
+	meta := testMetadata()
+
+	for _, key := range meta.Subtasks() {
+		if err := s.WriteSubtaskState(1, key, []byte(key.String())); err != nil {
+			t.Fatalf("WriteSubtaskState(%s): %v", key, err)
+		}
+	}
+	if err := s.Complete(1, meta); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	// The recorded sequence is only evidence if it is the sequence that wrote a
+	// checkpoint somebody can restore. Read it back through the ordinary path
+	// first: an ordering assertion over a write that produced nothing usable
+	// would pass on a Storage that wrote the right operations to the wrong
+	// files.
+	if _, payloads, err := NewStorage(root).Load(1); err != nil {
+		t.Fatalf("Load after the recorded write: %v", err)
+	} else if len(payloads) != len(meta.Subtasks()) {
+		t.Fatalf("Load returned %d payloads, want %d", len(payloads), len(meta.Subtasks()))
+	}
+
+	stateRenames := fs.renamesOfStateFiles()
+	if want := len(meta.Subtasks()); len(stateRenames) != want {
+		t.Fatalf("the sequence holds %d .state renames and the metadata names %d subtasks: "+
+			"a subtask whose file never landed is one _COMPLETE vouches for and Load cannot find%s",
+			len(stateRenames), want, fs.trace())
+	}
+	metadataRename := fs.indexOf(opRename, metadataName)
+	completeRename := fs.indexOf(opRename, completeName)
+	completeSync := fs.indexOf(opSync, completeName+tempSuffix)
+	if metadataRename < 0 || completeRename < 0 || completeSync < 0 {
+		t.Fatalf("the sequence is missing one of: %s rename (%d), %s rename (%d), %s fsync (%d)%s",
+			metadataName, metadataRename, completeName, completeRename, completeName, completeSync, fs.trace())
+	}
+
+	// 1. Every .state file is renamed into place before _METADATA.
+	//
+	// _METADATA is what names the subtasks a restore will look for. A metadata
+	// file that landed first would, at a crash between the two, name a subtask
+	// whose state is not there -- and it is _METADATA, not the state files,
+	// that Load reads to decide what it is missing.
+	for _, at := range stateRenames {
+		if at > metadataRename {
+			t.Errorf("%s was renamed at step %d and a .state file at step %d: the metadata names "+
+				"subtasks whose state had not landed yet%s",
+				metadataName, metadataRename, at, fs.trace())
+		}
+	}
+
+	// 2. The checkpoint directory is fsynced after those renames.
+	//
+	// A file's own fsync makes its CONTENTS durable. The directory entry naming
+	// it is separate metadata, so without this the directory can come back not
+	// listing a file whose data is safely on disk.
+	dirSyncAfterRenames := -1
+	for i, op := range fs.ops {
+		if op.Kind == opSyncDir && i > metadataRename {
+			dirSyncAfterRenames = i
+			break
+		}
+	}
+	if dirSyncAfterRenames < 0 {
+		t.Errorf("nothing fsynced the checkpoint directory after the state files and %s were renamed "+
+			"into it: their contents are durable and the entries naming them need not be%s",
+			metadataName, fs.trace())
+	}
+
+	// 3. _COMPLETE's rename is the LAST rename in the sequence.
+	//
+	// This is invariant 8 stated as an order. The marker declares the whole
+	// checkpoint usable, so anything that became visible after it is something
+	// the marker vouched for before it existed.
+	if last := fs.lastIndexOf(opRename); last != completeRename {
+		t.Errorf("%s was renamed at step %d and the last rename in the sequence is step %d (%s): "+
+			"the marker declared the checkpoint usable before that name existed%s",
+			completeName, completeRename, last, fs.ops[last], fs.trace())
+	}
+
+	// 4. _COMPLETE is fsynced, and the directory is fsynced after it.
+	//
+	// The marker's own fsync is what puts its contents on the disk; the
+	// directory fsync after the rename is what puts the ENTRY there. Without
+	// the second one a crash can leave a checkpoint that is complete on the
+	// platter and absent from its directory, which Latest skips -- losing a
+	// recovery point rather than corrupting one, but losing it silently.
+	if completeSync > completeRename {
+		t.Errorf("%s was fsynced at step %d, after its rename at step %d: the name can point at "+
+			"contents that never reached the disk%s",
+			completeName, completeSync, completeRename, fs.trace())
+	}
+	if last := fs.lastIndexOf(opSyncDir); last < completeRename {
+		t.Errorf("the last directory fsync is step %d and %s was renamed at step %d: the marker's "+
+			"contents are durable and the entry naming it need not be%s",
+			last, completeName, completeRename, fs.trace())
+	}
+}
+
+// TestEveryFileIsFsyncedBeforeItsRename is the within-file half of the order.
+//
+// Separate from the sequence assertions above because it is a different claim:
+// those are about which name becomes visible first, this is about what is
+// behind a name when it does. A rename is atomic, so a reader sees the old file
+// or the new one; without the fsync it can see the new NAME pointing at
+// contents that never reached the disk, which is a file of the right length
+// full of whatever was in those blocks.
+func TestEveryFileIsFsyncedBeforeItsRename(t *testing.T) {
+	fs := &recordingFS{}
+	s := newStorageOn(t.TempDir(), fs)
+	meta := testMetadata()
+	for _, key := range meta.Subtasks() {
+		if err := s.WriteSubtaskState(1, key, []byte(key.String())); err != nil {
+			t.Fatalf("WriteSubtaskState(%s): %v", key, err)
+		}
+	}
+	if err := s.Complete(1, meta); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	renames := 0
+	for i, op := range fs.ops {
+		if op.Kind != opRename {
+			continue
+		}
+		renames++
+		// The four operations on the temporary file, in order, immediately
+		// before the rename that gives it its final name.
+		want := []fsOpKind{opCreate, opWrite, opSync, opClose}
+		if i < len(want) {
+			t.Fatalf("the rename at step %d has only %d operations before it%s", i, i, fs.trace())
+		}
+		tmp := op.Path + tempSuffix
+		for n, kind := range want {
+			at := i - len(want) + n
+			if fs.ops[at].Kind != kind || fs.ops[at].Path != tmp {
+				t.Errorf("step %d before the rename of %s is %q, want %q on the temporary file%s",
+					at, filepath.Base(op.Path), fs.ops[at], fsOp{Kind: kind, Path: tmp}, fs.trace())
+			}
+		}
+	}
+	if want := len(meta.Subtasks()) + 2; renames != want {
+		t.Errorf("the sequence holds %d renames, want %d: one per subtask plus %s and %s%s",
+			renames, want, metadataName, completeName, fs.trace())
 	}
 }

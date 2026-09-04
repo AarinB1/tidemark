@@ -38,6 +38,21 @@ type Context interface {
 	// that checked it in some methods and not others would swallow the error in
 	// the rest.
 	State() state.KeyedState
+	// Subtask returns the identity of the parallel instance this context
+	// belongs to: the ID of its vertex and its index within that vertex.
+	//
+	// A subtask is the unit of scheduling, state and failure, so it is also the
+	// unit anything written OUTSIDE the runtime has to be named by. The
+	// transactional sink is the case that forced this: its committed files
+	// carry (subtask, checkpoint) in their names and that naming IS its
+	// deduplication, so a sink that could not learn its own index would have
+	// two subtasks committing to one path.
+	//
+	// A method on an interface that already exists rather than a new one, and
+	// the runtime is the only thing that can answer it. A factory told its own
+	// index instead would put the same number in two places, and the failure of
+	// them disagreeing is two subtasks sharing a file name, which is silent.
+	Subtask() (vertexID string, index int)
 }
 
 // Operator is the user-defined computation run by a subtask. The runtime calls

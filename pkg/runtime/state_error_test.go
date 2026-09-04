@@ -137,7 +137,7 @@ func runOperatorWithState(t *testing.T, st state.KeyedState, elems []core.Stream
 	gate := NewGate(ctx, []transport.Input{in}, faults{})
 	w := transport.NewWriter([][]transport.Output{{out}})
 
-	oc := newOpContext(ctx, w)
+	oc := newOpContext(ctx, subtaskID{vertexID: "op", index: 0}, w)
 	oc.state = st
 	op := &statefulOperator{}
 	if err := op.Open(oc); err != nil {

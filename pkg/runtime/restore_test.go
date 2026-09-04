@@ -724,7 +724,7 @@ func testRestoredWindowRecoversItsPendingTimers(t *testing.T, backend stateBacke
 		// to it: every window it emits came from a timer that survived the
 		// checkpoint, which is the whole claim.
 		op := operators.NewTumblingCount(recoveryWindowSize, recoveryWindowLateness)
-		ctx := &restoredOpContext{state: restored}
+		ctx := &restoredOpContext{state: restored, index: index}
 		if err := op.Open(ctx); err != nil {
 			t.Fatalf("subtask %d: Open: %v", index, err)
 		}
@@ -772,11 +772,13 @@ func testRestoredWindowRecoversItsPendingTimers(t *testing.T, backend stateBacke
 // output channels this test has no use for.
 type restoredOpContext struct {
 	state   state.KeyedState
+	index   int
 	emitted []*core.Record
 }
 
 func (c *restoredOpContext) Emit(rec *core.Record)   { c.emitted = append(c.emitted, rec) }
 func (c *restoredOpContext) CurrentWatermark() int64 { return math.MaxInt64 }
 func (c *restoredOpContext) State() state.KeyedState { return c.state }
+func (c *restoredOpContext) Subtask() (string, int)  { return "window", c.index }
 
 var _ core.Context = (*restoredOpContext)(nil)

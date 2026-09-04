@@ -21,6 +21,10 @@ type emitContext struct {
 func (c *emitContext) Emit(rec *core.Record)   { c.emitted = append(c.emitted, rec) }
 func (c *emitContext) CurrentWatermark() int64 { return c.watermark }
 
+// Subtask stands in for the identity the runtime assigns. A test driving one
+// operator by hand is subtask 0 of a vertex it does not otherwise name.
+func (c *emitContext) Subtask() (string, int) { return "test", 0 }
+
 // State hands out one Memory per context, made on first use so that a test that
 // never touches state does not carry one. It stands in for the per-subtask
 // state the runtime provides; a test sharing one across two operators would be

@@ -222,7 +222,7 @@ func TestOperatorSnapshotsBeforeForwardingTheBarrier(t *testing.T) {
 
 	gate := NewGate(ctx, []transport.Input{in}, faults{})
 	w := transport.NewWriter([][]transport.Output{{out}})
-	oc := newOpContext(ctx, w)
+	oc := newOpContext(ctx, subtaskID{vertexID: "op", index: 0}, w)
 	op := &statefulOperator{}
 	if err := op.Open(oc); err != nil {
 		t.Fatalf("Open: %v", err)
@@ -288,7 +288,7 @@ func TestOperatorSnapshotHoldsTheStateAtTheBarrier(t *testing.T) {
 	out := transport.NewChannel(16)
 	gate := NewGate(ctx, []transport.Input{in}, faults{})
 	w := transport.NewWriter([][]transport.Output{{out}})
-	oc := newOpContext(ctx, w)
+	oc := newOpContext(ctx, subtaskID{vertexID: "op", index: 0}, w)
 	op := &statefulOperator{}
 	if err := op.Open(oc); err != nil {
 		t.Fatalf("Open: %v", err)
@@ -355,13 +355,32 @@ func TestOperatorSnapshotHoldsTheStateAtTheBarrier(t *testing.T) {
 }
 
 // TestSinkAcknowledgesWithAnEmptyPayload. A sink participates in the protocol
-// and commits nothing (invariant 4). Both halves are asserted: it is counted,
-// and what it recorded is empty.
+// and commits nothing at snapshot time (invariant 4). Both halves are asserted:
+// it is counted, and what it recorded is what its Snapshot wrote -- empty, for
+// sinks.Collect, which holds its records in memory and has nothing to stage.
+//
+// The upstream acknowledgements go in BEFORE the sink runs, and that ordering
+// is the job's rather than the test's convenience. A barrier reaches a sink
+// only after every source injected it and every operator forwarded it, and each
+// of those acknowledges before it passes the barrier on -- so the last
+// acknowledgement of a checkpoint is always a sink's, and the checkpoint
+// completes inside it. Acknowledging afterwards, as this test used to, is a
+// shape no job produces: the sink waits at end of stream for a checkpoint that
+// only the test can settle, and the test waits for the sink.
 func TestSinkAcknowledgesWithAnEmptyPayload(t *testing.T) {
 	co, storage := newSnapshotCoordinator(t, 100)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	for _, key := range []checkpoint.SubtaskKey{{VertexID: "src"}, {VertexID: "op"}} {
+		if err := co.Acknowledge(1, key, nil); err != nil {
+			t.Fatalf("Acknowledge(%s): %v", key, err)
+		}
+	}
+	if co.Completed(1) {
+		t.Fatal("the checkpoint completed before the sink acknowledged: it is not being counted")
+	}
 
 	in := transport.NewChannel(16)
 	gate := NewGate(ctx, []transport.Input{in}, faults{})
@@ -385,11 +404,6 @@ func TestSinkAcknowledgesWithAnEmptyPayload(t *testing.T) {
 	}
 	gate.Wait()
 
-	for _, key := range []checkpoint.SubtaskKey{{VertexID: "src"}, {VertexID: "op"}} {
-		if err := co.Acknowledge(1, key, nil); err != nil {
-			t.Fatalf("Acknowledge(%s): %v", key, err)
-		}
-	}
 	if !co.Completed(1) {
 		t.Fatal("the checkpoint did not complete, so the sink did not acknowledge")
 	}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/AarinB1/tidemark/pkg/checkpoint"
+	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/runtime"
 	"github.com/AarinB1/tidemark/pkg/sinks"
 )
@@ -99,13 +100,29 @@ func faultySeeds(t *testing.T, n int) []int64 {
 
 // TestTheWorkloadReachesEveryCheckpoint.
 //
-// The schedule generator draws checkpoint IDs in 1..4 from the barrier
-// arithmetic, and a job that completed fewer than four would spend every
-// barrier fault above that on a checkpoint nobody reaches. Asserted against a
-// clean run, where nothing interferes.
+// The schedule generator draws checkpoint IDs in 1..maxCheckpoint from the
+// barrier arithmetic, and a job that completed fewer would spend every barrier
+// fault above that on a checkpoint nobody reaches. Asserted against a clean
+// run, where nothing interferes.
+//
+// The bound is taken from barriersPerSubtask, which is the function sitesOf
+// bounds the draw with, rather than written out as a literal. A literal is a
+// restatement of the arithmetic and drifts from it silently: this test held the
+// number four, correct at a barrier interval of 500, and the only thing that
+// noticed when the interval moved was the test itself failing with a number it
+// could have computed. What is being asserted is that the RUN reaches what the
+// GENERATOR aims at, and that comparison is only meaningful when one side is
+// measured and the other is the generator's own arithmetic.
 func TestTheWorkloadReachesEveryCheckpoint(t *testing.T) {
-	ids := cleanRunCheckpoints(t)
-	if want := int64(4); ids != want {
+	// Both sources inject the same number of barriers by construction; see the
+	// note on barrierIntervalA. The generator takes the maximum over the source
+	// vertices, so either one produces it.
+	want := barriersPerSubtask(sourceACount, jobParallelism, barrierIntervalA)
+	if other := barriersPerSubtask(sourceBCount, jobParallelism, barrierIntervalB); other != want {
+		t.Fatalf("srcA injects %d barriers a subtask and srcB injects %d: checkpoint k names a "+
+			"different depth on each input and the alignment windows stop lining up", want, other)
+	}
+	if ids := cleanRunCheckpoints(t); ids != want {
 		t.Errorf("a clean run completed checkpoint %d as its last, want %d: "+
 			"the schedule generator draws barrier faults it cannot land", ids, want)
 	}
@@ -133,7 +150,7 @@ func cleanRunCheckpoints(t *testing.T) int64 {
 	t.Helper()
 	root := t.TempDir()
 	if err := runtime.RunWithOptions(context.Background(),
-		jobGraph(sinks.NewCollect(), &windowFactory{}),
+		jobGraph(func() core.Sink { return sinks.NewCollect() }, &windowFactory{}),
 		runtime.Options{CheckpointRoot: root, Seed: 1}); err != nil {
 		t.Fatalf("the clean run failed: %v", err)
 	}
@@ -153,7 +170,7 @@ func cleanRunCheckpointIDs(t *testing.T) (*checkpoint.Storage, []int64) {
 	t.Helper()
 	root := t.TempDir()
 	if err := runtime.RunWithOptions(context.Background(),
-		jobGraph(sinks.NewCollect(), &windowFactory{}),
+		jobGraph(func() core.Sink { return sinks.NewCollect() }, &windowFactory{}),
 		runtime.Options{CheckpointRoot: root, Seed: 1}); err != nil {
 		t.Fatalf("the clean run failed: %v", err)
 	}

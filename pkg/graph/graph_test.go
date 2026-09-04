@@ -32,9 +32,11 @@ func (nopOperator) Close() error                                    { return nil
 
 type nopSink struct{}
 
-func (nopSink) Open(core.Context) error  { return nil }
-func (nopSink) Write(*core.Record) error { return nil }
-func (nopSink) Close() error             { return nil }
+func (nopSink) Open(core.Context) error              { return nil }
+func (nopSink) Write(*core.Record) error             { return nil }
+func (nopSink) Snapshot(io.Writer) error             { return nil }
+func (nopSink) NotifyCheckpointComplete(int64) error { return nil }
+func (nopSink) Close() error                         { return nil }
 
 // helperInterval is what the source helper below sets for both per-source
 // intervals. A source vertex must state a positive value for each, so a helper

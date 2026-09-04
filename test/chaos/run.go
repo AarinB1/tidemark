@@ -26,7 +26,7 @@ import (
 // # Why the lengths differ
 //
 // srcA covers its whole range in two thousand elements per subtask while srcB
-// needs eight thousand for its. Both inject four barriers, so srcA reaches
+// needs eight thousand for its. Both inject eight barriers, so srcA reaches
 // barrier k roughly four times as early in the stream as srcB does, and the
 // gate holds srcA's barrier for thousands of srcB elements waiting for the
 // matching one. That gap is the alignment window, and it is measured in
@@ -58,12 +58,40 @@ const (
 	sourceACount = 4000
 	sourceBCount = 16000
 	// Scaled against the range lengths so both vertices inject the same NUMBER
-	// of barriers: 2000/500 and 8000/2000 are both four. A vertex injecting
+	// of barriers: 2000/250 and 8000/1000 are both eight. A vertex injecting
 	// more barriers than another is not wrong, but it makes "checkpoint k" mean
 	// a different depth on each input and the alignment windows stop lining up
 	// with the schedule's checkpoint IDs.
-	barrierIntervalA = 500
-	barrierIntervalB = 2000
+	//
+	// # Why eight and not four
+	//
+	// Phase 4 ran these at 500 and 2000, four barriers a subtask, and the
+	// census that came out of it said the suite was weaker than its schedule
+	// count: 359 of 661 resumes restarted from ZERO because the fault fired
+	// before any checkpoint had completed, and a run that restarts from zero
+	// exercises replay rather than restore. Phase 5's exactly-once claim is
+	// about what restore commits, so a suite that reaches restore in fewer than
+	// half its resumes is validating the wrong half of the property.
+	//
+	// Halving both intervals halves the distance to the first complete
+	// checkpoint without touching the record count, the parallelism, the keys
+	// or the window size -- so the oracle's answer, the alignment skew and the
+	// state the operator holds are all the workload Phase 4 measured. What
+	// moves is where the cuts fall. Measured over three 500-seed runs and three
+	// 25-seed ones: resumes from a real checkpoint 45.7% -> 65.3-69.3%, and
+	// schedules recovering from a cut that held a complete but unfired window
+	// 47.4% -> 58.6-61.4%.
+	//
+	// The cost is fsyncs. Twice the barriers is twice the checkpoints and twice
+	// the state files, which is about twenty per cent on the 500-seed target
+	// (41s -> 48-53s) and about seven per cent on the 25-seed subset `make
+	// check` runs under the race detector. Quartering them instead was measured
+	// too and buys more (85.8% of resumes from a checkpoint) at ninety per cent
+	// more wall clock, and it moves the flush fraction out of the timing
+	// baseline this workload has been held to since Phase 4 -- which would mean
+	// re-committing a figure whose value is that it has not moved.
+	barrierIntervalA = 250
+	barrierIntervalB = 1000
 
 	// maxRecoveries bounds how many times one schedule is resumed.
 	//
@@ -132,15 +160,22 @@ func (f *windowFactory) dropped() int64 {
 	return total
 }
 
-// jobGraph is the workload as a graph writing into sink.
-func jobGraph(sink core.Sink, f *windowFactory) *graph.Graph {
+// jobGraph is the workload as a graph whose sink subtasks come from newSink.
+//
+// A FACTORY and not a sink. Phase 4 handed one sinks.Collect to every subtask,
+// which is right for a sink that locks and holds a slice; it is wrong for
+// sinks.Transactional, which owns a file handle and an epoch counter. Several
+// goroutines sharing one would write into a single staging file and commit it
+// under a single name, so half the output would disappear -- and the visible
+// symptom is a short write from inside bufio rather than anything about
+// correctness. Transactional refuses a second Open for that reason.
+func jobGraph(newSink func() core.Sink, f *windowFactory) *graph.Graph {
 	g := graph.New()
 	vertices := []graph.Vertex{
 		sourceVertex("srcA", sourceAConfig(), barrierIntervalA),
 		sourceVertex("srcB", sourceBConfig(), barrierIntervalB),
 		{ID: "window", Kind: graph.VertexOperator, Parallelism: jobParallelism, NewOperator: f.newOperator},
-		{ID: "out", Kind: graph.VertexSink, Parallelism: jobParallelism,
-			NewSink: func() core.Sink { return sink }},
+		{ID: "out", Kind: graph.VertexSink, Parallelism: jobParallelism, NewSink: newSink},
 	}
 	for _, v := range vertices {
 		if err := g.AddVertex(v); err != nil {
@@ -174,7 +209,7 @@ func sourceVertex(id string, cfg sources.GeneratorConfig, barrierInterval int64)
 // -- which the census would report as a miss and which looks exactly like the
 // interesting kind of miss.
 var scheduleGraphOnce = sync.OnceValue(func() *graph.Graph {
-	return jobGraph(sinks.NewDiscard(), &windowFactory{})
+	return jobGraph(func() core.Sink { return sinks.NewDiscard() }, &windowFactory{})
 })
 
 // oracleCounts is the batch answer for this workload.
@@ -223,24 +258,31 @@ type Result struct {
 // faults, resumed from the last complete checkpoint after each abort, until it
 // finishes. Both sinks are compared against the oracle.
 //
-// # Contents, never order
+// # What is compared, and where it is read from
 //
-// Delivery is at-least-once. There is no transactional sink in this phase, so
-// every window the aborted run fired after the checkpoint is fired again by the
-// resumed one, and the order records reach the sink after a recovery differs
-// from a clean run for reasons that have nothing to do with correctness. What
-// is compared is the SORTED contents, with the duplicates collapsed -- and the
-// duplicates having to AGREE is the real assertion, because a partial recount,
-// a double count, or a window reopened against a stale watermark all show up
-// as two different counts under one (key, window).
+// COMMITTED FILES, through sinks.ReadCommitted, and never an in-memory slice.
+// That is what makes the exactly-once claim mean something: the comparison runs
+// against files that survived a crash rather than against a slice that was
+// never at risk. A staging file is not output and is never read as one.
 //
-// # One sink across the aborted run and its recoveries
+// Sorted contents, never emission order. Ordering after a recovery differs from
+// a clean run for reasons that have nothing to do with correctness.
 //
-// A sink is external and durable: it does not forget what an aborted run wrote
-// to it. Handing each attempt a fresh sink would measure recovery against a
-// sink that conveniently lost the evidence of double delivery, which on a
-// window operator that emits as its windows close is most of the evidence there
-// is.
+// Through Phase 4 the assertion was that duplicates AGREED, because delivery
+// was at-least-once and a recovered run re-fired every window the aborted one
+// had fired after the cut. It is now that there are NO duplicates. A window
+// fired after the cut was staged into an epoch above the checkpoint, and
+// restore discards those; the resumed run re-fires it into an epoch of its own
+// and commits it once. That is the whole of what this phase buys, and it is a
+// strictly stronger assertion than the one it replaces.
+//
+// # One output root across the aborted run and its recoveries
+//
+// A sink is external and durable: it does not forget what an aborted run
+// committed. Handing each attempt a fresh directory would measure recovery
+// against a sink that conveniently lost the evidence of double delivery, which
+// on a window operator that emits as its windows close is most of the evidence
+// there is.
 func RunSchedule(t *testing.T, seed int64) Result {
 	t.Helper()
 	faults := ScheduleFor(seed, scheduleGraphOnce())
@@ -252,21 +294,24 @@ func RunSchedule(t *testing.T, seed int64) Result {
 	// of the element stream whether or not anybody records snapshots.
 	cleanTally, cleanMeter := &firingTally{}, &stateMeter{}
 	cleanFactory := &windowFactory{tally: cleanTally}
-	cleanSink := sinks.NewCollect()
-	if err := runtime.RunWithOptions(context.Background(), jobGraph(cleanSink, cleanFactory),
+	cleanOutput := t.TempDir()
+	if err := runtime.RunWithOptions(context.Background(),
+		jobGraph(transactionalSinks(cleanOutput), cleanFactory),
 		runtime.Options{Seed: uint64(seed), NewState: cleanMeter.newState}); err != nil {
 		t.Fatalf("seed %d: the clean run failed: %v", seed, err)
 	}
 	res.CleanTiming = cleanTally.timing()
 	res.CleanTiming.PeakStateEntries = cleanMeter.peak.Load()
 	assertDroppedNothing(t, seed, cleanFactory, "clean run")
-	assertCleanRunFiredEachWindowOnce(t, seed, cleanSink)
-	assertMatchesOracle(t, seed, cleanSink, "clean run")
+	assertNothingLeftStaged(t, seed, cleanOutput)
+	cleanRows := committedRows(t, seed, cleanOutput, "clean run")
+	assertEachWindowCommittedOnce(t, seed, cleanRows, "clean run")
+	assertMatchesOracle(t, seed, cleanRows, "clean run")
 
 	// The fault run, and its recoveries.
 	inj := newInjector(faults)
 	root := t.TempDir()
-	sink := sinks.NewCollect()
+	output := t.TempDir()
 	restoreFrom := ""
 	for attempt := 0; ; attempt++ {
 		if attempt > maxRecoveries {
@@ -279,7 +324,7 @@ func RunSchedule(t *testing.T, seed int64) Result {
 		// were never held at once. Timing.add is where that distinction lives.
 		tally, meter := &firingTally{}, &stateMeter{}
 		f := &windowFactory{tally: tally}
-		err := runtime.RunWithOptions(context.Background(), jobGraph(sink, f), runtime.Options{
+		err := runtime.RunWithOptions(context.Background(), jobGraph(transactionalSinks(output), f), runtime.Options{
 			CheckpointRoot: root,
 			RestoreFrom:    restoreFrom,
 			Seed:           uint64(seed),
@@ -307,9 +352,98 @@ func RunSchedule(t *testing.T, seed int64) Result {
 		}
 	}
 
-	assertMatchesOracle(t, seed, sink, "fault run")
+	// The staging check comes FIRST, and the order is not cosmetic. It is the
+	// more primitive fact -- a transaction nobody will ever commit -- and the
+	// oracle comparison ends the test with a Fatalf, so a suite that checked it
+	// second would report the symptom and never the cause. Seed 105 was
+	// diagnosed the long way for exactly that reason.
+	assertNothingLeftStaged(t, seed, output)
+	faultRows := committedRows(t, seed, output, "fault run")
+	assertEachWindowCommittedOnce(t, seed, faultRows, "fault run")
+	assertMatchesOracle(t, seed, faultRows, "fault run")
 	res.Outcomes = inj.outcomes()
 	return res
+}
+
+// transactionalSinks is the factory jobGraph is handed: one sink per subtask,
+// all under one output root.
+func transactionalSinks(root string) func() core.Sink {
+	return func() core.Sink { return sinks.NewTransactional(root) }
+}
+
+// committedRows decodes what a run COMMITTED, keeping every row for a
+// (key, window) rather than one.
+//
+// Read from the committed directory and nowhere else. A staging file belongs to
+// an epoch no checkpoint vouched for: its records are replayable, so a
+// comparison that counted them would count records the recovered run produces
+// again.
+//
+// The window start is DERIVED and not read. The operator stamps a fired window
+// with its end-1, so the start is EventTime-(size-1); reading EventTime as a
+// start would shift every expectation by size-1 and leave every row still
+// looking plausible.
+func committedRows(t *testing.T, seed int64, root, label string) map[oracle.Key][]int64 {
+	t.Helper()
+	recs, err := sinks.ReadCommitted(root)
+	if err != nil {
+		t.Fatalf("seed %d: %s: reading the committed output: %v", seed, label, err)
+	}
+	out := make(map[oracle.Key][]int64)
+	for _, rec := range recs {
+		count, err := operators.DecodeCount(rec.Value)
+		if err != nil {
+			t.Fatalf("seed %d: %s: the committed output holds a value that is not a count: %v",
+				seed, label, err)
+		}
+		k := oracle.Key{Key: string(rec.Key), WindowStart: rec.EventTime - (windowSize - 1)}
+		out[k] = append(out[k], count)
+	}
+	return out
+}
+
+// assertEachWindowCommittedOnce is the exactly-once claim.
+//
+// Every (key, window) appears in the committed output exactly once, on a
+// recovered run as much as on a clean one. Through Phase 4 this could only be
+// asserted of the clean run: delivery was at-least-once, so a recovered run
+// re-fired every window the aborted one had fired after the cut and the
+// comparison had to collapse duplicates. It no longer does, and this is the
+// assertion that says so.
+//
+// A window fired after the cut was staged into an epoch above the checkpoint
+// being resumed from, and restore discards those; the resumed run re-fires it
+// into an epoch of its own and commits it once. Committing at snapshot time
+// instead -- invariant 4 removed -- puts the aborted run's copy in committed/
+// as well, and shows up here as a (key, window) with two rows.
+func assertEachWindowCommittedOnce(t *testing.T, seed int64, rows map[oracle.Key][]int64, label string) {
+	t.Helper()
+	for k, counts := range rows {
+		if len(counts) != 1 {
+			t.Fatalf("seed %d: %s: key %x window %d is committed %d times with counts %v; "+
+				"committed output is exactly once, so a second copy is a transaction that was "+
+				"committed and then produced again", seed, label, k.Key, k.WindowStart, len(counts), counts)
+		}
+	}
+}
+
+// assertNothingLeftStaged.
+//
+// A run that finished committed every epoch: the ones a checkpoint covered, on
+// its notification, and the one after the last barrier, because the job
+// succeeded. A staging file surviving all of that is a transaction nobody will
+// ever commit -- records that are simply absent from the output, which the
+// oracle comparison catches only if no other copy of that (key, window) exists.
+func assertNothingLeftStaged(t *testing.T, seed int64, root string) {
+	t.Helper()
+	staged, err := sinks.StagingFiles(root)
+	if err != nil {
+		t.Fatalf("seed %d: reading the staging directory: %v", seed, err)
+	}
+	if len(staged) != 0 {
+		t.Errorf("seed %d: the run finished and %v are still staged: every epoch is either covered "+
+			"by a checkpoint that completed or is the final one", seed, staged)
+	}
 }
 
 // recoveryPoint describes where the next attempt will resume from, and counts
@@ -362,74 +496,26 @@ func assertDroppedNothing(t *testing.T, seed int64, f *windowFactory, label stri
 	}
 }
 
-// windowRows decodes what a job wrote into a sink, keeping EVERY row for a
-// (key, window) rather than one.
-//
-// The window start is DERIVED and not read. The operator stamps a fired window
-// with its end-1, so the start is EventTime-(size-1); reading EventTime as a
-// start would shift every expectation by size-1 and leave every row still
-// looking plausible.
-func windowRows(t *testing.T, recs []*core.Record) map[oracle.Key][]int64 {
+// assertMatchesOracle compares committed output against the batch oracle.
+func assertMatchesOracle(t *testing.T, seed int64, got map[oracle.Key][]int64, label string) {
 	t.Helper()
-	out := make(map[oracle.Key][]int64)
-	for _, rec := range recs {
-		count, err := operators.DecodeCount(rec.Value)
-		if err != nil {
-			t.Fatalf("the sink holds a value that is not a count: %v", err)
-		}
-		k := oracle.Key{Key: string(rec.Key), WindowStart: rec.EventTime - (windowSize - 1)}
-		out[k] = append(out[k], count)
-	}
-	return out
-}
-
-// assertCleanRunFiredEachWindowOnce.
-//
-// A run with no fault has nothing to replay, so every (key, window) reaches the
-// sink exactly once. It is asserted separately from the oracle comparison
-// because the comparison collapses duplicates by design -- it has to, for the
-// recovered runs -- and would therefore pass on a clean run that emitted every
-// window twice.
-func assertCleanRunFiredEachWindowOnce(t *testing.T, seed int64, sink *sinks.Collect) {
-	t.Helper()
-	for k, counts := range windowRows(t, sink.Records()) {
-		if len(counts) != 1 {
-			t.Fatalf("seed %d: the clean run emitted key %x window %d %d times with counts %v; nothing was replayed",
-				seed, k.Key, k.WindowStart, len(counts), counts)
-		}
-	}
-}
-
-// assertMatchesOracle compares a sink against the batch oracle.
-func assertMatchesOracle(t *testing.T, seed int64, sink *sinks.Collect, label string) {
-	t.Helper()
-	got := windowRows(t, sink.Records())
 	want := oracleCounts()
 
-	// Every duplicate of a (key, window) carries the same count. This is the
-	// assertion the at-least-once sink makes possible rather than the one it
-	// costs: a replay that was not exact shows up here as two numbers.
 	collapsed := make(map[oracle.Key]int64, len(got))
 	for k, counts := range got {
-		for _, c := range counts[1:] {
-			if c != counts[0] {
-				t.Fatalf("seed %d: %s: key %x window %d was emitted with counts %v: the replay was not exact",
-					seed, label, k.Key, k.WindowStart, counts)
-			}
-		}
 		collapsed[k] = counts[0]
 	}
 
 	if len(collapsed) != len(want) {
-		t.Errorf("seed %d: %s: the sink holds %d (key, window) rows, want %d",
+		t.Errorf("seed %d: %s: the committed output holds %d (key, window) rows, want %d",
 			seed, label, len(collapsed), len(want))
 	}
 	for _, tr := range oracle.Sorted(want) {
 		k := oracle.Key{Key: tr.Key, WindowStart: tr.WindowStart}
 		gotCount, ok := collapsed[k]
 		if !ok {
-			t.Fatalf("seed %d: %s: the sink is missing key %x window %d, which the oracle counts at %d",
-				seed, label, tr.Key, tr.WindowStart, tr.Count)
+			t.Fatalf("seed %d: %s: the committed output is missing key %x window %d, which the "+
+				"oracle counts at %d", seed, label, tr.Key, tr.WindowStart, tr.Count)
 		}
 		if gotCount != tr.Count {
 			t.Fatalf("seed %d: %s: key %x window %d counted %d, want %d",
@@ -438,8 +524,8 @@ func assertMatchesOracle(t *testing.T, seed int64, sink *sinks.Collect, label st
 	}
 	for k := range collapsed {
 		if _, ok := want[k]; !ok {
-			t.Fatalf("seed %d: %s: the sink holds key %x window %d, which the input does not produce",
-				seed, label, k.Key, k.WindowStart)
+			t.Fatalf("seed %d: %s: the committed output holds key %x window %d, which the input "+
+				"does not produce", seed, label, k.Key, k.WindowStart)
 		}
 	}
 }
