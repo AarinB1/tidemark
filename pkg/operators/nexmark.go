@@ -618,3 +618,496 @@ func purgeWindows(st state.KeyedState, purged func(windowStart int64) bool) erro
 	})
 	return err
 }
+
+// ---------------------------------------------------------------------------
+// q5: hot items. Two event-time stages.
+// ---------------------------------------------------------------------------
+
+// The shape of q5, written down here because it is four vertices and no one of
+// them says what the query is:
+//
+//	source -> NewBidsOnly()               a Map: keeps the bids
+//	       -> NewSlidingCount(size,slide) stage 1: bids per (auction, window)
+//	       -> NewQ5Rekey(size)            a Map: re-keys onto the window
+//	       -> NewQ5HotItems(size,late)    stage 2: the auctions at the maximum
+//	       -> sink
+//
+// # Why the filter is its own vertex here and inside the operator elsewhere
+//
+// q1, q2 and q7 drop the non-bid events inside themselves, because each of them
+// has to decode the value anyway and a separate vertex would decode every event
+// twice with a shuffle in between. Stage 1 is operators.WindowCount, which
+// counts records WITHOUT looking at them: it cannot do the filtering, and a
+// person event reaching it would open a window keyed on a person id -- a row
+// the oracle does not have, on a key nothing will ever bid on. So the filter
+// gets its own vertex, and only here.
+//
+// # Why the re-key is its own vertex
+//
+// Stage 2 groups by WINDOW, and a record's key is what the shuffle partitions
+// on, so stage 1's output has to carry the window as its key by the time it
+// crosses the edge into stage 2. An operator's emitted key is what the writer
+// behind it partitions on, so the change has to happen in the vertex BEFORE
+// that edge -- which is what this Map is. Doing it inside stage 2 would be too
+// late: the record would already have been sent to whichever subtask the
+// auction id chose, and each subtask would compute the maximum of its own share
+// of the window with nothing to say it had.
+//
+// # Why stage 1's emission is at end-1, and why that is load-bearing here
+//
+// WindowCount stamps a fired window with its END-1 rather than its start. Until
+// Phase 3c it did not, and this is the first pipeline where the difference is
+// reachable: a watermark w that fires the window [start, end) has already gone
+// past start, so a record stamped with start arrives at stage 2 behind a
+// watermark that has already been forwarded, and stage 2 -- which has a
+// lateness rule -- would see the ENTIRE upstream output as late and drop all of
+// it. The output would be empty, with no error anywhere, and it would look like
+// a windowing bug in stage 2.
+//
+// Stage 2 counts what it accepts as well as what it drops for that reason; see
+// HotItems.OnTime.
+
+// NewBidsOnly returns a Map keeping the bid events and dropping the rest.
+//
+// A Map and not a Filter for the reason at the top of this file: the type
+// discriminator has to be read out of the value, and a value that does not
+// decode is a layout disagreement rather than an event of the wrong type. A
+// predicate cannot tell the two apart.
+//
+// The record is forwarded as it arrived rather than rebuilt. This vertex
+// selects; a rebuilt record would be a second encoding of one event.
+func NewBidsOnly() *Map {
+	return NewMap(func(rec *core.Record) (*core.Record, error) {
+		typ, err := sources.NexmarkTypeOf(rec.Value)
+		if err != nil {
+			return nil, fmt.Errorf("operators: q5: %w", err)
+		}
+		if typ != sources.EventBid {
+			return nil, nil
+		}
+		return rec, nil
+	})
+}
+
+// auctionCountBytes is the width of a stage-1 output value.
+const auctionCountBytes = 16
+
+// AuctionCount is what stage 1 hands stage 2: one auction's bid count in one
+// window.
+//
+// The auction moves from the KEY into the VALUE, because the key becomes the
+// window. Nothing is lost and nothing is duplicated: after the re-key the
+// record says (window, auction, count) with the window in the key and the
+// other two in the value.
+type AuctionCount struct {
+	Auction uint64
+	Count   int64
+}
+
+// EncodeAuctionCount renders ac as sixteen bytes: the auction then the count,
+// both big-endian.
+func EncodeAuctionCount(ac AuctionCount) []byte {
+	var buf [auctionCountBytes]byte
+	binary.BigEndian.PutUint64(buf[0:8], ac.Auction)
+	binary.BigEndian.PutUint64(buf[8:16], uint64(ac.Count))
+	return buf[:]
+}
+
+// DecodeAuctionCount reads a value written by the re-key.
+//
+// Exactly sixteen bytes, not at least: only the re-key writes these, so another
+// length means the layout and the code have come apart, and reading the first
+// sixteen bytes of something else would produce two plausible numbers.
+func DecodeAuctionCount(value []byte) (AuctionCount, error) {
+	if len(value) != auctionCountBytes {
+		return AuctionCount{}, fmt.Errorf("operators: q5: an auction count is %d bytes, want %d",
+			len(value), auctionCountBytes)
+	}
+	return AuctionCount{
+		Auction: binary.BigEndian.Uint64(value[0:8]),
+		Count:   int64(binary.BigEndian.Uint64(value[8:16])),
+	}, nil
+}
+
+// WindowKey renders a window start as the eight big-endian bytes stage 2 is
+// keyed on.
+//
+// Big-endian and fixed width so that every one of a window's counts hashes to
+// one subtask and so that stage 2's composite state keys split unambiguously.
+// It is the same shape a Nexmark id key has, and deliberately so: the engine
+// has one key encoding.
+func WindowKey(windowStart int64) []byte {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(windowStart))
+	return buf[:]
+}
+
+// WindowKeyStart reads a window start back out of a stage-2 key.
+func WindowKeyStart(key []byte) (int64, error) {
+	if len(key) != 8 {
+		return 0, fmt.Errorf("operators: q5: a window key is %d bytes, want 8", len(key))
+	}
+	return int64(binary.BigEndian.Uint64(key)), nil
+}
+
+// NewQ5Rekey returns the Map between q5's two stages: it moves the auction out
+// of the key and the window in.
+//
+// size is the sliding window size stage 1 was built with, and it is how the
+// window start is recovered: a fired window carries its END-1, so the start is
+// EventTime-(size-1). Nothing is lost by that -- every reader already knows the
+// size it asked for -- but the two do have to agree, and a mismatch here is
+// silent: it would shift every window by a constant and every row would still
+// look plausible. Stage 2 checks the agreement rather than trusting it; see
+// HotItems.ProcessElement.
+//
+// The event time is untouched. It is still the window's end-1, which is exactly
+// the watermark that completes the window, so stage 2 receives its input ahead
+// of the watermark that releases it rather than behind it.
+func NewQ5Rekey(size int64) *Map {
+	if size <= 0 {
+		panic(fmt.Sprintf("operators: NewQ5Rekey: size is %d, must be > 0", size))
+	}
+	return NewMap(func(rec *core.Record) (*core.Record, error) {
+		auction, err := sources.NexmarkKeyID(rec.Key)
+		if err != nil {
+			return nil, fmt.Errorf("operators: q5 re-key: %w", err)
+		}
+		count, err := DecodeCount(rec.Value)
+		if err != nil {
+			return nil, fmt.Errorf("operators: q5 re-key: %w", err)
+		}
+		return &core.Record{
+			Key:       WindowKey(subFloor(rec.EventTime, size-1)),
+			Value:     EncodeAuctionCount(AuctionCount{Auction: auction, Count: count}),
+			EventTime: rec.EventTime,
+		}, nil
+	})
+}
+
+// HotItems is q5's second stage: per window, the auctions with the highest bid
+// count.
+//
+// ALL of the auctions attaining the maximum, not one of them. That is Nexmark's
+// own semantic -- "num >= ALL" -- and it is what makes a tie deterministic
+// without a rule to break it with: a tie is several output rows, and the set of
+// rows is what the sink is compared on. Within one window the rows come out in
+// ascending AUCTION order, which is not arranged by a sort but falls out of the
+// state layout below; see ProcessWatermark.
+//
+// # State layout
+//
+// Aggregates, under state.PrefixUserState:
+//
+//	key    state.PrefixUserState, then the eight-byte window key, then the
+//	       auction as a big-endian uint64
+//	value  the count as a big-endian int64, eight bytes
+//
+// Both fields after the discriminator are fixed width, so the split is by
+// offset and needs no separator. The window key leads, so one window's counts
+// are a contiguous run in ascending byte order and the auctions within it are
+// ascending too -- which is where the emission order comes from.
+//
+// Timers, under state.PrefixTimer, in the layout WindowCount and q7 use:
+//
+//	key    state.PrefixTimer, then the fire time as state.EncodeOrderedInt64,
+//	       then the window key, then the window start as a big-endian int64
+//	value  empty
+//
+// The window key and the trailing window start are the same number written
+// twice, which is redundant and is kept anyway: there is then ONE timer layout
+// in this package rather than three, and the chaos census parses that layout
+// from outside pkg/operators. Eight bytes per open window is the price.
+//
+// The current watermark, under state.PrefixOperatorState:
+//
+//	key    state.PrefixOperatorState, then the name "watermark"
+//	value  the watermark as state.EncodeOrderedInt64
+//
+// # The watermark, which is the trap this stage exists to walk past
+//
+// This operator has a lateness rule, and core.Context.CurrentWatermark() is
+// sitting right there looking like the obvious source for it. It is NOT
+// restored across a checkpoint: a recovered operator would read the runtime's
+// initial minimum, conclude that nothing had been purged, accept records it
+// should be dropping, and re-emit a (window, auction) the sink already holds.
+// So the watermark lives in this operator's own KeyedState, exactly as
+// WindowCount's does, and nothing in this file calls CurrentWatermark. See
+// TestNoOperatorReadsTheWatermarkFromTheContext, which is what watches this.
+type HotItems struct {
+	size            int64
+	allowedLateness int64
+
+	state  state.KeyedState
+	keyBuf []byte
+
+	// dropped counts stage-1 records discarded as late, and onTime counts the
+	// ones accepted. Both are on the Go struct rather than in state, for the
+	// reason WindowCount.dropped is.
+	//
+	// onTime is not decoration. Stage 2 seeing its whole input as late produces
+	// EMPTY output and no error, which reads as a windowing bug; a test that
+	// only asserted "nothing was dropped" would pass against a stage that
+	// received nothing at all. The pair is what makes that assertion mean
+	// something.
+	dropped int64
+	onTime  int64
+}
+
+var _ core.Operator = (*HotItems)(nil)
+
+// hotItemKeyBytes is the width of a stage-2 aggregate key: the discriminator,
+// the window key and the auction.
+const hotItemKeyBytes = prefixBytes + 8 + 8
+
+// NewQ5HotItems returns q5's second stage over windows of size millis, keeping
+// fired windows open for allowedLateness millis past their end.
+//
+// size is the SAME size stage 1 and the re-key were built with. This operator
+// could avoid knowing it -- the fire time is the event time its input carries
+// -- and takes it anyway so that it can CHECK the agreement: a window key and
+// an event time that do not correspond is a mis-wired pipeline, and the symptom
+// without the check is every window shifted by a constant with every row still
+// looking plausible.
+//
+// A bad specification panics rather than returning an error, for the reason
+// NewSlidingCount panics.
+func NewQ5HotItems(size, allowedLateness int64) *HotItems {
+	switch {
+	case size <= 0:
+		panic(fmt.Sprintf("operators: NewQ5HotItems: size is %d, must be > 0", size))
+	case allowedLateness < 0:
+		panic(fmt.Sprintf("operators: NewQ5HotItems: allowedLateness is %d, must be >= 0", allowedLateness))
+	}
+	return &HotItems{size: size, allowedLateness: allowedLateness}
+}
+
+// Open takes the subtask's keyed state, refusing a nil one.
+func (h *HotItems) Open(ctx core.Context) error {
+	h.state = ctx.State()
+	if h.state == nil {
+		return errors.New("operators: q5 stage 2: the runtime provided no keyed state")
+	}
+	return nil
+}
+
+// Dropped returns the number of stage-1 records discarded as late.
+func (h *HotItems) Dropped() int64 { return h.dropped }
+
+// OnTime returns the number of stage-1 records accepted into a window.
+//
+// The number that says stage 2 is doing anything at all. See the note on the
+// struct: an all-late stage 2 emits nothing and reports nothing.
+func (h *HotItems) OnTime() int64 { return h.onTime }
+
+// appendHotItemKey appends the composite AGGREGATE key for (windowKey,
+// auction). See the layout on HotItems:
+//
+//	state.PrefixUserState || windowKey, 8 bytes || auction, big-endian uint64
+//
+// parseHotItemKey is directly below and is its inverse. Both fields are fixed
+// width, so the split is by offset; change one and the other stops being its
+// inverse, which is why they are adjacent.
+func appendHotItemKey(dst []byte, windowKey []byte, auction uint64) []byte {
+	dst = append(dst, state.PrefixUserState)
+	dst = append(dst, windowKey...)
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], auction)
+	return append(dst, buf[:]...)
+}
+
+// parseHotItemKey splits an aggregate key back into its two fields. The
+// returned window key ALIASES stateKey.
+func parseHotItemKey(stateKey []byte) (windowKey []byte, auction uint64, err error) {
+	if len(stateKey) != hotItemKeyBytes {
+		return nil, 0, fmt.Errorf("operators: q5 stage 2: a state key is %d bytes, want %d",
+			len(stateKey), hotItemKeyBytes)
+	}
+	return stateKey[prefixBytes : prefixBytes+8], binary.BigEndian.Uint64(stateKey[prefixBytes+8:]), nil
+}
+
+// fireTimeOf returns the watermark at which the window starting at start is
+// complete, which is its end-1, saturating.
+func (h *HotItems) fireTimeOf(start int64) int64 { return addCeil(start, h.size-1) }
+
+// isPurged reports whether the window starting at start is past its allowed
+// lateness at watermark. The same expression WindowCount and q7 use, so that a
+// dropped record cannot resurrect a window that has already been reported.
+func (h *HotItems) isPurged(watermark, start int64) bool {
+	return watermark > addCeil(addCeil(start, h.size), h.allowedLateness)
+}
+
+// ProcessElement folds one stage-1 count into its window and arms the window's
+// timer.
+//
+// The record's KEY is the window and its VALUE is (auction, count). Its event
+// time is the window's end-1, which is checked against the key rather than
+// trusted: the two are the same window said twice, and a pipeline whose re-key
+// was built with a different size than this stage would otherwise shift every
+// window by a constant with nothing to point at.
+func (h *HotItems) ProcessElement(rec *core.Record, ctx core.Context) error {
+	windowStart, err := WindowKeyStart(rec.Key)
+	if err != nil {
+		return err
+	}
+	if want := h.fireTimeOf(windowStart); rec.EventTime != want {
+		return fmt.Errorf("operators: q5 stage 2: a record keyed on window %d carries event time %d, "+
+			"but a window of size %d completes at %d: the re-key and this stage disagree about the size",
+			windowStart, rec.EventTime, h.size, want)
+	}
+	ac, err := DecodeAuctionCount(rec.Value)
+	if err != nil {
+		return err
+	}
+
+	watermark, err := loadWatermark(h.state)
+	if err != nil {
+		return fmt.Errorf("operators: q5 stage 2: %w", err)
+	}
+	if h.isPurged(watermark, windowStart) {
+		h.dropped++
+		return nil
+	}
+	h.onTime++
+
+	// Replaced, not accumulated. Stage 1 emits one record per (auction,
+	// window) when that window fires, so a second record for the same pair is
+	// a RE-FIRE carrying the updated count rather than an increment to add.
+	// Adding would double the count of any window stage 1 re-fired.
+	h.keyBuf = appendHotItemKey(h.keyBuf[:0], rec.Key, ac.Auction)
+	h.state.Put(h.keyBuf, encodeCount(ac.Count))
+
+	// Armed on every record; the key is a function of (fireTime, window) so
+	// writing it again is idempotent.
+	h.keyBuf = appendTimerKey(h.keyBuf[:0], rec.EventTime, rec.Key, windowStart)
+	h.state.Put(h.keyBuf, nil)
+	return nil
+}
+
+// hotWindow is one due window's running maximum, built during the single scan
+// ProcessWatermark makes.
+type hotWindow struct {
+	max int64
+	// winners are the auctions at max, in the order the scan met them, which
+	// is ascending. See ProcessWatermark.
+	winners []uint64
+}
+
+// ProcessWatermark fires every window the watermark completes, then purges the
+// ones it puts out of reach.
+//
+// # One scan, not one per window
+//
+// The due timers are collected first, then ONE pass over the aggregate
+// partition finds every due window's maximum together. A scan per firing window
+// would be O(windows fired * aggregates held) on a watermark that completes
+// several windows, which a sliding specification does routinely.
+//
+// That pass runs in ascending byte order, and the aggregate key is
+// (window, auction), so a window's counts arrive contiguously with the auctions
+// ascending. The winners of a tie therefore come out in ascending auction order
+// with nothing sorted: the order is a property of the layout, which is worth
+// stating because it is no longer visible as code.
+//
+// # Collect, then fire
+//
+// Firing happens after both scans have ENDED. fire reads and Put writes keys
+// OTHER than the one a callback was handed, and KeyedState.Iterate leaves that
+// undefined precisely because the two backends disagree: Memory looks each key
+// up again as it reaches it, Pebble reads a view fixed when the scan began.
+func (h *HotItems) ProcessWatermark(wm int64, ctx core.Context) error {
+	storeWatermark(h.state, wm)
+	due, err := collectDue(h.state, wm)
+	if err != nil {
+		return fmt.Errorf("operators: q5 stage 2: %w", err)
+	}
+	if len(due) == 0 {
+		return purgeWindows(h.state, func(start int64) bool { return h.isPurged(wm, start) })
+	}
+
+	// The due windows, by window key, so the scan below can recognise one in
+	// constant time.
+	windows := make(map[string]*hotWindow, len(due))
+	for _, t := range due {
+		windows[string(t.key)] = &hotWindow{}
+	}
+
+	var scanErr error
+	h.state.Iterate(func(stateKey, value []byte) bool {
+		if len(stateKey) == 0 {
+			scanErr = errors.New("operators: q5 stage 2: state holds a zero-length key")
+			return false
+		}
+		if stateKey[0] != state.PrefixUserState {
+			return false // past the aggregates
+		}
+		windowKey, auction, err := parseHotItemKey(stateKey)
+		if err != nil {
+			scanErr = err
+			return false
+		}
+		w, ok := windows[string(windowKey)]
+		if !ok {
+			return true // not firing on this watermark
+		}
+		count, err := DecodeCount(value)
+		if err != nil {
+			scanErr = fmt.Errorf("operators: q5 stage 2: auction %d: %w", auction, err)
+			return false
+		}
+		switch {
+		case len(w.winners) == 0 || count > w.max:
+			w.max = count
+			w.winners = append(w.winners[:0], auction)
+		case count == w.max:
+			w.winners = append(w.winners, auction)
+		}
+		return true
+	})
+	if scanErr != nil {
+		return scanErr
+	}
+
+	for _, t := range due {
+		// Deleted BEFORE emitting, so that anything arriving later re-arms the
+		// window rather than having its timer removed underneath.
+		h.state.Delete(t.stateKey)
+		w := windows[string(t.key)]
+		if len(w.winners) == 0 {
+			// Unreachable: the purge runs after this loop and only removes
+			// windows whose timers this call has already fired, so a due timer
+			// always has aggregates. Reported rather than passed over, because
+			// a window that silently produced no row is indistinguishable from
+			// a window with no bids.
+			return fmt.Errorf("operators: q5 stage 2: window %d fired with no counts", t.windowStart)
+		}
+		for _, auction := range w.winners {
+			ctx.Emit(&core.Record{
+				Key:       sources.NexmarkKey(auction),
+				Value:     encodeCount(w.max),
+				EventTime: h.fireTimeOf(t.windowStart),
+			})
+		}
+	}
+	return purgeWindows(h.state, func(start int64) bool { return h.isPurged(wm, start) })
+}
+
+// OnEndOfStream does nothing. The windows still open when the input runs out
+// are flushed by the gate's MaxInt64 watermark, which arrives immediately
+// before end-of-stream; flushing here as well would be a second mechanism for
+// one job.
+func (h *HotItems) OnEndOfStream(ctx core.Context) error { return nil }
+
+// Snapshot refuses rather than writing nothing: this operator's state is the
+// subtask's KeyedState, which pkg/checkpoint serialises directly, and a
+// zero-byte snapshot would be a claim that there is nothing to keep.
+func (h *HotItems) Snapshot(w io.Writer) error {
+	return errors.New("operators: q5 stage 2 cannot be snapshotted through core.Operator: its state is the subtask's KeyedState, which pkg/checkpoint serialises directly")
+}
+
+// Restore refuses for the same reason Snapshot does.
+func (h *HotItems) Restore(r io.Reader) error {
+	return errors.New("operators: q5 stage 2 cannot be restored through core.Operator: its state is the subtask's KeyedState, which the runtime restores directly")
+}
+
+func (h *HotItems) Close() error { return nil }
