@@ -44,6 +44,36 @@ var nexmarkSeeds = flag.Int("chaos.nexmark.seeds", 10,
 // has four operator vertices to q0's one, so it holds more state and its faults
 // have more places to be. Pooling the five would average that away and report a
 // number belonging to no workload.
+//
+// # Known limitation: q5 is covered on a weaker topology than q7 needs
+//
+// This suite runs every query on the two sources of nexSourceConfigs, whose
+// event-time ranges are DISJOINT, so no window is fed by more than one source
+// vertex. See the note on the workload in nexmark.go for the whole of the
+// reasoning; what matters here is that the constraint comes from q5 and applies
+// to the suite.
+//
+// q5's answer is a per-window maximum over auctions, and two per-source maxima
+// cannot be merged into the maximum over their union: the counts they were
+// selected from are gone by then, and test/oracle/nexmark.go does not expose
+// them. Separating the ranges makes the union exact. That reasoning is correct
+// and the separation is the right call.
+//
+// It is still a weaker shape than q7 would support. q7 merges across sources
+// trivially -- a fold under oracle.BetterBid, which needs nothing the oracle
+// withholds -- so q7 could have run on overlapping ranges, where a (auction,
+// window) pair is fed by both sources and the gate's minimum across four inputs
+// decides when it fires. The two share one workload, so q5's constraint sets
+// q7's topology too, and q7 pays for a limit that is not its own.
+//
+// What that leaves uncovered here, and where it IS covered: a windowed Nexmark
+// query recovering a window fed by two source vertices at once. The Phase 5
+// census suite overlaps its sources and exercises exactly that, on the
+// keyed-count workload rather than on q7. Lifting the limitation means widening
+// test/oracle/nexmark.go to expose q5's per-auction counts so two partial
+// answers can be merged; it is written down as a known limitation, not as an
+// oversight, so that a later phase that widens the oracle knows what to come
+// back for.
 func TestNexmarkChaosSuite(t *testing.T) {
 	requested := *nexmarkSeeds
 	if requested < 1 {
