@@ -63,6 +63,18 @@ func TestTimingSinkObservesOnlyItsFirstRecord(t *testing.T) {
 	}
 }
 
+// TestCheckpointParent pins that an empty --state-dir is the system temp
+// directory, the same contract as os.MkdirTemp. Fingerprinting Getwd instead
+// is how a tmpfs restore gets published as an NVMe number.
+func TestCheckpointParent(t *testing.T) {
+	if got := checkpointParent("/var/lib/tidemark"); got != "/var/lib/tidemark" {
+		t.Errorf("checkpointParent(%q) = %q", "/var/lib/tidemark", got)
+	}
+	if got := checkpointParent(""); got != os.TempDir() {
+		t.Errorf("empty --state-dir must be TempDir %q, got %q", os.TempDir(), got)
+	}
+}
+
 func TestProvisionalOn(t *testing.T) {
 	tests := []struct {
 		name string

@@ -46,7 +46,7 @@ type Fingerprint struct {
 	// varies minute to minute and would make a machine fail to match itself.
 	MemoryBytes int64 `json:"memory_bytes"`
 	// DiskRotational is "yes", "no" or "unknown" for the block device backing
-	// the working directory.
+	// the directory passed to machineFingerprint.
 	//
 	// A string and not a bool because there are three answers and the third one
 	// is common: a container on an overlay or tmpfs has an anonymous device
@@ -67,10 +67,10 @@ const (
 
 // machineFingerprint reads this machine, probing the device that backs dir.
 //
-// dir is the working directory rather than a constant, because that is where
-// checkpoints are written and it is the device whose latency the recovery
-// harness measures. A caller passing a path on another filesystem gets that
-// filesystem's answer, which is the honest one.
+// The recovery harness passes the directory checkpoints land in -- --state-dir,
+// or the system temp directory when that flag is empty -- because that is the
+// device whose latency it measures. A caller passing a path on another
+// filesystem gets that filesystem's answer, which is the honest one.
 func machineFingerprint(dir string) Fingerprint {
 	return Fingerprint{
 		CPUModel:       cpuModel(),

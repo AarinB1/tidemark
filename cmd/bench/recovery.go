@@ -247,17 +247,30 @@ func (s *timingSink) Close() error                                      { return
 // cannot happen by forgetting.
 func provisionalOn(f Fingerprint) bool { return f.DiskRotational != diskSolidState }
 
+// checkpointParent is the directory MkdirTemp creates checkpoint roots under.
+//
+// Empty --state-dir is the system temp directory, the same contract as
+// os.MkdirTemp. The recovery fingerprint probes this path so Provisional
+// names the device the restore actually reads, not the device the process
+// started on.
+func checkpointParent(stateDir string) string {
+	if stateDir != "" {
+		return stateDir
+	}
+	return os.TempDir()
+}
+
 // runRecoverySweep measures every configuration and prints the curve.
 func runRecoverySweep(opts sweepOptions) (RecoveryReport, error) {
 	configs, err := sweep(opts)
 	if err != nil {
 		return RecoveryReport{}, err
 	}
-	dir, err := os.Getwd()
-	if err != nil {
-		return RecoveryReport{}, fmt.Errorf("working directory: %w", err)
-	}
-	fingerprint := machineFingerprint(dir)
+	// The device that will hold the checkpoints, not the working directory.
+	// MkdirTemp with an empty --state-dir writes under os.TempDir();
+	// fingerprinting cwd would report the project's disk while the restore
+	// reads a different one.
+	fingerprint := machineFingerprint(checkpointParent(opts.stateDir))
 	report := RecoveryReport{
 		Fingerprint: fingerprint,
 		Provisional: provisionalOn(fingerprint),

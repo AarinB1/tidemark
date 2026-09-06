@@ -55,6 +55,7 @@ bench-check:
 		--parallelism $(BENCH_PARALLELISM) \
 		--seed $(BENCH_SEED) \
 		--keys $(BENCH_KEYS) \
+		--auctions $(BENCH_AUCTIONS) \
 		--json $(BENCH_OUT) \
 		--baseline $(BENCH_BASELINE) \
 		--threshold $(BENCH_THRESHOLD)
