@@ -22,6 +22,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/AarinB1/tidemark/pkg/graph"
@@ -88,15 +90,22 @@ func main() {
 		"comma-separated workloads to measure, or \"all\": identity, q0, q1, q2, q5, q7")
 	seed := flag.Uint64("seed", 1, "generator seed; the same seed always produces the same records")
 	keys := flag.Int64("keys", 10000, "number of distinct keys, for the identity workload")
-	auctions := flag.Int64("auctions", 10000, "auction id space, for the Nexmark workloads; the state-size dial")
+	auctions := flag.String("auctions", "10000",
+		"comma-separated auction id spaces to measure, for the Nexmark workloads; the state-size dial")
 	window := flag.Int64("window", 5000, "window size in millis; the source steps event time 1ms per element")
 	slide := flag.Int64("slide", 1250, "window slide in millis, for q5")
 	jsonPath := flag.String("json", "", "write the report to this file as JSON; empty writes nothing")
 	baseline := flag.String("baseline", "", "compare against this baseline report and fail on a regression")
 	threshold := flag.Float64("threshold", 15, "percent slower than the baseline that counts as a regression")
+	mode := flag.String("mode", modeThroughput,
+		"what to measure: throughput, state, recovery, or all")
+	checkpoints := flag.Int("checkpoints", 8, "checkpoints each source subtask takes, in the state and recovery modes")
+	stateDir := flag.String("state-dir", "",
+		"where the state and recovery modes write checkpoints; empty is the system temp directory")
 	flag.Parse()
 
 	opts := sweepOptions{
+		mode:        *mode,
 		records:     *records,
 		parallelism: *parallelism,
 		query:       *query,
@@ -105,6 +114,8 @@ func main() {
 		auctions:    *auctions,
 		window:      *window,
 		slide:       *slide,
+		checkpoints: *checkpoints,
+		stateDir:    *stateDir,
 		jsonPath:    *jsonPath,
 		baseline:    *baseline,
 		threshold:   *threshold,
@@ -118,20 +129,80 @@ func main() {
 // sweepOptions is the flag set, gathered so that run has one argument rather
 // than eleven positional ones that can be transposed silently.
 type sweepOptions struct {
+	mode        string
 	records     int64
 	parallelism string
 	query       string
 	seed        uint64
 	keys        int64
-	auctions    int64
+	auctions    string
 	window      int64
 	slide       int64
+	checkpoints int
+	stateDir    string
 	jsonPath    string
 	baseline    string
 	threshold   float64
 }
 
+// The measurement modes.
+//
+// Separate modes rather than one run producing everything, because they want
+// different jobs: throughput takes no snapshot and wants the coarsest barriers
+// the engine allows, while the state and recovery harnesses exist to write
+// checkpoints. A single run doing both would report a throughput number for a
+// job that spent its time serialising state.
+const (
+	modeThroughput = "throughput"
+	modeState      = "state"
+	modeRecovery   = "recovery"
+	modeAll        = "all"
+)
+
 func run(opts sweepOptions) error {
+	switch opts.mode {
+	case modeThroughput:
+		return runThroughput(opts)
+	case modeState:
+		return runState(opts)
+	case modeAll:
+		if err := runThroughput(opts); err != nil {
+			return err
+		}
+		return runState(opts)
+	}
+	return fmt.Errorf("mode %q: want %s, %s, %s or %s",
+		opts.mode, modeThroughput, modeState, modeRecovery, modeAll)
+}
+
+// runState measures how much state each configuration holds and what its
+// checkpoints weigh.
+//
+// The JSON goes beside the throughput report rather than into it: the two hold
+// different rows measured on different jobs, and one document with both would
+// invite a reader to compare a rate against a byte count as if they came from
+// the same run.
+func runState(opts sweepOptions) error {
+	report, err := runStateSweep(opts)
+	if err != nil {
+		return err
+	}
+	printStateTable(report)
+	if opts.jsonPath != "" {
+		return writeJSON(stateJSONPath(opts.jsonPath), report)
+	}
+	return nil
+}
+
+// stateJSONPath puts the state report beside the throughput one, so that
+// `-mode all -json bench.json` writes bench.json and bench.state.json rather
+// than one overwriting the other.
+func stateJSONPath(path string) string {
+	ext := filepath.Ext(path)
+	return strings.TrimSuffix(path, ext) + ".state" + ext
+}
+
+func runThroughput(opts sweepOptions) error {
 	configs, err := sweep(opts)
 	if err != nil {
 		return err
@@ -158,7 +229,7 @@ func run(opts sweepOptions) error {
 	printScaling(report)
 
 	if opts.jsonPath != "" {
-		if err := writeReport(opts.jsonPath, report); err != nil {
+		if err := writeJSON(opts.jsonPath, report); err != nil {
 			return err
 		}
 	}
@@ -168,12 +239,13 @@ func run(opts sweepOptions) error {
 	return nil
 }
 
-// sweep expands the flags into the configurations to measure, query outer and
-// parallelism inner.
+// sweep expands the flags into the configurations to measure: query outer,
+// then auction cardinality, then parallelism.
 //
 // Query outer so that a sweep reads down a query's scaling curve rather than
 // across unrelated jobs, and so a run interrupted part way has whole curves
-// rather than a fragment of each.
+// rather than a fragment of each. Parallelism innermost for the same reason one
+// level down: it is the axis a row is read against.
 func sweep(opts sweepOptions) ([]Config, error) {
 	names, err := parseQueries(opts.query)
 	if err != nil {
@@ -183,27 +255,33 @@ func sweep(opts sweepOptions) ([]Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	auctions, err := parseInt64s(opts.auctions, "auctions")
+	if err != nil {
+		return nil, err
+	}
 
 	var configs []Config
 	for _, name := range names {
-		for _, p := range levels {
-			cfg := Config{
-				Query:              name,
-				Parallelism:        p,
-				Records:            opts.records,
-				Seed:               opts.seed,
-				Keys:               opts.keys,
-				AuctionCardinality: opts.auctions,
-				WindowMillis:       opts.window,
-				SlideMillis:        opts.slide,
+		for _, a := range auctions {
+			for _, p := range levels {
+				cfg := Config{
+					Query:              name,
+					Parallelism:        p,
+					Records:            opts.records,
+					Seed:               opts.seed,
+					Keys:               opts.keys,
+					AuctionCardinality: a,
+					WindowMillis:       opts.window,
+					SlideMillis:        opts.slide,
+				}
+				// Refused here rather than at the point of running, so a sweep
+				// with a bad flag fails before it spends ten minutes on the
+				// rows that were fine.
+				if err := cfg.check(); err != nil {
+					return nil, err
+				}
+				configs = append(configs, cfg)
 			}
-			// Refused here rather than at the point of running, so a sweep with
-			// a bad flag fails before it spends ten minutes on the rows that
-			// were fine.
-			if err := cfg.check(); err != nil {
-				return nil, err
-			}
-			configs = append(configs, cfg)
 		}
 	}
 	return configs, nil
@@ -283,7 +361,8 @@ func baseOf(r Report, query string) (Result, bool) {
 	return Result{}, false
 }
 
-func writeReport(path string, r Report) error {
+// writeJSON writes any of the reports this command produces.
+func writeJSON(path string, r any) error {
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err

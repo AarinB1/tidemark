@@ -453,7 +453,7 @@ func TestMachineFingerprintIsSelfConsistent(t *testing.T) {
 func writeTempReport(t *testing.T, r Report) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "baseline.json")
-	if err := writeReport(path, r); err != nil {
+	if err := writeJSON(path, r); err != nil {
 		t.Fatalf("writing a baseline fixture: %v", err)
 	}
 	return path

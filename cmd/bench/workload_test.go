@@ -378,7 +378,7 @@ func TestLabelNamesTheDialsThatMatter(t *testing.T) {
 func TestSweepExpandsQueryOuterParallelismInner(t *testing.T) {
 	opts := sweepOptions{
 		records: 1000, parallelism: "1,2", query: "q7,q5",
-		seed: 1, keys: 10, auctions: 100, window: 2000, slide: 500,
+		seed: 1, keys: 10, auctions: "100", window: 2000, slide: 500,
 	}
 	configs, err := sweep(opts)
 	if err != nil {
@@ -405,7 +405,7 @@ func TestSweepExpandsQueryOuterParallelismInner(t *testing.T) {
 func TestSweepRefusesABadConfigurationBeforeRunningAnything(t *testing.T) {
 	opts := sweepOptions{
 		records: 1000, parallelism: "1,2", query: "q5",
-		seed: 1, keys: 10, auctions: 100, window: 2000, slide: 9999,
+		seed: 1, keys: 10, auctions: "100", window: 2000, slide: 9999,
 	}
 	if _, err := sweep(opts); err == nil {
 		t.Fatal("sweep accepted a slide wider than its window")
