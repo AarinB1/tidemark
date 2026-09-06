@@ -32,5 +32,8 @@ go.work.sum
 # .vscode/
 
 # Benchmark reports. The committed baseline lives at test/bench/baseline.json;
-# a local run writes here and is not a repo artifact.
+# a local run writes here and is not a repo artifact. `make bench-full` writes
+# all three: bench.json, bench.state.json and bench.recovery.json.
 bench.json
+bench.state.json
+bench.recovery.json
