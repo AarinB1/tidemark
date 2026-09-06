@@ -290,7 +290,10 @@ func TestCompareReports(t *testing.T) {
 		GOMAXPROCS:     4,
 	}
 	results := func(rate float64) []Result {
-		return []Result{{Parallelism: 1, Records: 2000000, Seed: 1, Keys: 10000, RecordsPerSec: rate}}
+		return []Result{{
+			Config:        Config{Query: queryIdentity, Parallelism: 1, Records: 2000000, Seed: 1, Keys: 10000},
+			RecordsPerSec: rate,
+		}}
 	}
 
 	tests := []struct {
@@ -316,7 +319,7 @@ func TestCompareReports(t *testing.T) {
 			want:        Report{Fingerprint: local, Results: results(700000)},
 			got:         Report{Fingerprint: local, Results: results(690000)},
 			wantErr:     false,
-			wantOutputs: []string{"parallelism 1", "against baseline"},
+			wantOutputs: []string{"identity p=1", "against baseline"},
 			notOutputs:  []string{"SKIPPED"},
 		},
 		{
@@ -331,8 +334,11 @@ func TestCompareReports(t *testing.T) {
 			// A matching fingerprint that compared nothing looks exactly like a
 			// pass, which is the other way this check can go quiet.
 			name: "the same machine with no overlapping configuration says so",
-			want: Report{Fingerprint: local, Results: []Result{{Parallelism: 8, RecordsPerSec: 1}}},
-			got:  Report{Fingerprint: local, Results: results(700000)},
+			want: Report{Fingerprint: local, Results: []Result{{
+				Config:        Config{Query: queryIdentity, Parallelism: 8, Records: 2000000, Seed: 1, Keys: 10000},
+				RecordsPerSec: 1,
+			}}},
+			got: Report{Fingerprint: local, Results: results(700000)},
 
 			wantErr:     false,
 			wantOutputs: []string{"compared nothing"},
@@ -373,7 +379,10 @@ func TestCompareReports(t *testing.T) {
 func TestCompareBaselineSkipsOnAFixtureFromAnotherMachine(t *testing.T) {
 	got := Report{
 		Fingerprint: machineFingerprint(t.TempDir()),
-		Results:     []Result{{Parallelism: 1, Records: 2000000, Seed: 1, Keys: 10000, RecordsPerSec: 1}},
+		Results: []Result{{
+			Config:        Config{Query: queryIdentity, Parallelism: 1, Records: 2000000, Seed: 1, Keys: 10000},
+			RecordsPerSec: 1,
+		}},
 	}
 
 	fixtures := []string{

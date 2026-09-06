@@ -1,4 +1,4 @@
-// Command bench measures throughput at a range of parallelism levels and
+// Command bench measures throughput across a sweep of configurations and
 // reports the scaling curve.
 //
 // It runs a fixed number of records rather than for a fixed duration, so two
@@ -9,6 +9,11 @@
 //
 // Never run this under -race. The race detector costs 5 to 20x and the number
 // it produces means nothing.
+//
+// One invocation produces the whole sweep, and that is deliberate: the numbers
+// that get published come from one machine in one sitting, and a sweep
+// assembled from several invocations is a sweep whose rows were measured under
+// conditions nobody wrote down. See docs/BENCHMARKS.md.
 package main
 
 import (
@@ -17,25 +22,19 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/AarinB1/tidemark/pkg/core"
 	"github.com/AarinB1/tidemark/pkg/graph"
-	"github.com/AarinB1/tidemark/pkg/operators"
 	tmruntime "github.com/AarinB1/tidemark/pkg/runtime"
-	"github.com/AarinB1/tidemark/pkg/sinks"
-	"github.com/AarinB1/tidemark/pkg/sources"
 )
 
 // Report is what a benchmark run writes and what a baseline holds.
 //
 // The machine sits on the report rather than on each result because it
-// describes the run, not the level. Without it a laptop number and a CI number
-// get compared silently, and the comparison is meaningless in a way nothing in
-// the output would show. See Fingerprint, and compareBaseline for what a
-// mismatch does.
+// describes the run, not the configuration. Without it a laptop number and a CI
+// number get compared silently, and the comparison is meaningless in a way
+// nothing in the output would show. See Fingerprint, and compareBaseline for
+// what a mismatch does.
 //
 // encoding/json is fine here. The scope rule bars reflection-based
 // serialization from the data path; this is a benchmark's result file, which
@@ -51,29 +50,31 @@ type Report struct {
 	Results []Result `json:"results"`
 }
 
-// Result is one parallelism level.
+// Result is one measured configuration.
 type Result struct {
-	Parallelism   int     `json:"parallelism"`
-	Records       int64   `json:"records"`
-	Seed          uint64  `json:"seed"`
-	Keys          int64   `json:"keys"`
+	Config
 	ElapsedMillis int64   `json:"elapsed_millis"`
 	RecordsPerSec float64 `json:"records_per_sec"`
+	// Oversubscribed marks a configuration whose parallelism exceeded the
+	// machine's core count. It is carried into the JSON so that a 16-way number
+	// from a 4-core box cannot enter the record looking like a measurement of
+	// 16-way scaling.
+	Oversubscribed bool `json:"oversubscribed"`
 }
 
-// label names the configuration a result measured, for the console line and
-// for the regression message.
-func (r Result) label() string { return fmt.Sprintf("parallelism %d", r.Parallelism) }
-
-// baselineFor finds the baseline result that measured the same configuration
-// as got.
+// baselineFor finds the baseline result that measured the same configuration.
+//
+// The whole Config has to agree, not just the parallelism. A q7 run at
+// parallelism 4 over ten thousand auctions and one over a hundred are different
+// jobs, and a comparison that matched on parallelism alone would call one a
+// regression of the other.
 //
 // A configuration the baseline does not cover is SKIPPED by the caller rather
-// than treated as a regression, so adding a level does not fail the check
-// against a baseline that predates it.
+// than treated as a regression, so adding a row does not fail the check against
+// a baseline that predates it.
 func baselineFor(want Report, got Result) (Result, bool) {
 	for _, res := range want.Results {
-		if res.Parallelism == got.Parallelism {
+		if res.Config == got.Config {
 			return res, true
 		}
 	}
@@ -81,23 +82,57 @@ func baselineFor(want Report, got Result) (Result, bool) {
 }
 
 func main() {
-	records := flag.Int64("records", 2000000, "records to push through the pipeline at each level")
-	parallelism := flag.String("parallelism", "1,2,4,8", "comma-separated parallelism levels to measure")
+	records := flag.Int64("records", 2000000, "records to push through the pipeline in each configuration")
+	parallelism := flag.String("parallelism", "1,2,4,8,16", "comma-separated parallelism levels to measure")
+	query := flag.String("query", queryIdentity,
+		"comma-separated workloads to measure, or \"all\": identity, q0, q1, q2, q5, q7")
 	seed := flag.Uint64("seed", 1, "generator seed; the same seed always produces the same records")
-	keys := flag.Int64("keys", 10000, "number of distinct keys")
+	keys := flag.Int64("keys", 10000, "number of distinct keys, for the identity workload")
+	auctions := flag.Int64("auctions", 10000, "auction id space, for the Nexmark workloads; the state-size dial")
+	window := flag.Int64("window", 5000, "window size in millis; the source steps event time 1ms per element")
+	slide := flag.Int64("slide", 1250, "window slide in millis, for q5")
 	jsonPath := flag.String("json", "", "write the report to this file as JSON; empty writes nothing")
 	baseline := flag.String("baseline", "", "compare against this baseline report and fail on a regression")
 	threshold := flag.Float64("threshold", 15, "percent slower than the baseline that counts as a regression")
 	flag.Parse()
 
-	if err := run(*records, *parallelism, *seed, *keys, *jsonPath, *baseline, *threshold); err != nil {
+	opts := sweepOptions{
+		records:     *records,
+		parallelism: *parallelism,
+		query:       *query,
+		seed:        *seed,
+		keys:        *keys,
+		auctions:    *auctions,
+		window:      *window,
+		slide:       *slide,
+		jsonPath:    *jsonPath,
+		baseline:    *baseline,
+		threshold:   *threshold,
+	}
+	if err := run(opts); err != nil {
 		fmt.Fprintln(os.Stderr, "bench:", err)
 		os.Exit(1)
 	}
 }
 
-func run(records int64, parallelism string, seed uint64, keys int64, jsonPath, baseline string, threshold float64) error {
-	levels, err := parseLevels(parallelism)
+// sweepOptions is the flag set, gathered so that run has one argument rather
+// than eleven positional ones that can be transposed silently.
+type sweepOptions struct {
+	records     int64
+	parallelism string
+	query       string
+	seed        uint64
+	keys        int64
+	auctions    int64
+	window      int64
+	slide       int64
+	jsonPath    string
+	baseline    string
+	threshold   float64
+}
+
+func run(opts sweepOptions) error {
+	configs, err := sweep(opts)
 	if err != nil {
 		return err
 	}
@@ -110,123 +145,138 @@ func run(records int64, parallelism string, seed uint64, keys int64, jsonPath, b
 	}
 	report := Report{Fingerprint: machineFingerprint(dir)}
 
-	for _, p := range levels {
-		res, err := measure(records, p, seed, keys)
+	for _, cfg := range configs {
+		res, err := measure(cfg)
 		if err != nil {
 			return err
 		}
 		report.Results = append(report.Results, res)
-		fmt.Printf("parallelism=%d records=%d elapsed=%dms rate=%.0f rec/s\n",
-			res.Parallelism, res.Records, res.ElapsedMillis, res.RecordsPerSec)
+		fmt.Printf("%s elapsed=%dms rate=%.0f rec/s%s\n",
+			res.label(), res.ElapsedMillis, res.RecordsPerSec, oversubscribedNote(res))
 	}
 
 	printScaling(report)
 
-	if jsonPath != "" {
-		if err := writeReport(jsonPath, report); err != nil {
+	if opts.jsonPath != "" {
+		if err := writeReport(opts.jsonPath, report); err != nil {
 			return err
 		}
 	}
-	if baseline != "" {
-		return compareBaseline(baseline, report, threshold)
+	if opts.baseline != "" {
+		return compareBaseline(opts.baseline, report, opts.threshold)
 	}
 	return nil
 }
 
-// measure times one parallelism level.
-func measure(records int64, p int, seed uint64, keys int64) (Result, error) {
-	g, err := benchGraph(records, p, seed, keys)
+// sweep expands the flags into the configurations to measure, query outer and
+// parallelism inner.
+//
+// Query outer so that a sweep reads down a query's scaling curve rather than
+// across unrelated jobs, and so a run interrupted part way has whole curves
+// rather than a fragment of each.
+func sweep(opts sweepOptions) ([]Config, error) {
+	names, err := parseQueries(opts.query)
+	if err != nil {
+		return nil, err
+	}
+	levels, err := parseLevels(opts.parallelism)
+	if err != nil {
+		return nil, err
+	}
+
+	var configs []Config
+	for _, name := range names {
+		for _, p := range levels {
+			cfg := Config{
+				Query:              name,
+				Parallelism:        p,
+				Records:            opts.records,
+				Seed:               opts.seed,
+				Keys:               opts.keys,
+				AuctionCardinality: opts.auctions,
+				WindowMillis:       opts.window,
+				SlideMillis:        opts.slide,
+			}
+			// Refused here rather than at the point of running, so a sweep with
+			// a bad flag fails before it spends ten minutes on the rows that
+			// were fine.
+			if err := cfg.check(); err != nil {
+				return nil, err
+			}
+			configs = append(configs, cfg)
+		}
+	}
+	return configs, nil
+}
+
+// measure times one configuration.
+func measure(cfg Config) (Result, error) {
+	// Coarse barriers, and no coordinator listening: a throughput run records
+	// no snapshot, and invariant 3 does not let a source have no barriers at
+	// all. See benchThroughputBarrierInterval.
+	g, err := buildGraph(cfg, benchThroughputBarrierInterval)
 	if err != nil {
 		return Result{}, err
 	}
-
-	// The timer starts after construction and stops when Run returns, so what
-	// is measured is the pipeline and nothing around it.
-	start := time.Now()
-	if err := tmruntime.Run(context.Background(), g); err != nil {
-		return Result{}, fmt.Errorf("parallelism %d: %w", p, err)
+	elapsed, err := timeRun(g)
+	if err != nil {
+		return Result{}, fmt.Errorf("%s: %w", cfg.label(), err)
 	}
-	elapsed := time.Since(start)
-
 	return Result{
-		Parallelism:   p,
-		Records:       records,
-		Seed:          seed,
-		Keys:          keys,
-		ElapsedMillis: elapsed.Milliseconds(),
-		RecordsPerSec: float64(records) / elapsed.Seconds(),
+		Config:         cfg,
+		ElapsedMillis:  elapsed.Milliseconds(),
+		RecordsPerSec:  float64(cfg.Records) / elapsed.Seconds(),
+		Oversubscribed: cfg.oversubscribed(),
 	}, nil
 }
 
-// benchGraph is source -> identity map -> discard sink, every vertex at p.
+// timeRun is the measured interval, and it is one function so that every
+// harness in this command measures the same thing.
 //
-// Every vertex scales together. A source pinned at 1 feeding p map subtasks
-// would measure the source rather than the shuffle, and the curve would go
-// flat for a reason that has nothing to do with the engine.
-//
-// The sink is Discard, never Collect. Collect appends every record to a slice,
-// so a throughput run against it measures slice growth and the garbage
-// collector.
-func benchGraph(records int64, p int, seed uint64, keys int64) (*graph.Graph, error) {
-	cfg := sources.GeneratorConfig{
-		Seed:           seed,
-		Count:          records,
-		KeyCardinality: keys,
-		BaseEventTime:  time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC).UnixMilli(),
-		EventTimeStep:  1,
-		MaxLag:         500,
-		ValueSize:      16,
-		AmountRange:    1000,
-	}
-
-	g := graph.New()
-	vertices := []graph.Vertex{
-		{ID: "source", Kind: graph.VertexSource, Parallelism: p,
-			NewSource: func() core.Source { return sources.NewGenerator(cfg) },
-			// Deliberately coarse against a two-million record run: twenty
-			// broadcasts of each per subtask. This job measures record
-			// throughput, and a tight interval here would move the number
-			// without the record path having changed.
-			WatermarkIntervalElements: 100000,
-			MaxOutOfOrderness:         cfg.MaxLag,
-			BarrierIntervalElements:   100000},
-		{ID: "identity", Kind: graph.VertexOperator, Parallelism: p,
-			NewOperator: func() core.Operator {
-				return operators.NewMap(func(rec *core.Record) (*core.Record, error) { return rec, nil })
-			}},
-		{ID: "sink", Kind: graph.VertexSink, Parallelism: p,
-			NewSink: func() core.Sink { return sinks.NewDiscard() }},
-	}
-	for _, v := range vertices {
-		if err := g.AddVertex(v); err != nil {
-			return nil, err
-		}
-	}
-	for _, e := range [][2]string{{"source", "identity"}, {"identity", "sink"}} {
-		if err := g.Connect(e[0], e[1]); err != nil {
-			return nil, err
-		}
-	}
-	return g, nil
+// The clock starts after the graph is built and stops when Run returns. Graph
+// construction allocates the vertices and the channels and does not scale with
+// the record count; teardown is inside Run, because Run does not return until
+// every subtask has unwound and every gate forwarder has finished.
+func timeRun(g *graph.Graph) (time.Duration, error) {
+	start := time.Now()
+	err := tmruntime.Run(context.Background(), g)
+	return time.Since(start), err
 }
 
-// printScaling reports each level against parallelism 1, which is the number
-// the exit criterion is stated in.
+func oversubscribedNote(res Result) string {
+	if !res.Oversubscribed {
+		return ""
+	}
+	return " OVERSUBSCRIBED"
+}
+
+// printScaling reports each level against parallelism 1 of the same query,
+// which is the number the exit criterion is stated in.
+//
+// Per query, because the ratio is only meaningful within one workload: q5 at
+// parallelism 4 against identity at parallelism 1 is two jobs and a division.
 func printScaling(r Report) {
-	base, ok := resultAt(r, 1)
-	if !ok {
-		return
-	}
 	fmt.Printf("scaling (%s):\n", r.Fingerprint)
-	for _, res := range r.Results {
-		fmt.Printf("  %s: %.0f rec/s, %.2fx\n",
-			res.label(), res.RecordsPerSec, res.RecordsPerSec/base.RecordsPerSec)
+	for _, name := range queries {
+		base, ok := baseOf(r, name)
+		if !ok {
+			continue
+		}
+		for _, res := range r.Results {
+			if res.Query != name {
+				continue
+			}
+			fmt.Printf("  %s: %.0f rec/s, %.2fx%s\n",
+				res.label(), res.RecordsPerSec, res.RecordsPerSec/base.RecordsPerSec, oversubscribedNote(res))
+		}
 	}
 }
 
-func resultAt(r Report, p int) (Result, bool) {
+// baseOf returns the parallelism-1 result of one query, which every other level
+// of that query is reported against.
+func baseOf(r Report, query string) (Result, bool) {
 	for _, res := range r.Results {
-		if res.Parallelism == p {
+		if res.Query == query && res.Parallelism == 1 {
 			return res, true
 		}
 	}
@@ -239,26 +289,4 @@ func writeReport(path string, r Report) error {
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), 0o644)
-}
-
-func parseLevels(s string) ([]int, error) {
-	var levels []int
-	for _, field := range strings.Split(s, ",") {
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
-		p, err := strconv.Atoi(field)
-		if err != nil {
-			return nil, fmt.Errorf("parallelism %q: %w", field, err)
-		}
-		if p < 1 {
-			return nil, fmt.Errorf("parallelism %d: must be >= 1", p)
-		}
-		levels = append(levels, p)
-	}
-	if len(levels) == 0 {
-		return nil, fmt.Errorf("no parallelism levels given")
-	}
-	return levels, nil
 }
