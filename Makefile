@@ -1,4 +1,4 @@
-.PHONY: build test vet lint check demo bench bench-check chaos chaos-race
+.PHONY: build test vet lint check demo bench bench-check chaos chaos-race chaos-nexmark
 
 build:
 	go build ./...
@@ -79,3 +79,21 @@ chaos:
 chaos-race:
 	go test ./test/chaos -run TestChaosSuite -count=1 -race -v \
 		-chaos.seeds=$(CHAOS_RACE_SEEDS) -timeout $(CHAOS_TIMEOUT)
+
+# The Nexmark chaos suite: the same fault schedules against the five queries.
+#
+# Five hundred contiguous seeds PER QUERY, so this target is two and a half
+# thousand schedules. It exists because the number was previously reachable only
+# by knowing the flag name, and a run that has to be assembled from a comment is
+# a run nobody makes.
+#
+# Without -race, for the reason the five-hundred-seed keyed-count target is:
+# five to twenty times the cost across five queries fits no budget anybody will
+# pay. The race subset for this suite is the package default of ten seeds per
+# query, which `go test ./...` in `check` already runs under the detector.
+NEXMARK_CHAOS_SEEDS ?= 500
+NEXMARK_CHAOS_TIMEOUT ?= 60m
+
+chaos-nexmark:
+	go test ./test/chaos -run TestNexmarkChaosSuite -count=1 -v \
+		-chaos.nexmark.seeds=$(NEXMARK_CHAOS_SEEDS) -timeout $(NEXMARK_CHAOS_TIMEOUT)

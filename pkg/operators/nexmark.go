@@ -154,14 +154,31 @@ func bidOf(rec *core.Record, query string) (sources.Bid, bool, error) {
 // q7: the highest bid in each (auction, tumbling window).
 // ---------------------------------------------------------------------------
 
-// MaxBid is q7.
+// MaxBid is q7 -- a VARIANT of it, and the difference is in the answer rather
+// than in the encoding, so it is named here rather than left to be inferred.
 //
 // A tumbling window over bids, emitting the winning bid of each (key, window).
 // The key is a bid's auction id, because that is what a bid's Record.Key holds
-// and what the shuffle partitions on. A maximum over a whole window regardless
-// of auction is not something one keyed operator can compute: at a parallelism
-// above one, each subtask would see a share of the window's bids and report the
-// maximum of that share, with nothing to say it had.
+// and what the shuffle partitions on.
+//
+// # What standard q7 computes, and what this computes
+//
+// Standard Nexmark q7 is the single highest bid of each window across ALL
+// auctions: one row per window. This is the highest bid of each (auction,
+// window): one row per auction that received a bid in that window. Nobody
+// should read the query name here and assume the standard answer -- on the same
+// input the two produce different row counts, and this one's rows are a
+// superset from which the standard answer could be folded.
+//
+// The variant is forced rather than chosen. A maximum over a whole window
+// regardless of auction is not something one keyed operator can compute: at a
+// parallelism above one, each subtask would see a share of the window's bids
+// and report the maximum of that share, with nothing to say it had. The
+// standard query needs a second stage -- a re-key onto the window and a fold
+// over the per-auction maxima, which is the shape q5 uses for its two stages --
+// and that stage is not built. Building it here would be building a query
+// nothing in this phase asks for; naming the difference costs nothing and stops
+// a reader from mistaking one for the other.
 //
 // # State layout
 //
