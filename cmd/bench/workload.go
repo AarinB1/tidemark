@@ -203,8 +203,19 @@ func nexmarkConfig(c Config) sources.NexmarkConfig {
 // nothing to do with the engine.
 //
 // The sink is Discard, never Collect: Collect appends every record to a slice,
-// so a throughput run against it measures slice growth and the collector.
+// so a throughput run against it measures slice growth and the collector. The
+// recovery harness substitutes its own through buildGraphWithSink.
 func buildGraph(c Config, barrierInterval int64) (*graph.Graph, error) {
+	return buildGraphWithSink(c, barrierInterval, func() core.Sink { return sinks.NewDiscard() })
+}
+
+// buildGraphWithSink is buildGraph with the sink chosen by the caller.
+//
+// It exists for the recovery harness, whose sink has to notice when its first
+// record arrives. Everything else takes Discard, and the factory is a FACTORY
+// rather than a sink because a sink is per subtask: several subtasks sharing
+// one would share whatever it holds.
+func buildGraphWithSink(c Config, barrierInterval int64, newSink func() core.Sink) (*graph.Graph, error) {
 	if err := c.check(); err != nil {
 		return nil, err
 	}
@@ -222,8 +233,7 @@ func buildGraph(c Config, barrierInterval int64) (*graph.Graph, error) {
 	chain := operatorChain(c)
 	vertices = append(vertices, chain...)
 	vertices = append(vertices, graph.Vertex{
-		ID: "sink", Kind: graph.VertexSink, Parallelism: c.Parallelism,
-		NewSink: func() core.Sink { return sinks.NewDiscard() },
+		ID: "sink", Kind: graph.VertexSink, Parallelism: c.Parallelism, NewSink: newSink,
 	})
 	for _, v := range vertices {
 		if err := g.AddVertex(v); err != nil {

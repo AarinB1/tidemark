@@ -165,11 +165,16 @@ func run(opts sweepOptions) error {
 		return runThroughput(opts)
 	case modeState:
 		return runState(opts)
+	case modeRecovery:
+		return runRecovery(opts)
 	case modeAll:
 		if err := runThroughput(opts); err != nil {
 			return err
 		}
-		return runState(opts)
+		if err := runState(opts); err != nil {
+			return err
+		}
+		return runRecovery(opts)
 	}
 	return fmt.Errorf("mode %q: want %s, %s, %s or %s",
 		opts.mode, modeThroughput, modeState, modeRecovery, modeAll)
@@ -194,13 +199,29 @@ func runState(opts sweepOptions) error {
 	return nil
 }
 
-// stateJSONPath puts the state report beside the throughput one, so that
-// `-mode all -json bench.json` writes bench.json and bench.state.json rather
-// than one overwriting the other.
-func stateJSONPath(path string) string {
-	ext := filepath.Ext(path)
-	return strings.TrimSuffix(path, ext) + ".state" + ext
+// runRecovery measures how long each configuration takes to resume output
+// after being restored from a checkpoint.
+func runRecovery(opts sweepOptions) error {
+	report, err := runRecoverySweep(opts)
+	if err != nil {
+		return err
+	}
+	printRecoveryTable(report)
+	if opts.jsonPath != "" {
+		return writeJSON(suffixedJSONPath(opts.jsonPath, "recovery"), report)
+	}
+	return nil
 }
+
+// suffixedJSONPath puts a report beside the throughput one, so that
+// `-mode all -json bench.json` writes bench.json, bench.state.json and
+// bench.recovery.json rather than one overwriting the others.
+func suffixedJSONPath(path, suffix string) string {
+	ext := filepath.Ext(path)
+	return strings.TrimSuffix(path, ext) + "." + suffix + ext
+}
+
+func stateJSONPath(path string) string { return suffixedJSONPath(path, "state") }
 
 func runThroughput(opts sweepOptions) error {
 	configs, err := sweep(opts)
