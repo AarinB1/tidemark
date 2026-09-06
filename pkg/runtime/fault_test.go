@@ -368,10 +368,32 @@ func TestDuringAlignmentIsOfferedOnlyInsideAnAlignmentWindow(t *testing.T) {
 	t.Logf("%d alignment-window consultations", seen)
 }
 
-// TestDuringAlignmentFiresAndFailsTheSubtask.
+// TestDuringAlignmentFiresAndFailsTheSubtask is the assertion that the
+// alignment injection point fires at all, and that firing aborts the subtask
+// whose alignment window it landed in.
+//
+// The predicate names ONE SUBTASK, and the index is what makes it one. A
+// subtask is (vertexID, index); "op" is a vertex at parallelism 2, so a
+// predicate matching on the vertex alone names a position BOTH op[0] and op[1]
+// reach. Each aligns barrier 2 behind its own Gate on its own goroutine, and
+// the first firing does not stop the second: the failing subtask reports into
+// a channel buffered to the subtask count and only then cancels, and the other
+// subtask is already inside its own consultation rather than waiting on that
+// cancellation. Both fire, the count below reads 2, and a fault schedule that
+// left the index free was never naming a logical position at all -- which is
+// invariant 6, the schedule being deterministic where the scheduler is not.
+//
+// Exactly once is therefore sound rather than tolerated. The count is asserted
+// against a condition only one subtask can satisfy, and within that subtask the
+// condition holds once: delivered only grows across an alignment and each
+// checkpoint aligns once, so op[0] is offered barrier 2 at delivered = 1 one
+// time in a run. "At least once" would be the wrong repair -- it also passes on
+// a runtime that fires zero times, and firing at all is the first of the two
+// claims here.
 func TestDuringAlignmentFiresAndFailsTheSubtask(t *testing.T) {
 	inj := &recordingInjector{fire: func(c consultation) bool {
-		return c.site == "during-alignment" && c.vertexID == "op" && c.n == 2 && c.delivered == 1
+		return c.site == "during-alignment" && c.vertexID == "op" && c.subtask == 0 &&
+			c.n == 2 && c.delivered == 1
 	}}
 	err := RunWithOptions(context.Background(), faultGraph(t, sinks.NewCollect(), nil),
 		Options{FaultInjector: inj})
@@ -382,8 +404,8 @@ func TestDuringAlignmentFiresAndFailsTheSubtask(t *testing.T) {
 	if len(fired) != 1 {
 		t.Fatalf("the injector fired %d times: %v", len(fired), fired)
 	}
-	if fired[0].delivered != 1 || fired[0].n != 2 {
-		t.Fatalf("fired at %s, want barrier 2 with 1 input delivered", fired[0])
+	if fired[0].vertexID != "op" || fired[0].subtask != 0 || fired[0].n != 2 || fired[0].delivered != 1 {
+		t.Fatalf("fired at %s, want op[0] at barrier 2 with 1 input delivered", fired[0])
 	}
 }
 
