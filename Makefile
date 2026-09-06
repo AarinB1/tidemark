@@ -42,6 +42,13 @@ bench:
 		--keys $(BENCH_KEYS) \
 		--json $(BENCH_OUT)
 
+# Compares against the committed baseline ONLY when the machine matches the one
+# the baseline was measured on; see Fingerprint in cmd/bench. On any other
+# machine it prints both machines and exits zero, because a baseline from
+# elsewhere says nothing about this hardware and a target that is always red is
+# a target nobody reads. Today every machine skips: test/bench/baseline.json is
+# unattributed and the canonical one comes from the reference machine in
+# docs/BENCHMARKS.md.
 bench-check:
 	go run ./cmd/bench \
 		--records $(BENCH_RECORDS) \

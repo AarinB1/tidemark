@@ -17,7 +17,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -32,19 +31,24 @@ import (
 
 // Report is what a benchmark run writes and what a baseline holds.
 //
-// The machine fields sit on the report rather than on each result because they
-// describe the run, not the level. Without them a laptop number and a CI number
+// The machine sits on the report rather than on each result because it
+// describes the run, not the level. Without it a laptop number and a CI number
 // get compared silently, and the comparison is meaningless in a way nothing in
-// the output would show.
+// the output would show. See Fingerprint, and compareBaseline for what a
+// mismatch does.
 //
 // encoding/json is fine here. The scope rule bars reflection-based
 // serialization from the data path; this is a benchmark's result file, which
 // runs once per invocation and never touches a record.
 type Report struct {
-	GoVersion  string   `json:"go_version"`
-	GOMAXPROCS int      `json:"gomaxprocs"`
-	NumCPU     int      `json:"num_cpu"`
-	Results    []Result `json:"results"`
+	Fingerprint Fingerprint `json:"fingerprint"`
+	// Note is free text a COMMITTED baseline carries and a fresh run does not.
+	// It is where a baseline says what machine it came from and how much its
+	// numbers are worth, since JSON has nowhere else to put a caveat and a
+	// caveat that lives only in a document travels separately from the file it
+	// is about. Nothing in the comparison reads it.
+	Note    string   `json:"note,omitempty"`
+	Results []Result `json:"results"`
 }
 
 // Result is one parallelism level.
@@ -55,6 +59,25 @@ type Result struct {
 	Keys          int64   `json:"keys"`
 	ElapsedMillis int64   `json:"elapsed_millis"`
 	RecordsPerSec float64 `json:"records_per_sec"`
+}
+
+// label names the configuration a result measured, for the console line and
+// for the regression message.
+func (r Result) label() string { return fmt.Sprintf("parallelism %d", r.Parallelism) }
+
+// baselineFor finds the baseline result that measured the same configuration
+// as got.
+//
+// A configuration the baseline does not cover is SKIPPED by the caller rather
+// than treated as a regression, so adding a level does not fail the check
+// against a baseline that predates it.
+func baselineFor(want Report, got Result) (Result, bool) {
+	for _, res := range want.Results {
+		if res.Parallelism == got.Parallelism {
+			return res, true
+		}
+	}
+	return Result{}, false
 }
 
 func main() {
@@ -79,11 +102,13 @@ func run(records int64, parallelism string, seed uint64, keys int64, jsonPath, b
 		return err
 	}
 
-	report := Report{
-		GoVersion:  runtime.Version(),
-		GOMAXPROCS: runtime.GOMAXPROCS(0),
-		NumCPU:     runtime.NumCPU(),
+	// The working directory, because that is the filesystem checkpoints land
+	// on and the one whose rotational flag belongs in the fingerprint.
+	dir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("working directory: %w", err)
 	}
+	report := Report{Fingerprint: machineFingerprint(dir)}
 
 	for _, p := range levels {
 		res, err := measure(records, p, seed, keys)
@@ -103,7 +128,7 @@ func run(records int64, parallelism string, seed uint64, keys int64, jsonPath, b
 		}
 	}
 	if baseline != "" {
-		return compare(baseline, report, threshold)
+		return compareBaseline(baseline, report, threshold)
 	}
 	return nil
 }
@@ -192,10 +217,10 @@ func printScaling(r Report) {
 	if !ok {
 		return
 	}
-	fmt.Printf("scaling (gomaxprocs=%d cpus=%d %s):\n", r.GOMAXPROCS, r.NumCPU, r.GoVersion)
+	fmt.Printf("scaling (%s):\n", r.Fingerprint)
 	for _, res := range r.Results {
-		fmt.Printf("  parallelism %d: %.0f rec/s, %.2fx\n",
-			res.Parallelism, res.RecordsPerSec, res.RecordsPerSec/base.RecordsPerSec)
+		fmt.Printf("  %s: %.0f rec/s, %.2fx\n",
+			res.label(), res.RecordsPerSec, res.RecordsPerSec/base.RecordsPerSec)
 	}
 }
 
@@ -206,44 +231,6 @@ func resultAt(r Report, p int) (Result, bool) {
 		}
 	}
 	return Result{}, false
-}
-
-// compare fails when any level is more than threshold percent slower than the
-// baseline. Levels the baseline does not cover are skipped rather than treated
-// as a regression, so adding a level does not fail the check that the baseline
-// predates.
-func compare(path string, got Report, threshold float64) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("baseline: %w", err)
-	}
-	var want Report
-	if err := json.Unmarshal(data, &want); err != nil {
-		return fmt.Errorf("baseline %s: %w", path, err)
-	}
-
-	if want.GOMAXPROCS != got.GOMAXPROCS || want.NumCPU != got.NumCPU {
-		fmt.Printf("note: baseline ran on %d cpus at gomaxprocs %d, this run on %d at %d\n",
-			want.NumCPU, want.GOMAXPROCS, got.NumCPU, got.GOMAXPROCS)
-	}
-
-	var regressions []string
-	for _, res := range got.Results {
-		base, ok := resultAt(want, res.Parallelism)
-		if !ok {
-			continue
-		}
-		change := (res.RecordsPerSec - base.RecordsPerSec) / base.RecordsPerSec * 100
-		fmt.Printf("parallelism %d: %.0f rec/s against baseline %.0f (%+.1f%%)\n",
-			res.Parallelism, res.RecordsPerSec, base.RecordsPerSec, change)
-		if change < -threshold {
-			regressions = append(regressions, fmt.Sprintf("parallelism %d is %.1f%% slower", res.Parallelism, -change))
-		}
-	}
-	if len(regressions) > 0 {
-		return fmt.Errorf("regression worse than %.0f%%: %s", threshold, strings.Join(regressions, "; "))
-	}
-	return nil
 }
 
 func writeReport(path string, r Report) error {

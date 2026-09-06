@@ -1,7 +1,5 @@
 {
-  "go_version": "go1.25.0",
-  "gomaxprocs": 4,
-  "num_cpu": 4,
+  "note": "UNATTRIBUTED, and therefore never compared against. These four numbers were measured during Phase 6a in a container that recorded go1.25.0, 4 CPUs and GOMAXPROCS 4, and nothing else: no machine fingerprint was taken, so no machine can claim them. bench-check compares only against a baseline whose fingerprint matches the running machine, and the absent fingerprint here matches nothing, so every run skips with a message rather than being measured against numbers of unknown provenance. The canonical baseline is generated once on the reference machine described in docs/BENCHMARKS.md and replaces this file wholesale, fingerprint and all. Do not stamp a fingerprint onto these results: that would attribute them to a machine that did not produce them. Re-measuring in this container was tried and rejected -- four consecutive 2M-record runs at parallelism 1 spanned 445k to 555k rec/s, a 25 percent spread against a 15 percent threshold, so a baseline taken here would fail or pass on luck.",
   "results": [
     {
       "parallelism": 1,
